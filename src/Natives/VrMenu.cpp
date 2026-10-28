@@ -238,12 +238,12 @@ void VRMenuPointer(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::
             const int fresh = g_VRIKFreshTotal, replay = g_VRIKReplayTotal, susp = g_MenuDiagSuspend, cam = g_MenuDiagCamMiss,
                       snap = g_MenuDiagSnap, nocap = g_MenuDiagNoCapture;
             if (s_at) {
-                Log("[menu-diag] 2s: playerPasses %llu fresh %d replay %d suspended %d (why %d) camMiss %d (status %d) snapshots %d noCapture %d | bind %d diagCapture %d headAim %d tier %d palmValid %d viewValid %d snapCount %d | input %d trig L %.2f R %.2f (published L %.2f R %.2f) overlay %d\n",
+                Log("[menu-diag] 2s: playerPasses %llu fresh %d replay %d suspended %d (why %d) camMiss %d (status %d) snapshots %d noCapture %d | bind %d diagCapture %d headAim %d tier %d palmValid %d viewValid %d snapCount %d | input %d trig L %.2f R %.2f grip L %.2f R %.2f (published L %.2f R %.2f) overlay %d\n",
                     (unsigned long long)(match - s_match), fresh - s_fresh, replay - s_replay, susp - s_susp, int(g_MenuDiagPaired),
                     cam - s_cam, int(g_MenuDiagLastCamStatus), snap - s_snap, nocap - s_nocap, int(g_VRBind), int(g_VRDiagCapture),
                     cvr::anim::IsHeadAimWeaponActive() ? 1 : 0, g_sceneTier.load(std::memory_order_relaxed), int(g_VRPalmModelValid),
                     int(g_VRViewWorldValid), int(g_VRFKSnapCount), haveInput ? 1 : 0, haveInput ? input.leftTrigger : -1.0f,
-                    haveInput ? input.rightTrigger : -1.0f, published.leftTrigger, published.rightTrigger, cvr::vrui::DebugBits());
+                    haveInput ? input.rightTrigger : -1.0f, input.leftGrip, input.rightGrip, published.leftTrigger, published.rightTrigger, cvr::vrui::DebugBits());
             }
             s_at = now; s_match = match; s_fresh = fresh; s_replay = replay; s_susp = susp; s_cam = cam; s_snap = snap; s_nocap = nocap;
         }
