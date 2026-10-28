@@ -41,9 +41,7 @@ struct SdkType {
 } // namespace
 
 // At file scope: it starts with the SDK headers, then defines kSdkTypes[] (static).
-// LOCAL BUILD: the generated table needs the author's regenerated RED4ext.SDK, which the pinned
-// submodule is not, so this diagnostic-only startup check is left empty here.
-static const SdkType kSdkTypes[1] = {};
+#include "SdkLayouts.gen.inc"
 
 namespace {
 
@@ -65,7 +63,6 @@ void Mismatch(Tally& t, const char* fmt, const char* a, const char* b, uint32_t 
 void Compare(Tally& t) {
     auto* rtti = RED4ext::CRTTISystem::Get();
     for (const auto& type : kSdkTypes) {
-        if (!type.rtti) continue;
         ++t.types;
         RED4ext::CClass* cls = rtti->GetClass(RED4ext::CName(type.rtti));
         if (!cls) {
