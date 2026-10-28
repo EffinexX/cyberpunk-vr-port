@@ -535,7 +535,11 @@ bool Evaluate(sl::Feature feature, const sl::FrameToken& frame, const sl::BaseSt
             eyeTags[i] = tags.tag[i];
             sl::Extent a{};
             if (!Area(tags.tag[i], &a)) continue;
-            const bool input = a.width == in.width && a.height == in.height;
+            // DLAA renders at the output size, so size alone cannot tell the output from an input:
+            // the output tag is classified by its type first, or the right eye's result is never
+            // copied back and that eye stays black.
+            const bool outputTag = tags.tag[i].type == sl::kBufferTypeScalingOutputColor;
+            const bool input = !outputTag && a.width == in.width && a.height == in.height;
             const bool isOutput = !input && a.width == out.width && a.height == out.height;
             if (input) eyeTags[i].extent = Half(a, eye);
             else if (isOutput) eyeTags[i].extent = Half(a, (mode & 2) ? 0 : eye);

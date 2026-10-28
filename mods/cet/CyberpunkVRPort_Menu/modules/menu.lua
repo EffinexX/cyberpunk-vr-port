@@ -1849,6 +1849,42 @@ local function pointers(cam, C, R, U)
     out = VRMenuPointer(Vector4.new(C[1], C[2], C[3], 1), Vector4.new(R[1], R[2], R[3], 0),
       Vector4.new(U[1], U[2], U[3], 0), Vector4.new(W, H, 0, 0))
   end)
+  -- DIAG: dead pointers. The pointer is built from the avatar's finger bones, not the controller,
+  -- so frozen bones (origin not moving) or missing data leave the menu unusable.
+  pcall(function()
+    local D = S.diagPtr
+    if D == nil or D.openedAt ~= S.panelStart then
+      D = { openedAt = S.panelStart, since = S.time, last = {}, moved = { false, false }, said = -99 }
+      S.diagPtr = D
+    end
+    if out == nil or #out < 8 then
+      if S.time - D.said > 5 then
+        D.said = S.time
+        print(string.format("[VRMenu] diag: pointer data unavailable (out=%s n=%s)", tostring(out ~= nil), tostring(out and #out)))
+      end
+    else
+      local anyHit = false
+      for hand = 1, 2 do
+        local tip, ray, origin = out[(hand - 1) * 4 + 1], out[(hand - 1) * 4 + 2], out[(hand - 1) * 4 + 3]
+        if (tip.w > .5 and tip.x >= 0 and tip.x <= 1 and tip.y >= 0 and tip.y <= 1)
+          or (ray.w > .5 and ray.x >= 0 and ray.x <= 1 and ray.y >= 0 and ray.y <= 1) then anyHit = true end
+        local l = D.last[hand]
+        if l and (math.abs(l[1] - origin.x) + math.abs(l[2] - origin.y) + math.abs(l[3] - origin.z)) > 0.002 then
+          D.moved[hand] = true
+        end
+        D.last[hand] = { origin.x, origin.y, origin.z, origin.w, tip.w, ray.w }
+      end
+      if anyHit then
+        D.since = S.time; D.moved = { false, false }
+      elseif S.time - D.since > 3 and S.time - D.said > 5 then
+        D.said = S.time
+        local L, Rh = D.last[1], D.last[2]
+        print(string.format("[VRMenu] diag: no hand reaches the menu for %.0f s -- L(bones moved=%s tip=%.0f ray=%.0f trig=%.2f) R(bones moved=%s tip=%.0f ray=%.0f trig=%.2f)",
+          S.time - D.since, tostring(D.moved[1]), L[5], L[6], L[4], tostring(D.moved[2]), Rh[5], Rh[6], Rh[4]))
+        D.moved = { false, false }
+      end
+    end
+  end)
   if out == nil or #out < 8 then
     for hand = 1, 2 do
       local P=S.hands[hand]
@@ -1991,18 +2027,42 @@ local function tick(dt)
   if S.columnAction and S.time>=S.columnAction.at then
     local b=S.columnAction.button;S.columnAction=nil;invokeClick(b)
   end
-  if Gameplay.transition(kit, dt) then return end
+  if Gameplay.transition(kit, dt) then
+    -- DIAG: a wait transition that never finishes swallows every open request
+    local tr = S.waitTransition
+    if tr and S.time - tr.started > 15 and S.time - (S.diagTransAt or -99) > 10 then
+      S.diagTransAt = S.time
+      print(string.format("[VRMenu] diag: wait transition stuck for %.0f s (phase %s)", S.time - tr.started, tostring(tr.phase)))
+    end
+    return
+  end
   -- the swipe is read every frame, open or not: the history lives in the plugin
   local g = nil
   if type(VRMenuGesture) == "function" then pcall(function() g = VRMenuGesture() end) end
   -- L3 + R3 held, or the gripped swipe down: open or close, the menu straight ahead either way
-  if g ~= nil and #g >= 1 and (g[1].x > 1.5 or #g >= 3) then
+  -- LOCAL CHANGE: the swipe is ignored (it fired while steering); only the L3 + R3 hold opens/closes
+  if g ~= nil and #g >= 1 and g[1].x > 1.5 then
+    local how = g[1].x > 1.5 and "L3+R3" or "swipe"
     if S.open then
       -- A physical grip swipe must not interrupt a list grabbed with R3. The explicit
       -- L3 + R3 chord still closes it; discard any incidental swipe during the grab.
       if g[1].x>1.5 or not Stick.blocksSwipe(S.hands[2],S.time) then M.close() end
     elseif not armed() and sceneTier() < 3 and not paused() then
-      M.open(camera())
+      local opened = M.open(camera())
+      if not opened then
+        print(string.format("[VRMenu] diag: %s open failed (transition=%s surfaceReady=%s camera=%s open=%s)",
+          how, tostring(S.waitTransition ~= nil), tostring(type(VRMenuSurfaceReady) == "function"),
+          tostring(camera() ~= nil), tostring(S.open)))
+      end
+    else
+      -- DIAG: say which gate refused it, and what sits in the right weapon slot
+      local item = "none"
+      pcall(function()
+        local w = Game.GetTransactionSystem():GetItemInSlot(Game.GetPlayer(), TweakDBID.new("AttachmentSlots.WeaponRight"))
+        if w then item = TDBID.ToStringDEBUG(w:GetItemID().id) end
+      end)
+      print(string.format("[VRMenu] diag: %s refused (armed=%s item=%s sceneTier=%s paused=%s)",
+        how, tostring(armed()), tostring(item), tostring(sceneTier()), tostring(paused())))
     end
   end
   if not S.open then return end

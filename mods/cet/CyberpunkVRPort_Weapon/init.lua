@@ -439,7 +439,7 @@ local muzzlePosWarned = false
 local aimHitProbed = false
 
 -- THE WEAPON IN THE LEFT HAND. See the block above carryTick().
-local CARRY_LEFT      = true
+local CARRY_LEFT      = false
 local carryOn         = false     -- the weapon is in AttachmentSlots.WeaponLeft right now
 local carryItemID     = nil       -- what to put back, and where it came from
 local carryRGripWas   = false
