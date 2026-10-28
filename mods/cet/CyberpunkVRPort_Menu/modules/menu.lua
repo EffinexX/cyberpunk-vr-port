@@ -57,6 +57,16 @@ local TOAST_Y = 1480
 -- Pointers, metres.
 local HOVER, PRESS, RELEASE, THROUGH = 0.10, 0.010, 0.025, -0.05
 local TRIGGER_ON, TRIGGER_OFF = 0.70, 0.40
+-- DIAG: CET loses the tail of scripting.log when the game exits, so diagnostics also go to
+-- diag.log in this mod's folder, flushed on every line.
+local function diagPrint(msg)
+  print(msg)
+  pcall(function()
+    local f = io.open("diag.log", "a")
+    if f then f:write(os.date("[%Y-%m-%d %H:%M:%S] ") .. msg .. "
+"); f:close() end
+  end)
+end
 local WALK_AWAY = 1.1
 -- A press in a list stays a tap until it has moved this far (canvas px); then it scrolls the list, or
 -- slides the slider it landed on when it went sideways. A FINGER'S OWN PUSH DOES NOT COUNT: pushed into
@@ -1860,7 +1870,7 @@ local function pointers(cam, C, R, U)
     if out == nil or #out < 8 then
       if S.time - D.said > 5 then
         D.said = S.time
-        print(string.format("[VRMenu] diag: pointer data unavailable (out=%s n=%s)", tostring(out ~= nil), tostring(out and #out)))
+        diagPrint(string.format("[VRMenu] diag: pointer data unavailable (out=%s n=%s)", tostring(out ~= nil), tostring(out and #out)))
       end
     else
       local anyHit = false
@@ -1879,7 +1889,7 @@ local function pointers(cam, C, R, U)
       elseif S.time - D.since > 3 and S.time - D.said > 5 then
         D.said = S.time
         local L, Rh = D.last[1], D.last[2]
-        print(string.format("[VRMenu] diag: no hand reaches the menu for %.0f s -- L(bones moved=%s tip=%.0f ray=%.0f trig=%.2f) R(bones moved=%s tip=%.0f ray=%.0f trig=%.2f)",
+        diagPrint(string.format("[VRMenu] diag: no hand reaches the menu for %.0f s -- L(bones moved=%s tip=%.0f ray=%.0f trig=%.2f) R(bones moved=%s tip=%.0f ray=%.0f trig=%.2f)",
           S.time - D.since, tostring(D.moved[1]), L[5], L[6], L[4], tostring(D.moved[2]), Rh[5], Rh[6], Rh[4]))
         D.moved = { false, false }
       end
@@ -1979,6 +1989,16 @@ local function pointers(cam, C, R, U)
       setCursor(hand, rayX, rayY, (P.trig or P.stickScroll) and 16 or 22, K.YELLOW, 1.0)
       cursor = true
     end
+    -- DIAG: a physical trigger pull that does not become a press, with every gate that can block it
+    local rawOn = trigger > TRIGGER_ON
+    if rawOn and not P.diagTrigPrev and (stickHeld or P.trig or not rayOn) then
+      pcall(function()
+        diagPrint(string.format("[VRMenu] diag: hand %d trigger pulled, no press: stickHeld=%s trigLatched=%s rayOn=%s ray(w=%.0f x=%.2f y=%.2f) poking=%s state=%s drag=%s pend=%s scroll=%s stickScroll=%s stick=%.2f",
+          hand, tostring(stickHeld), tostring(P.trig), tostring(rayOn), ray.w, ray.x, ray.y, tostring(poking), tostring(P.state),
+          tostring(P.dragBy), tostring(P.pend and P.pend.by), tostring(P.scroll and P.scroll.by), tostring(P.stickScroll ~= nil), stick or 0))
+      end)
+    end
+    P.diagTrigPrev = rawOn
     if not stickHeld and trigger > TRIGGER_ON and not P.trig then
       P.trig = true
       -- the trigger presses what the pointer is on, or what the finger hovers when it is that close
@@ -2032,7 +2052,7 @@ local function tick(dt)
     local tr = S.waitTransition
     if tr and S.time - tr.started > 15 and S.time - (S.diagTransAt or -99) > 10 then
       S.diagTransAt = S.time
-      print(string.format("[VRMenu] diag: wait transition stuck for %.0f s (phase %s)", S.time - tr.started, tostring(tr.phase)))
+      diagPrint(string.format("[VRMenu] diag: wait transition stuck for %.0f s (phase %s)", S.time - tr.started, tostring(tr.phase)))
     end
     return
   end
@@ -2050,7 +2070,7 @@ local function tick(dt)
     elseif not armed() and sceneTier() < 3 and not paused() then
       local opened = M.open(camera())
       if not opened then
-        print(string.format("[VRMenu] diag: %s open failed (transition=%s surfaceReady=%s camera=%s open=%s)",
+        diagPrint(string.format("[VRMenu] diag: %s open failed (transition=%s surfaceReady=%s camera=%s open=%s)",
           how, tostring(S.waitTransition ~= nil), tostring(type(VRMenuSurfaceReady) == "function"),
           tostring(camera() ~= nil), tostring(S.open)))
       end
@@ -2061,7 +2081,7 @@ local function tick(dt)
         local w = Game.GetTransactionSystem():GetItemInSlot(Game.GetPlayer(), TweakDBID.new("AttachmentSlots.WeaponRight"))
         if w then item = TDBID.ToStringDEBUG(w:GetItemID().id) end
       end)
-      print(string.format("[VRMenu] diag: %s refused (armed=%s item=%s sceneTier=%s paused=%s)",
+      diagPrint(string.format("[VRMenu] diag: %s refused (armed=%s item=%s sceneTier=%s paused=%s)",
         how, tostring(armed()), tostring(item), tostring(sceneTier()), tostring(paused())))
     end
   end

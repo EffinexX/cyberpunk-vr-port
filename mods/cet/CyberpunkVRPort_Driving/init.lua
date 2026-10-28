@@ -50,13 +50,21 @@ end
 -- LOCAL DIAGNOSTICS: why a hand does not take (or loses) the wheel. Logs only on changes.
 -- state: 0 = wheel unavailable (not driving / game menu mode / overlay), 4 = available,
 -- +1 right hand held, +2 left hand held. armed: wheel proximity bits (1 right, 2 left).
+local function diagPrint(msg)
+    print(msg)
+    pcall(function()
+        local f = io.open("diag.log", "a")
+        if f then f:write(os.date("[%Y-%m-%d %H:%M:%S] ") .. msg .. "
+"); f:close() end
+    end)
+end
 local diag = { mounted = false, state = nil, held = 0, grip = { false, false }, pend = {} }
 local function bit(v, b) return math.floor(v / b) % 2 == 1 end
 local function wheelDiag(dt)
     local player = Game.GetPlayer()
     local vehicle = player and player:GetMountedVehicle()
     if not vehicle then
-        if diag.mounted then print("[driving] diag: left the vehicle") end
+        if diag.mounted then diagPrint("[driving] diag: left the vehicle") end
         diag.mounted, diag.state, diag.held, diag.pend = false, nil, 0, {}
         return
     end
@@ -77,16 +85,16 @@ local function wheelDiag(dt)
     end
     if not diag.mounted then
         diag.mounted = true
-        print("[driving] diag: entered vehicle, " .. context())
+        diagPrint("[driving] diag: entered vehicle, " .. context())
     elseif state - held ~= (diag.state or 0) - diag.held then
-        print(string.format("[driving] diag: wheel %s, %s", state >= 4 and "available" or "UNAVAILABLE", context()))
+        diagPrint(string.format("[driving] diag: wheel %s, %s", state >= 4 and "available" or "UNAVAILABLE", context()))
     end
     for h = 1, 2 do
         local b = h == 1 and 1 or 2
         local name = h == 1 and "right" or "left"
         local was, now = bit(diag.held, b), bit(held, b)
         if was ~= now then
-            print(string.format("[driving] diag: %s hand %s the wheel%s, %s", name, now and "took" or "released",
+            diagPrint(string.format("[driving] diag: %s hand %s the wheel%s, %s", name, now and "took" or "released",
                 (not now and grip[h]) and " WHILE GRIP STILL HELD" or "", context()))
         end
         if grip[h] and not diag.grip[h] and not now then diag.pend[h] = 0 end
@@ -97,7 +105,7 @@ local function wheelDiag(dt)
                 diag.pend[h] = diag.pend[h] + math.max(0, dt or 0)
                 if diag.pend[h] >= 0.3 then
                     diag.pend[h] = nil
-                    print(string.format("[driving] diag: %s grip pressed but no grab (%s), %s", name,
+                    diagPrint(string.format("[driving] diag: %s grip pressed but no grab (%s), %s", name,
                         bit(armed, b) and "hand at the wheel" or "hand NOT near the wheel", context()))
                 end
             end
@@ -108,7 +116,7 @@ end
 
 registerForEvent("onUpdate", function(dt)
     local dok, derr = pcall(wheelDiag, dt)
-    if not dok and not diag.err then diag.err = true; print("[driving] diag error: " .. tostring(derr)) end
+    if not dok and not diag.err then diag.err = true; diagPrint("[driving] diag error: " .. tostring(derr)) end
     local ok, err = pcall(function()
         local state = Game.GetVRWheelControlState()
         if state == 0 then restore(); profileTime = 0.5; return end
