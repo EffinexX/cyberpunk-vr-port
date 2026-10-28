@@ -1827,6 +1827,9 @@ local function finish(P, hand, by, cancel)
     pcall(b.drag, nil, "end", hand)
   end
   local g = P.pend
+  if by == "trigger" and g ~= nil and (g.by ~= by or cancel) then
+    pcall(diagPrint, string.format("[VRMenu] diag: hand %d trigger release without click (pend by %s, cancel=%s)", hand, tostring(g.by), tostring(cancel)))
+  end
   if g ~= nil and g.by == by then
     P.pend = nil
     if not cancel and g.b ~= nil then
@@ -1836,6 +1839,7 @@ local function finish(P, hand, by, cancel)
         P.drag, P.dragBy = nil, nil
         pcall(g.b.drag, nil, "end", hand)
       else
+        if by == "trigger" then pcall(diagPrint, string.format("[VRMenu] diag: hand %d trigger click on %s", hand, tostring(g.b.key))) end
         click(g.b, hand, g.x0, g.y0)
       end
     end
@@ -1988,13 +1992,18 @@ local function pointers(cam, C, R, U)
       setCursor(hand, rayX, rayY, (P.trig or P.stickScroll) and 16 or 22, K.YELLOW, 1.0)
       cursor = true
     end
-    -- DIAG: a physical trigger pull that does not become a press, with every gate that can block it
-    local rawOn = trigger > TRIGGER_ON
-    if rawOn and not P.diagTrigPrev and (stickHeld or P.trig or not rayOn) then
+    -- DIAG: every physical trigger pull while the menu is open. The raw value comes from the controller
+    -- (shared slot 154 left / 160 right); `trigger` below is the one the menu uses, which only exists
+    -- while the avatar's finger bones resolve.
+    local raw = 0
+    pcall(function() raw = GetVRSharedSlot(hand == 1 and 154 or 160) or 0 end)
+    local rawOn = raw > TRIGGER_ON
+    if rawOn and not P.diagTrigPrev then
       pcall(function()
-        diagPrint(string.format("[VRMenu] diag: hand %d trigger pulled, no press: stickHeld=%s trigLatched=%s rayOn=%s ray(w=%.0f x=%.2f y=%.2f) poking=%s state=%s drag=%s pend=%s scroll=%s stickScroll=%s stick=%.2f",
-          hand, tostring(stickHeld), tostring(P.trig), tostring(rayOn), ray.w, ray.x, ray.y, tostring(poking), tostring(P.state),
-          tostring(P.dragBy), tostring(P.pend and P.pend.by), tostring(P.scroll and P.scroll.by), tostring(P.stickScroll ~= nil), stick or 0))
+        local willPress = not stickHeld and trigger > TRIGGER_ON and not P.trig and (rayOn or poking)
+        diagPrint(string.format("[VRMenu] diag: hand %d trigger pulled raw=%.2f menuTrigger=%.2f -> %s | stickHeld=%s trigLatched=%s rayOn=%s ray(w=%.0f x=%.2f y=%.2f) tip(w=%.0f) poking=%s state=%s drag=%s pend=%s scroll=%s stickScroll=%s",
+          hand, raw, trigger, willPress and "PRESS" or "no press", tostring(stickHeld), tostring(P.trig), tostring(rayOn), ray.w, ray.x, ray.y, tip.w,
+          tostring(poking), tostring(P.state), tostring(P.dragBy), tostring(P.pend and P.pend.by), tostring(P.scroll and P.scroll.by), tostring(P.stickScroll ~= nil)))
       end)
     end
     P.diagTrigPrev = rawOn
