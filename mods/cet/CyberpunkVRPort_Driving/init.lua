@@ -54,8 +54,7 @@ local function diagPrint(msg)
     print(msg)
     pcall(function()
         local f = io.open("diag.log", "a")
-        if f then f:write(os.date("[%Y-%m-%d %H:%M:%S] ") .. msg .. "
-"); f:close() end
+        if f then f:write(os.date("[%Y-%m-%d %H:%M:%S] ") .. msg .. "\n"); f:close() end
     end)
 end
 local diag = { mounted = false, state = nil, held = 0, grip = { false, false }, pend = {} }
