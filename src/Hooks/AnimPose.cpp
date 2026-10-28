@@ -292,6 +292,7 @@ if (g_VRRecordFK) {
                     // leaning keep working: the arms, or the upper body, are handed over, and roomscale
                     // still works.
                     if (suspend || DeviceCamActive() || posePairedAnimation) {
+                        ++g_MenuDiagSuspend; g_MenuDiagPaired = (suspend ? 1 : 0) | (DeviceCamActive() ? 2 : 0) | (posePairedAnimation ? 4 : 0);
                         return result;
                     }
                 }
@@ -684,6 +685,7 @@ if (g_VRRecordFK) {
                     // short camera-pair miss used to select the legacy shoulder
                     // anchor and move idle hands 11-15 cm toward the face.
                     if(!camModelValid) {
+                        ++g_MenuDiagCamMiss; g_MenuDiagLastCamStatus = int(cameraStatus);
                         cvr::anim::WheelMaintainGrab();
                         const auto action=snapEvent ? VrikCameraStatus::Invalidated : cameraStatus;
                         if(VRIK_RestoreMissingCamera(boneBuf,action,tickNow,GetTickCount64()))
@@ -2094,6 +2096,7 @@ if (g_VRRecordFK) {
                             *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(poseDesc)+0x20));
                         // Post-solve FK refresh is DIAG-ONLY (feeds g_VRIKDbgHandFK and the
                         // vrik_diag dump); skip the full-skeleton FK on normal frames.
+                        if (g_VRDiagCapture == 0) ++g_MenuDiagNoCapture;
                         if (g_VRDiagCapture != 0) {
                             VRIK_ComputeFK(boneBuf, VRIK_FKCount());
                             if (g_VRRightBoneIdx >= 0 && g_VRRightBoneIdx < VRIK_MAX_BONES) {
@@ -2119,6 +2122,7 @@ if (g_VRRecordFK) {
                                     g_VRFKSnapRot[i][3] = g_fkRot[i][3];
                                 }
                                 g_VRFKSnapCount = lim;
+                                ++g_MenuDiagSnap;
                             }
                         }
                     }

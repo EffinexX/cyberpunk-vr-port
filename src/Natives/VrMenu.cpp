@@ -20,6 +20,9 @@
 #include "Natives/VrMenu.hpp"
 #include "Anim/VrikHook.hpp"
 #include "Anim/VrikState.hpp"
+#include "Anim/HeadAimWeapon.hpp"
+#include "Camera/CameraState.hpp"
+extern void Log(const char* fmt, ...);
 #include "Overlay/VrOverlay.hpp"
 #include "Overlay/UiRec.hpp"
 #include "Runtimes/OpenXRManager.hpp"
@@ -222,6 +225,27 @@ void VRMenuPointer(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::
     const float w = size.X > 0.01f ? size.X : 1.0f, h = size.Y > 0.01f ? size.Y : 1.0f;
     VRControllerState input{};
     const bool haveInput = OpenXRManager::Get().GetControllerState(&input);
+    // LOCAL MENU DIAG: which path the player pose hook takes while the menu is open, every 2 s.
+    {
+        static ULONGLONG s_at = 0;
+        static uint64_t s_match = 0;
+        static int s_fresh = 0, s_replay = 0, s_susp = 0, s_cam = 0, s_snap = 0, s_nocap = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_at >= 2000) {
+            const uint64_t match = g_AnimPoseMatchCalls;
+            const int fresh = g_VRIKFreshTotal, replay = g_VRIKReplayTotal, susp = g_MenuDiagSuspend, cam = g_MenuDiagCamMiss,
+                      snap = g_MenuDiagSnap, nocap = g_MenuDiagNoCapture;
+            if (s_at) {
+                Log("[menu-diag] 2s: playerPasses %llu fresh %d replay %d suspended %d (why %d) camMiss %d (status %d) snapshots %d noCapture %d | bind %d diagCapture %d headAim %d tier %d palmValid %d viewValid %d snapCount %d | input %d trig L %.2f R %.2f\n",
+                    (unsigned long long)(match - s_match), fresh - s_fresh, replay - s_replay, susp - s_susp, int(g_MenuDiagPaired),
+                    cam - s_cam, int(g_MenuDiagLastCamStatus), snap - s_snap, nocap - s_nocap, int(g_VRBind), int(g_VRDiagCapture),
+                    cvr::anim::IsHeadAimWeaponActive() ? 1 : 0, g_sceneTier.load(std::memory_order_relaxed), int(g_VRPalmModelValid),
+                    int(g_VRViewWorldValid), int(g_VRFKSnapCount), haveInput ? 1 : 0, haveInput ? input.leftTrigger : -1.0f,
+                    haveInput ? input.rightTrigger : -1.0f);
+            }
+            s_at = now; s_match = match; s_fresh = fresh; s_replay = replay; s_susp = susp; s_cam = cam; s_snap = snap; s_nocap = nocap;
+        }
+    }
     float m2w[4];
     const bool frame = ModelToWorldFrame(m2w) && g_VRFKSnapCount > kIndex3[1];
     for (int side = 0; side < 2; ++side) {

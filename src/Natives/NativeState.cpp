@@ -222,6 +222,9 @@ volatile int       g_VRIKReplayTotal = 0;
 // Fresh solves, i.e. how often the arms/body actually move. The replay path re-writes the SAME
 // pose bit for bit, so this counter -- not the pose-apply count -- is the VRIK frame rate.
 volatile int       g_VRIKFreshTotal = 0;
+// LOCAL MENU DIAG: per-path counters of the player pose hook, read by VRMenuPointer.
+volatile int       g_MenuDiagSuspend = 0, g_MenuDiagCamMiss = 0, g_MenuDiagSnap = 0, g_MenuDiagNoCapture = 0;
+volatile int       g_MenuDiagLastCamStatus = -1, g_MenuDiagPaired = 0;
 // Where the hand frame takes the view quaternion from. 1 = the view PACKET (seqlock [143]),
 // the same latch the time-align's headOri_view comes from, so the re-basing cancels exactly.
 // 0 = the hands snapshot's copy of shared [104..107], which is what it was: a second capture of
