@@ -366,8 +366,6 @@ extern volatile uintptr_t g_VRIKLastBufA;         // distinct bone buffers seen 
 extern volatile uintptr_t g_VRIKLastBufB;
 extern volatile int       g_VRIKReplayTotal;      // same-tick replays served from the solve cache
 extern volatile int       g_VRIKFreshTotal;       // solves that actually recomputed the pose
-extern volatile int       g_MenuDiagSuspend, g_MenuDiagCamMiss, g_MenuDiagSnap, g_MenuDiagNoCapture;  // local menu diag
-extern volatile int       g_MenuDiagLastCamStatus, g_MenuDiagPaired;
 extern "C" __declspec(dllexport) extern volatile int CyberpunkVR_VrikHandFrameOneLatch;
 extern volatile int       CyberpunkVR_VrikHandFrameAlign;
 extern volatile float     g_VRIKDbgClav[2][8];

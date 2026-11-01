@@ -10,7 +10,6 @@ bool ParseSetting(const char*,Settings&);
 void WriteSettings(void*,const Settings&);
 bool Visible();
 bool CapturesInput();
-int DebugBits();   // LOCAL DIAG: 1 visible, 2 wanted, 4 releasePending, 8 capture
 void Toggle();
 // L3 + R3 held half a second: the VR menu (mods/cet/CyberpunkVRPort_Menu) is asked to open or close, once
 // per hold; the panel itself is F10 / INSERT. Read (and cleared) by VRMenuGesture.

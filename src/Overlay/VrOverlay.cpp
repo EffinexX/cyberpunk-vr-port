@@ -28,7 +28,6 @@ Settings GetSettings(){std::lock_guard lock(mutex);return settings;}
 void SetSettings(Settings s){std::lock_guard lock(mutex);settings=Sanitize(s);}
 bool Visible(){return visible.load(std::memory_order_relaxed);}
 bool CapturesInput(){return capture.load(std::memory_order_relaxed);}
-int DebugBits(){std::lock_guard lock(mutex);return (visible?1:0)|(wanted?2:0)|(releasePending?4:0)|(capture?8:0);}
 void Toggle(){std::lock_guard lock(mutex);ToggleLocked();}
 bool ConsumeMenuSummon(){std::lock_guard lock(mutex);const bool s=menuSummon;menuSummon=false;return s;}
 void Close(bool resume){std::lock_guard lock(mutex);wanted=false;visible=false;capture=true;releasePending=true;if(resume)command=2;ReleasePointer();}

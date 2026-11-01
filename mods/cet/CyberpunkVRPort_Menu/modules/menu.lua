@@ -62,15 +62,6 @@ local TOAST_Y = 1480
 -- Pointers, metres.
 local HOVER, PRESS, RELEASE, THROUGH = 0.10, 0.010, 0.025, -0.05
 local TRIGGER_ON, TRIGGER_OFF = 0.70, 0.40
--- DIAG: CET loses the tail of scripting.log when the game exits, so diagnostics also go to
--- diag.log in this mod's folder, flushed on every line.
-local function diagPrint(msg)
-  print(msg)
-  pcall(function()
-    local f = io.open("diag.log", "a")
-    if f then f:write(os.date("[%Y-%m-%d %H:%M:%S] ") .. msg .. "\n"); f:close() end
-  end)
-end
 local WALK_AWAY = 1.1
 -- A press in a list stays a tap until it has moved this far (canvas px); then it scrolls the list, or
 -- slides the slider it landed on when it went sideways. A FINGER'S OWN PUSH DOES NOT COUNT: pushed into
@@ -1762,9 +1753,6 @@ local function finish(P, hand, by, cancel)
     pcall(b.drag, nil, "end", hand)
   end
   local g = P.pend
-  if by == "trigger" and g ~= nil and (g.by ~= by or cancel) then
-    pcall(diagPrint, string.format("[VRMenu] diag: hand %d trigger release without click (pend by %s, cancel=%s)", hand, tostring(g.by), tostring(cancel)))
-  end
   if g ~= nil and g.by == by then
     P.pend = nil
     if not cancel and g.b ~= nil then
@@ -1774,7 +1762,6 @@ local function finish(P, hand, by, cancel)
         P.drag, P.dragBy = nil, nil
         pcall(g.b.drag, nil, "end", hand)
       else
-        if by == "trigger" then pcall(diagPrint, string.format("[VRMenu] diag: hand %d trigger click on %s", hand, tostring(g.b.key))) end
         click(g.b, hand, g.x0, g.y0)
       end
     end
@@ -1796,42 +1783,6 @@ local function pointers(cam, C, R, U)
   pcall(function()
     out = VRMenuPointer(Vector4.new(C[1], C[2], C[3], 1), Vector4.new(R[1], R[2], R[3], 0),
       Vector4.new(U[1], U[2], U[3], 0), Vector4.new(W, H, 0, 0))
-  end)
-  -- DIAG: dead pointers. The pointer is built from the avatar's finger bones, not the controller,
-  -- so frozen bones (origin not moving) or missing data leave the menu unusable.
-  pcall(function()
-    local D = S.diagPtr
-    if D == nil or D.openedAt ~= S.panelStart then
-      D = { openedAt = S.panelStart, since = S.time, last = {}, moved = { false, false }, said = -99 }
-      S.diagPtr = D
-    end
-    if out == nil or #out < 8 then
-      if S.time - D.said > 5 then
-        D.said = S.time
-        diagPrint(string.format("[VRMenu] diag: pointer data unavailable (out=%s n=%s)", tostring(out ~= nil), tostring(out and #out)))
-      end
-    else
-      local anyHit = false
-      for hand = 1, 2 do
-        local tip, ray, origin = out[(hand - 1) * 4 + 1], out[(hand - 1) * 4 + 2], out[(hand - 1) * 4 + 3]
-        if (tip.w > .5 and tip.x >= 0 and tip.x <= 1 and tip.y >= 0 and tip.y <= 1)
-          or (ray.w > .5 and ray.x >= 0 and ray.x <= 1 and ray.y >= 0 and ray.y <= 1) then anyHit = true end
-        local l = D.last[hand]
-        if l and (math.abs(l[1] - origin.x) + math.abs(l[2] - origin.y) + math.abs(l[3] - origin.z)) > 0.002 then
-          D.moved[hand] = true
-        end
-        D.last[hand] = { origin.x, origin.y, origin.z, origin.w, tip.w, ray.w }
-      end
-      if anyHit then
-        D.since = S.time; D.moved = { false, false }
-      elseif S.time - D.since > 3 and S.time - D.said > 5 then
-        D.said = S.time
-        local L, Rh = D.last[1], D.last[2]
-        diagPrint(string.format("[VRMenu] diag: no hand reaches the menu for %.0f s -- L(bones moved=%s tip=%.0f ray=%.0f trig=%.2f) R(bones moved=%s tip=%.0f ray=%.0f trig=%.2f)",
-          S.time - D.since, tostring(D.moved[1]), L[5], L[6], L[4], tostring(D.moved[2]), Rh[5], Rh[6], Rh[4]))
-        D.moved = { false, false }
-      end
-    end
   end)
   if out == nil or #out < 8 then
     for hand = 1, 2 do
@@ -1927,21 +1878,6 @@ local function pointers(cam, C, R, U)
       setCursor(hand, rayX, rayY, (P.trig or P.stickScroll) and 16 or 22, K.YELLOW, 1.0)
       cursor = true
     end
-    -- DIAG: every physical trigger pull while the menu is open. The raw value comes from the controller
-    -- (shared slot 154 left / 160 right); `trigger` below is the one the menu uses, which only exists
-    -- while the avatar's finger bones resolve.
-    local raw = 0
-    pcall(function() raw = GetVRSharedSlot(hand == 1 and 154 or 160) or 0 end)
-    local rawOn = raw > TRIGGER_ON
-    if rawOn and not P.diagTrigPrev then
-      pcall(function()
-        local willPress = not stickHeld and trigger > TRIGGER_ON and not P.trig and (rayOn or poking)
-        diagPrint(string.format("[VRMenu] diag: hand %d trigger pulled raw=%.2f menuTrigger=%.2f -> %s | stickHeld=%s trigLatched=%s rayOn=%s ray(w=%.0f x=%.2f y=%.2f) tip(w=%.0f) poking=%s state=%s drag=%s pend=%s scroll=%s stickScroll=%s",
-          hand, raw, trigger, willPress and "PRESS" or "no press", tostring(stickHeld), tostring(P.trig), tostring(rayOn), ray.w, ray.x, ray.y, tip.w,
-          tostring(poking), tostring(P.state), tostring(P.dragBy), tostring(P.pend and P.pend.by), tostring(P.scroll and P.scroll.by), tostring(P.stickScroll ~= nil)))
-      end)
-    end
-    P.diagTrigPrev = rawOn
     if not stickHeld and trigger > TRIGGER_ON and not P.trig then
       P.trig = true
       -- the trigger presses what the pointer is on, or what the finger hovers when it is that close
@@ -1990,42 +1926,18 @@ local function tick(dt)
   if S.columnAction and S.time>=S.columnAction.at then
     local b=S.columnAction.button;S.columnAction=nil;invokeClick(b)
   end
-  if Gameplay.transition(kit, dt) then
-    -- DIAG: a wait transition that never finishes swallows every open request
-    local tr = S.waitTransition
-    if tr and S.time - tr.started > 15 and S.time - (S.diagTransAt or -99) > 10 then
-      S.diagTransAt = S.time
-      diagPrint(string.format("[VRMenu] diag: wait transition stuck for %.0f s (phase %s)", S.time - tr.started, tostring(tr.phase)))
-    end
-    return
-  end
+  if Gameplay.transition(kit, dt) then return end
   -- the swipe is read every frame, open or not: the history lives in the plugin
   local g = nil
   if type(VRMenuGesture) == "function" then pcall(function() g = VRMenuGesture() end) end
   -- L3 + R3 held, or the gripped swipe down: open or close, the menu straight ahead either way
-  -- LOCAL CHANGE: the swipe is ignored (it fired while steering); only the L3 + R3 hold opens/closes
-  if g ~= nil and #g >= 1 and g[1].x > 1.5 then
-    local how = g[1].x > 1.5 and "L3+R3" or "swipe"
+  if g ~= nil and #g >= 1 and (g[1].x > 1.5 or #g >= 3) then
     if S.open then
       -- A physical grip swipe must not interrupt a list grabbed with R3. The explicit
       -- L3 + R3 chord still closes it; discard any incidental swipe during the grab.
       if g[1].x>1.5 or not Stick.blocksSwipe(S.hands[2],S.time) then M.close() end
     elseif not armed() and sceneTier() < 3 and not paused() then
-      local opened = M.open(camera())
-      if not opened then
-        diagPrint(string.format("[VRMenu] diag: %s open failed (transition=%s surfaceReady=%s camera=%s open=%s)",
-          how, tostring(S.waitTransition ~= nil), tostring(type(VRMenuSurfaceReady) == "function"),
-          tostring(camera() ~= nil), tostring(S.open)))
-      end
-    else
-      -- DIAG: say which gate refused it, and what sits in the right weapon slot
-      local item = "none"
-      pcall(function()
-        local w = Game.GetTransactionSystem():GetItemInSlot(Game.GetPlayer(), TweakDBID.new("AttachmentSlots.WeaponRight"))
-        if w then item = TDBID.ToStringDEBUG(w:GetItemID().id) end
-      end)
-      diagPrint(string.format("[VRMenu] diag: %s refused (armed=%s item=%s sceneTier=%s paused=%s)",
-        how, tostring(armed()), tostring(item), tostring(sceneTier()), tostring(paused())))
+      M.open(camera())
     end
   end
   if not S.open then return end
