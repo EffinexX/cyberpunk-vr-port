@@ -186,6 +186,73 @@ void DrawVRHandsControls() {
     {
         LiveControlsUiState st{};
         GetLiveControlsUiState(&st);
+        bool fingers = st.xrFingerTracking != 0;
+        if (UI::Checkbox("Finger tracking on empty hands", &fingers)) {
+            st.xrFingerTracking = fingers ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("An empty hand's fingers follow the controller's finger sensing (Index controllers on SteamVR).\n"
+                              "Off, or where the runtime has none: they follow grip and trigger.\n"
+                              "Only draws the fingers. A hand holding a weapon or an item keeps its grip.");
+        }
+        bool collision = st.xrHandCollision != 0;
+        if (UI::Checkbox("Hand collision", &collision)) {
+            st.xrHandCollision = collision ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Hands and arms stop at the body and at each other.\n"
+                              "Empty hands also stop at walls and furniture (static world geometry).\n"
+                              "Only the drawn arm stops; your real hand does not.");
+        }
+        bool collisionVehicle = st.xrHandCollisionVehicle != 0;
+        if (UI::Checkbox("Hand collision in vehicles", &collisionVehicle)) {
+            st.xrHandCollisionVehicle = collisionVehicle ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Seated, hands stop at the body and each other, not at the car.\n"
+                              "A hand on the wheel is never stopped.");
+        }
+        bool handPush = st.xrHandPush != 0;
+        if (UI::Checkbox("Hands push loose objects", &handPush)) {
+            st.xrHandPush = handPush ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("An empty hand clear of the body shoves bottles, crates and the like, and a hand pressed\n"
+                              "against a light prop knocks that one prop loose. Never in a vehicle.\n"
+                              "Experimental: turn it off if the player is ever thrown about.");
+        }
+        bool fingerContact = st.xrFingerContact != 0;
+        if (UI::Checkbox("Fingers stop at surfaces", &fingerContact)) {
+            st.xrFingerContact = fingerContact ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Closing an empty hand, each finger stops where it meets something, so a hand\n"
+                              "rests on a table or closes round a pipe. Never in a vehicle.");
+        }
+        bool propGrab = st.xrPropGrab != 0;
+        if (UI::Checkbox("Pick up small objects", &propGrab)) {
+            st.xrPropGrab = propGrab ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Squeeze the grip at a loose object up to 6 kg to carry it, let go to drop or throw it.\n"
+                              "On Index controllers, squeezing hard crushes it.\n"
+                              "Experimental: turn it off if the player is ever thrown about.");
+        }
+        float contactCm = st.xrContactMargin * 100.0f;
+        if (UI::SliderFloat("Distance kept from surfaces (cm)", &contactCm, 0.0f, 5.0f, "%.1f")) {
+            st.xrContactMargin = contactCm * 0.01f;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("The game's collision is simpler and often smaller than what is drawn. More distance keeps\n"
+                              "hands and fingers out of the mesh, and makes them stop a little before they touch.");
+        }
         bool roomscale = st.xrRoomscaleMovement != 0;
         if (UI::Checkbox("Roomscale movement", &roomscale)) {
             st.xrRoomscaleMovement = roomscale ? 1 : 0;
@@ -629,6 +696,12 @@ static bool DrawDrivingControls(LiveControlsUiState& state) {
             UI::Separator();
             UI::TextUnformatted("Driving -- hands on the wheel");
             changed |= CheckboxInt("Grab the wheel with the grips", &state.xrWheelGrab);
+            changed |= CheckboxInt("Hold a car's wheel anywhere on the rim", &state.xrWheelAnywhere);
+            if (UI::IsItemHovered()) {
+                UI::SetTooltip("Your hand stays where you took hold and slides round the rim with your own hand, so\n"
+                                  "you can steer one-handed from the top and change grip in a hard turn.\n"
+                                  "Off: a grab puts the hand where the driving animation holds it. Bikes always do.");
+            }
             if (UI::IsItemHovered()) {
                 UI::SetTooltip(
                     "While DRIVING, bring a hand to where the driving animation holds the\n"
@@ -1101,12 +1174,6 @@ bool DrawLiveControls(LiveControlsUiState& state,int section,bool* foveatedEditi
                 UI::SetTooltip("Hold Y: a small wheel opens in front of the body and the game keeps running.\n"
                                   "Point at a weapon, the arm cyberware, fists, a grenade or a consumable, then let go of Y.\n"
                                   "A tap of Y is still the next weapon. Off: the game's own wheel, which slows time.");
-            }
-            changed |= CheckboxInt("Finger tracking on empty hands", &state.xrFingerTracking);
-            if (UI::IsItemHovered()) {
-                UI::SetTooltip("An empty hand's fingers follow the controller's finger sensing (Index controllers on SteamVR).\n"
-                                  "Off, or where the runtime has none: they follow grip and trigger.\n"
-                                  "Only draws the fingers. A hand holding a weapon or an item keeps its grip.");
             }
             UI::Separator();
 

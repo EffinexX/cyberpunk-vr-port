@@ -335,8 +335,20 @@ On **empty hands** the fingers follow the controller's finger sensing where the
 runtime offers `XR_EXT_hand_tracking` (Index controllers on SteamVR): each finger
 on its own, including the fingertip that presses screens, so lift the index off
 the trigger to touch one. It only draws the fingers; a hand holding a weapon or an
-item keeps its grip (*Controls → Finger tracking on empty hands*; off = grip and
+item keeps its grip (*Avatar → Finger tracking on empty hands*; off = grip and
 trigger).
+
+**Hand collision** (*Avatar → Hand collision*): the drawn hands and arms stop at the
+body, at each other and at people, empty hands stop at walls, furniture and props, and a
+ranged weapon stops at walls and furniture by the outline of its own meshes: the wrist
+and the support hand are pushed out of the surface, and the shot keeps its direction. An
+empty hand clear of the body also shoves loose objects (*Hands push loose objects*). A
+hand closed on the gun as its support is not stopped at all. It moves the arm's target and
+nothing else, so your real hand keeps going and nothing gets pushed.
+A hand that holds a cigarette or the wheel is left alone, and seated only the body and
+the other hand stop it (*Hand collision in vehicles*).
+
+**Touching things** (*Avatar*): a hand gives a loose object its own speed while it presses on it, and a gun moves it aside. *Pick up small objects* carries anything loose up to 6 kg with the grip and throws it on release; on Index controllers squeezing hard crushes it. *Fingers stop at surfaces* lays each finger on what it closes on. *Distance kept from surfaces* keeps hands off meshes larger than their collision. A hand on a car's wheel (*Hold a car's wheel anywhere on the rim*) stays where it took hold and turns with the drawn wheel. No grenade comes off the belt while seated.
 
 Steam Frame uses the native `XR_VALVE_frame_controller_interaction` profile when
 available. Right A/B/X/Y, left D-pad, left View, right Menu and both bumpers map
@@ -463,7 +475,7 @@ play: it is for diagnosis and it costs both frame time and a very large log.
 | `CyberpunkVRPort_WristHud` | Lua | The living tattoo readout on the left forearm |
 | `CyberpunkVRPort_ForceFPP` | Lua | Camera bridge: publishes scene, device and UI state to the camera director (legacy folder name) |
 | `CyberpunkVRPort_Reload` | Lua | The physical reload — thirteen per-weapon configs, the magazine, the slide, the revolver cylinder |
-| `CyberpunkVRPort_HandCollision` | Lua | Hand / finger / weapon push-out. **Off since 0.1.2** (`COLL_ON = false`) — the body capsules came back out of the archive after a vehicle launched the player |
+| `CyberpunkVRPort_HandCollision` | Lua | Hand / finger / weapon push-out and the empty hands' stop at the world, by moving the arm targets. The body capsules' physics stays off since a vehicle launched the player |
 | `CyberpunkVRPort_Crosshair` | Lua | Hides the game's own crosshair while decoupled VR aim is on |
 | `CyberpunkVRPort_Holster` | Lua + reds | Hand-to-holster equip/unequip (immersive / simple) |
 | `CyberpunkVRPort_Smoking` | Lua + reds | Cigarette / lighter props, FX, audio, auto-puff |

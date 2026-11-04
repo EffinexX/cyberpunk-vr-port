@@ -124,6 +124,16 @@ struct LiveControls {
     // 1 (default) = an empty hand's fingers follow the controller's finger sensing where the runtime offers it
     // (Runtimes/HandTracking.hpp). 0 = they follow grip and trigger.
     volatile int xrFingerTracking = 1;
+    // 1 (default) = hands and arms stop at the body, each other and the world, in CyberpunkVRPort_HandCollision.
+    volatile int xrHandCollision = 1;
+    // 1 (default) = ...at the body and each other in a vehicle too. Only moves arm targets, so it cannot move the car.
+    volatile int xrHandCollisionVehicle = 1;
+    // 1 (default) = an empty hand clear of the body shoves loose objects, by capsules in the player's template.
+    volatile int xrHandPush = 1;
+    volatile int xrFingerContact = 1;
+    volatile int xrPropGrab = 1;
+    volatile float xrContactMargin = 0.01f;   // m kept from a surface, because the collision is smaller than the mesh
+    volatile int xrWheelAnywhere = 1;
 };
 
 extern LiveControls g_liveControls;

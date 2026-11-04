@@ -5,6 +5,7 @@
 #include "Anim/VrikHook.hpp"
 #include "Anim/ReloadPose.hpp"
 #include "Anim/Cyberware.hpp"
+#include "Anim/WheelGrab.hpp"
 #include "Core/VrCoreShared.hpp"
 #include <atomic>
 #include <cstring>
@@ -20,6 +21,11 @@ namespace cvr::gestures {
 namespace {
 std::atomic<uint64_t> input{},equipment{},fingers[2]{};
 struct State {Targets pose;CalibrationWeights calibration{};uint32_t epoch=~0u;uint64_t stamp{};};
+// How much each finger is held back from closing, so that zero (the start, and a hand long unreported) means free.
+std::atomic<float> contactHeld[2][5]{};
+std::atomic<uint64_t> contactStamp[2]{};
+std::atomic<uint64_t> contactAsked[2][5]{};
+constexpr uint64_t kContactFreshMs=400;
 State state[2];
 uint64_t Byte(float v){return uint64_t(std::clamp(std::isfinite(v)?v:0.f,0.f,1.f)*255.f+.5f);}
 void Blend(const float* a,const float* b,float t,float* out) {
@@ -56,6 +62,16 @@ void PublishFingers(int side,const float* closed) {
 void PublishEquipment(int mask) {
     equipment.store((GetTickCount64()<<2)|uint64_t(mask&3),std::memory_order_release);
 }
+void FingerContact(int side,int digit,float gap) {
+    if(side<0 || side>1 || digit<0 || digit>4 || !std::isfinite(gap))return;
+    const auto now=GetTickCount64();
+    const auto asked=contactAsked[side][digit].exchange(now,std::memory_order_relaxed);
+    // long unasked, the finger has been free
+    const float limit=asked && now-asked<=kContactFreshMs ? 1-contactHeld[side][digit].load(std::memory_order_relaxed):1.f;
+    const float next=StepFingerLimit(limit,FingerLimit(CyberpunkVR_GestureClosed[side][digit],gap),float(now-asked)*.001f);
+    contactHeld[side][digit].store(1-next,std::memory_order_relaxed);
+    contactStamp[side].store(now,std::memory_order_relaxed);
+}
 namespace {
 bool MeasuredFingers(int side,uint64_t now,float* closed) {
     const auto packed=fingers[side].load(std::memory_order_acquire);
@@ -66,7 +82,7 @@ bool MeasuredFingers(int side,uint64_t now,float* closed) {
 }
 void Apply(uint8_t* buffer) {
     CyberpunkVR_GestureMode[0]=CyberpunkVR_GestureMode[1]=0;
-    if(!buffer || g_VRBind!=4 || g_isInVehicle)return;
+    if(!buffer || g_VRBind!=4)return;
     const auto controls=input.load(std::memory_order_acquire),held=equipment.load(std::memory_order_acquire);
     const auto now=GetTickCount64();
     if(!((controls>>33)&1) || ((now-(controls>>34))&0x3fffffffull)>250 ||
@@ -82,17 +98,31 @@ void Apply(uint8_t* buffer) {
         // The wire's catch is timed to its payout, whatever the fingers do.
         float measured[5];
         const bool tracked=!wire && MeasuredFingers(side,now,measured);
+        // SEATED, a hand's fingers are its own while they are measured and it is not on the wheel. On the wheel they are the driving
+        // animation's, and without a measurement WheelFingers gives it the relaxed hand it always had.
+        if(g_isInVehicle && (!tracked || (side==0 ? anim::g_wheelBlendLeft:anim::g_wheelBlendRight).load(std::memory_order_relaxed)>.01f)) {
+            state[side]={};CyberpunkVR_GestureMode[side]=0;continue;
+        }
         // R3 belongs only to the right hand. L3 remains the game's ability. Measured, a thumb is simply up.
         const bool thumb=side==1 && !tracked && ((controls>>32)&1)!=0;
         auto& s=state[side];
         if(s.epoch!=epoch) {
-            const auto wanted=tracked?FromFingers(measured):Evaluate(grip,trigger,thumb,wire,cyberware::WireDeployment(side));
+            auto wanted=tracked?FromFingers(measured):Evaluate(grip,trigger,thumb,wire,cyberware::WireDeployment(side));
+            const auto contactAt=contactStamp[side].load(std::memory_order_relaxed);
+            float mayClose[5]={1,1,1,1,1};
+            if(!wire && contactAt && now>=contactAt && now-contactAt<=kContactFreshMs)
+                for(int digit=0;digit<5;++digit) {
+                    mayClose[digit]=1-contactHeld[side][digit].load(std::memory_order_relaxed);
+                    wanted.closed[digit]=std::min(wanted.closed[digit],mayClose[digit]);
+                }
             const auto calibration=tracked?FingerCalibration(measured):CalibrationTargets(grip,trigger,thumb,wire);
             const float dt=s.stamp && now>=s.stamp?std::min(float(now-s.stamp)*.001f,.05f):.016f;
             const float blend=wire?1.f:1-std::exp(-dt/.04f);
             for(int digit=0;digit<5;++digit) {
                 s.pose.closed[digit]=tracked?FollowFinger(s.pose.closed[digit],wanted.closed[digit],blend,digit,dt):
                     s.pose.closed[digit]+(wanted.closed[digit]-s.pose.closed[digit])*blend;
+                // a surface moves a finger now, without the pace of a hand opening
+                s.pose.closed[digit]=std::min(s.pose.closed[digit],mayClose[digit]);
                 s.pose.straight[digit]+=(wanted.straight[digit]-s.pose.straight[digit])*blend;
                 CyberpunkVR_GestureClosed[side][digit]=s.pose.closed[digit];
                 CyberpunkVR_GestureStraight[side][digit]=s.pose.straight[digit];

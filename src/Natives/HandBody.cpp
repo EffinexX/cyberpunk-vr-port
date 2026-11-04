@@ -11,6 +11,7 @@
 #include <sstream>
 #include <locale>
 #include <clocale>
+#include "Core/VrCoreShared.hpp"
 #include "Utils/SharedSlots.hpp"   // CyberpunkVR_Hands_Shared slot map (single source of truth)
 #include <RED4ext/Containers/StaticArray.hpp>
 #include <RED4ext/Scripting/Natives/ScriptGameInstance.hpp>
@@ -22,6 +23,7 @@
 #include <RED4ext/Scripting/Natives/animRig.hpp>
 #include <RED4ext/Scripting/Natives/Generated/Vector4.hpp>
 #include <RED4ext/Scripting/Natives/Generated/Quaternion.hpp>
+#include <RED4ext/Scripting/Natives/Generated/physics/TraceResult.hpp>
 #include <RED4ext/Scripting/Natives/Generated/anim/AnimGraph.hpp>
 #include <RED4ext/Scripting/Natives/Generated/anim/AnimFeature_IK.hpp>
 #include <RED4ext/Scripting/Natives/Generated/anim/AnimFeature_MeleeIKData.hpp>
@@ -837,6 +839,104 @@ void VRBodySetKinematic(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
     RED4ext::CStack stack(h.instance, args, 1, nullptr);
     const bool ok = VRSafeExecute(f, &stack);
     if (aOut) *aOut = ok;
+}
+
+// THE BODY A RAY HIT.
+//
+// physicsTraceResult is 0x60 bytes and script sees three fields of it. The rest, read off the game's own conversion from a
+// PhysX hit (sub_1403DDE38 in 2.5): +0x48 the proxy, +0x4C the body within it (the PxActor's userData, which is those two
+// packed), +0x50 the shape, +0x54 the distance, +0x59 the proxy's kind (byte 0x34 of the proxy, physics::ProxyType).
+// And entPhysicalBodyInterface is nothing but that pair: its natives read +0x40 as the proxy and +0x44 as the body and look
+// the rest up, validating the id. So one instance, filled in from a hit, IS the body it hit, and every VRBody* native works
+// on it. Measured in game: small props are kind 10 (aggregate), 1 (physical system) or 3 (destruction); kind 7 is the
+// world's baked collision, mass 0, and answers nothing.
+namespace {
+constexpr uint8_t kProxyPhysicalSystem = 1, kProxyDestruction = 3, kProxyAggregate = 10;
+
+bool TraceMoves(uint8_t kind) {
+    return kind == kProxyPhysicalSystem || kind == kProxyDestruction || kind == kProxyAggregate;
+}
+
+RED4ext::IScriptable* NewBody(uint32_t proxy, uint32_t body) {
+    auto* cls = RED4ext::CRTTISystem::Get()->GetClass("entPhysicalBodyInterface");
+    if (!cls) return nullptr;
+    auto* instance = static_cast<RED4ext::IScriptable*>(cls->CreateInstance(true));
+    if (!instance) return nullptr;
+    auto* raw = reinterpret_cast<uint8_t*>(instance);
+    *reinterpret_cast<uint32_t*>(raw + 0x40) = proxy;
+    *reinterpret_cast<uint32_t*>(raw + 0x44) = body;
+    return instance;
+}
+
+// Once per proxy in the log: the numbers the next test is read from.
+void TraceNote(uint32_t proxy, uint32_t body, uint32_t shape, uint8_t kind, float mass) {
+    static uint32_t s_seen[256] = {};
+    static uint32_t s_next = 0;
+    for (const auto seen : s_seen)
+        if (seen == proxy + 1) return;
+    s_seen[s_next++ % 256] = proxy + 1;
+    Log("[HandColl] touched proxy=%u body=%u shape=%u kind=%u mass=%.2f\n", proxy, body, shape, kind, mass);
+}
+
+struct TraceIds { uint32_t proxy, body, shape; uint8_t kind; };
+
+TraceIds ReadTrace(const RED4ext::physics::TraceResult& trace) {
+    const auto* raw = reinterpret_cast<const uint8_t*>(&trace);
+    return { *reinterpret_cast<const uint32_t*>(raw + 0x48), *reinterpret_cast<const uint32_t*>(raw + 0x4C),
+             *reinterpret_cast<const uint32_t*>(raw + 0x50), raw[0x59] };
+}
+}  // namespace
+
+// VRTraceInfo(trace) -> Vector4: x the kind, y the proxy, z the body, w the mass. All zero when the trace carries no proxy.
+void VRTraceInfo(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Vector4* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    alignas(16) RED4ext::physics::TraceResult trace{};
+    RED4ext::GetParameter(aFrame, &trace);
+    aFrame->code++;
+    if (!aOut) return;
+    *aOut = RED4ext::Vector4{};
+    const auto ids = ReadTrace(trace);
+    if (ids.proxy == 0) return;
+    float mass = 0.0f;
+    if (TraceMoves(ids.kind)) {
+        static RED4ext::IScriptable* s_scratch = nullptr;
+        if (!s_scratch) s_scratch = NewBody(ids.proxy, ids.body);
+        if (s_scratch) {
+            auto* raw = reinterpret_cast<uint8_t*>(s_scratch);
+            *reinterpret_cast<uint32_t*>(raw + 0x40) = ids.proxy;
+            *reinterpret_cast<uint32_t*>(raw + 0x44) = ids.body;
+            VRBodyCallGet(s_scratch, "GetMass", "Float", &mass, sizeof(mass));
+        }
+    }
+    TraceNote(ids.proxy, ids.body, ids.shape, ids.kind, mass);
+    aOut->X = static_cast<float>(ids.kind);
+    aOut->Y = static_cast<float>(ids.proxy);
+    aOut->Z = static_cast<float>(ids.body);
+    aOut->W = mass;
+}
+
+// VRTraceBody(trace) -> the body, for the VRBody* natives. Null for a kind that does not move.
+void VRTraceBody(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Handle<RED4ext::IScriptable>* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    alignas(16) RED4ext::physics::TraceResult trace{};
+    RED4ext::GetParameter(aFrame, &trace);
+    aFrame->code++;
+    if (!aOut) return;
+    const auto ids = ReadTrace(trace);
+    if (ids.proxy == 0 || !TraceMoves(ids.kind)) return;
+    if (auto* instance = NewBody(ids.proxy, ids.body)) *aOut = RED4ext::Handle<RED4ext::IScriptable>(instance);
+}
+
+// The body's orientation, beside VRBodyGetPos.
+void VRBodyGetRot(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Quaternion* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Handle<RED4ext::IScriptable> h;
+    RED4ext::GetParameter(aFrame, &h);
+    aFrame->code++;
+    if (!aOut) return;
+    aOut->i = 0.0f; aOut->j = 0.0f; aOut->k = 0.0f; aOut->r = 1.0f;
+    RED4ext::Transform t{};
+    if (VRBodyCallGet(h.instance, "GetTransform", "Transform", &t, sizeof(t))) *aOut = t.orientation;
 }
 
 // Is the body currently solver-owned? Read back rather than assumed, because SetIsKinematic can silently
