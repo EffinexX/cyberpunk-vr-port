@@ -1,5 +1,7 @@
+#include "Fbt/Game/Trackers.hpp"
 #include "Runtimes/PresenceRecenter.hpp"
 #include "Runtimes/HandTracking.hpp"
+#include "Runtimes/FingerGrip.hpp"
 #include "Utils/DebugGate.hpp"
 #include "Core/LiveControls.hpp"
 #include "Runtimes/HybridBodyYaw.hpp"
@@ -660,6 +662,11 @@ bool OpenXRManager::Init() {
     if (m_initialized) return true;
 
     Log("OpenXRManager: Initializing...\n");
+    // Workaround to disable unsupported HTC hand tracking: HTC's Vive software installs an implicit OpenXR API layer,
+    // XR_APILAYER_VIVE_hand_tracking, that implements XR_EXT_hand_tracking itself and reports the hands not active for
+    // seconds at a time, also with Valve Index controllers. This variable is the layer's own off switch; the OpenXR
+    // loader reads it when the instance is created, so it is set before that.
+    SetEnvironmentVariableW(L"DISABLE_XR_APILAYER_VIVE_HAND_TRACKING_1", L"1");
     ConfigurePreferredOpenXRRuntime();
 
     // Extensions we need
@@ -687,6 +694,11 @@ bool OpenXRManager::Init() {
                 }
             }
         }
+        cvr::trackers::ChooseExtensions(props, extensions);     // only with xr_vive_trackers=1
+        cvr::fingergrip::ChooseExtensions(props, extensions);   // only with xr_grip_from_fingers=1
+        // Two modules can ask for the same one (Runtimes/HandTracking.cpp, Runtimes/FingerGrip.cpp): each name once.
+        for(size_t i=0;i<extensions.size();++i)for(size_t j=extensions.size();j-->i+1;)
+            if(strcmp(extensions[i],extensions[j])==0)extensions.erase(extensions.begin()+j);
         Log("OpenXRManager: depth-layer (XR_KHR_composition_layer_depth) supported=%d\n", m_depthLayerSupported ? 1 : 0);
         Log("OpenXRManager: Steam Frame controller (%s) supported=%d\n",cvr::input::SteamFrameExtension,steamFrameEnabled?1:0);
     }
@@ -702,6 +714,7 @@ bool OpenXRManager::Init() {
         Log("OpenXRManager: Failed to create XrInstance (res=%d)\n", res);
         return false;
     }
+    cvr::trackers::OnInstanceCreated(m_instance);
 
     XrInstanceProperties instanceProps{XR_TYPE_INSTANCE_PROPERTIES};
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &instanceProps))) {
@@ -838,6 +851,7 @@ bool OpenXRManager::Init() {
             makeAction(m_hapticAction,          XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic",         "Haptic Feedback",      true);
             if(steamFrameEnabled)m_steamFrameActions.Create(makeAction);
         }
+        cvr::trackers::CreateActions(m_instance, m_actionSet);
         Log("OpenXRManager[Input]: gameplay action set %s (xr_input_actions=%d)\n",
             inputActionsEnabled ? "ENABLED" : "DISABLED (pose-only)", (int)inputActionsEnabled);
 
@@ -1078,6 +1092,7 @@ bool OpenXRManager::InitGraphics(ID3D12Device* device, ID3D12CommandQueue* queue
         Log("OpenXRManager: Failed to create XrSession (res=%d)\n", res);
         return false;
     }
+    cvr::fingergrip::OnSessionCreated(m_instance, m_session);
 
     m_runtimeFovLogInitialized = false;
     m_loggedRuntimeEyeFovs[0] = {};
@@ -1161,6 +1176,7 @@ bool OpenXRManager::InitGraphics(ID3D12Device* device, ID3D12CommandQueue* queue
                 xrCreateActionSpace(m_session, &aimSpaceInfo, &m_handAimSpaces[i]);
             }
         }
+        cvr::trackers::OnSessionCreated(m_session, m_handSpaces);
     }
 
     m_stopFrameThread.store(false, std::memory_order_relaxed);
@@ -1747,8 +1763,12 @@ bool OpenXRManager::GetRoomscaleSample(cvr::roomscale::Sample* out, OpenXRHeadPo
     // A hip hinge is room-fixed upper-body motion, not a request to walk CCT.
     // Full optical head motion is still retained in head for camera/hands.
     if(cvr::swimming::Active())head.bodyBend={};
-    const cvr::roomscale::Sample frame{{head.posX-head.bodyBend.right,-head.posZ-head.bodyBend.forward},sequence,head.originSerial,sampledUs,
-                                       haveFrame && head.valid};
+    // ...and a head turned is no step: the neck is walked, not the eyes (Runtimes/RoomscaleMovement.hpp EyeFromNeck).
+    const auto lever=Get3DofMovement()!=0 ? cvr::roomscale::Vec2{} :
+        cvr::roomscale::EyeFromNeck(head.oriX,head.oriY,head.oriZ,head.oriW);
+    cvr::roomscale::Sample frame{{head.posX-head.bodyBend.right-lever.x,-head.posZ-head.bodyBend.forward-lever.y},
+                                 sequence,head.originSerial,sampledUs,haveFrame && head.valid};
+    frame.eyeFromNeck=lever;
     *out=cvr::roomscale::MovementFrameSample(tracking,frame);
     if (out->valid) {
         if (frameHead) *frameHead=head;
@@ -1891,9 +1911,10 @@ extern "C" __declspec(dllexport) extern int CyberpunkVR_WeaponClass;
 extern bool g_hasWeaponEquipped;
 
 // UNDER FRAME GENERATION every hand rate above (the base and the weapon classes) is taken times this --
-// the rate and half of it again, a lighter filter -- instead of switching the filter off there, as it
-// used to be. 0 switches it off under framegen again. xr_hand_lerp_framegen_scale, live.
-extern "C" __declspec(dllexport) float CyberpunkVR_HandLerpFramegenScale = 1.5f;
+// the rate and a quarter of it again, a lighter filter -- instead of switching the filter off there, as it
+// used to be (1.5 until 2026-11-05, asked lower by players). 0 switches it off under framegen again.
+// xr_hand_lerp_framegen_scale, live.
+extern "C" __declspec(dllexport) float CyberpunkVR_HandLerpFramegenScale = 1.25f;
 
 static float EffectiveHandLerpSpeed() {
     const float base = CyberpunkVR_HandLerpSpeed;
@@ -2455,6 +2476,8 @@ void OpenXRManager::Shutdown() {
     m_stageUnavailable = false;
 
     if (m_session != XR_NULL_HANDLE) {
+        cvr::trackers::OnSessionDestroying();
+        cvr::fingergrip::OnSessionDestroying();
         xrDestroySession(m_session);
         m_session = XR_NULL_HANDLE;
     }

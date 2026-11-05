@@ -24,6 +24,7 @@
 #include "Anim/Cyberware.hpp"
 #include "Camera/CameraLink.hpp"   // cvr::camera::BarrelFrameRead
 #include "Hooks/SightLine.hpp"
+#include "Utils/SharedSlots.hpp"   // vrshared::kLeftMuzzle* (the left gun's dot)
 #include "Stereo/EngineStereo.hpp"
 #include "Overlay/OverlayInternal.hpp"
 #include "Natives/DebugView.hpp"
@@ -662,6 +663,89 @@ void DrawDebugView() {
             if(!toScreen(ax,ay,az,&pa) || !toScreen(bx,by,bz,&pb))continue;
             dl->AddLine(pa,pb,palette[s.color<ColorCount?s.color:0],1.2f);
         }
+        dl->PopClipRect();
+    }
+}
+
+// THE LEFT GUN'S DOT, two guns in hand: the mark DrawBarrelCrosshair makes, of the LEFT barrel -- the one the
+// reload mod publishes beside the right gun's (dual_wield.lua SetVRLeftMuzzle: shared[166..168] the muzzle,
+// [169..171] its forward, [172] valid, while [165] says two guns are out; the shot of the left gun leaves it too,
+// Hooks/WeaponAim.cpp WaLeftGunFired). Green, so the two marks are told apart. Under engine stereo both eyes get
+// it in this pass; otherwise only the first eye does (the second eye's composite carries the right gun's dot).
+void DrawLeftBarrelDot() {
+    if (!g_drawBarrelCross) return;
+    auto& xr = OpenXRManager::Get();
+    if (xr.GetSharedSlot(vrshared::kDualWieldActive) < 0.5f || xr.GetSharedSlot(vrshared::kLeftMuzzleValid) < 0.5f)
+        return;
+    const float mp[3] = {xr.GetSharedSlot(vrshared::kLeftMuzzlePos), xr.GetSharedSlot(vrshared::kLeftMuzzlePos + 1),
+                         xr.GetSharedSlot(vrshared::kLeftMuzzlePos + 2)};
+    float mf[3] = {xr.GetSharedSlot(vrshared::kLeftMuzzleFwd), xr.GetSharedSlot(vrshared::kLeftMuzzleFwd + 1),
+                   xr.GetSharedSlot(vrshared::kLeftMuzzleFwd + 2)};
+    const float fl2 = mf[0] * mf[0] + mf[1] * mf[1] + mf[2] * mf[2];
+    if (!(fl2 > 0.25f) || !(mp[0] * mp[0] + mp[1] * mp[1] + mp[2] * mp[2] > 1.0f)) return;
+    const float inv = 1.0f / std::sqrt(fl2);
+    mf[0] *= inv; mf[1] *= inv; mf[2] *= inv;
+
+    cvr::camera::BarrelFrame bf{};
+    if (!cvr::camera::BarrelFrameRead(&bf)) return;
+    const float cqx = bf.camQuat[0], cqy = bf.camQuat[1], cqz = bf.camQuat[2], cqw = bf.camQuat[3];
+    const float hcx = static_cast<float>(g_lastLocatePosFP[0]) / 131072.0f;
+    const float hcy = static_cast<float>(g_lastLocatePosFP[1]) / 131072.0f;
+    const float hcz = static_cast<float>(g_lastLocatePosFP[2]) / 131072.0f;
+    if (!(hcx * hcx + hcy * hcy + hcz * hcz > 1.0f)) return;
+
+    const bool engineStereo = cvr::engine_stereo::Enabled();
+    if (engineStereo && cvr::engine_stereo::OnePicture()) return;
+    const ImVec2 backbufferSize = ImGui::GetIO().DisplaySize;
+    const ImVec2 displaySize(engineStereo ? backbufferSize.x * 0.5f : backbufferSize.x, backbufferSize.y);
+    if (displaySize.x <= 1.0f || displaySize.y <= 1.0f) return;
+
+    const float rgt[3] = {1.0f - 2.0f * (cqy * cqy + cqz * cqz), 2.0f * (cqx * cqy + cqz * cqw),
+                          2.0f * (cqx * cqz - cqy * cqw)};
+    float halfIpd = CyberpunkVRPort_HalfIpd();
+    if (!(halfIpd > 0.0001f)) halfIpd = xr.GetSharedSlot(95);
+    if (!(halfIpd > 0.0001f)) halfIpd = 0.0325f;
+    const float D = CyberpunkVR_BarrelDotDistM;
+    if (!(D > 0.5f)) return;
+    // The point the left bullet reaches at D, seen from one eye (sign as DrawBarrelCrosshair's).
+    const auto dotForEye = [&](float sign, ImVec2* out) -> bool {
+        const float dx = (mp[0] + mf[0] * D) - (hcx + rgt[0] * halfIpd * sign);
+        const float dy = (mp[1] + mf[1] * D) - (hcy + rgt[1] * halfIpd * sign);
+        const float dz = (mp[2] + mf[2] * D) - (hcz + rgt[2] * halfIpd * sign);
+        float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+        RotateVectorByQuaternion(dx, dy, dz, -cqx, -cqy, -cqz, cqw, &lx, &ly, &lz);
+        return ProjectHeadSpacePointToScreen(lx, lz, -ly, displaySize, out);
+    };
+    const float sMain = engineStereo ? (CyberpunkVR_MainIsRightEye ? 1.0f : -1.0f)
+                                     : ((CyberpunkVR_BarrelDotEyeSign >= 0) ? +1.0f : -1.0f);
+    ImVec2 sc{}, scSecond{};
+    if (!dotForEye(sMain, &sc)) return;
+    if (!dotForEye(-sMain, &scSecond)) scSecond = sc;
+
+    constexpr float rad = 3.0f;
+    const ImU32 green = IM_COL32(60, 255, 90, 255);
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    if (!dl) return;
+    if (!engineStereo) {
+        dl->AddCircleFilled(sc, rad, green);
+        return;
+    }
+    const int mainEye = CyberpunkVR_MainIsRightEye ? 1 : 0;
+    float x2 = (scSecond.x / displaySize.x) * 2.0f - 1.0f, y2 = 1.0f - (scSecond.y / displaySize.y) * 2.0f;
+    AsymEyeWindows asym{};
+    if (cvr::projection::Active() && xr.GetAsymmetricEyeWindows(&asym)) {
+        x2 = cvr::projection::MapNdcX(x2, asym.eye[mainEye], asym.eye[1 - mainEye]);
+        y2 = cvr::projection::MapNdcY(y2, asym.eye[mainEye], asym.eye[1 - mainEye]);
+    }
+    x2 += CyberpunkVR_BarrelDotOffX2;
+    const float x1 = (sc.x / displaySize.x) * 2.0f - 1.0f, y1 = 1.0f - (sc.y / displaySize.y) * 2.0f;
+    for (int eye = 0; eye != 2; ++eye) {
+        const float x = eye == mainEye ? x1 : x2;
+        const float y = eye == mainEye ? y1 : y2;
+        const float left = float(eye) * displaySize.x;
+        dl->PushClipRect(ImVec2(left, 0), ImVec2(left + displaySize.x, displaySize.y), true);
+        dl->AddCircleFilled(ImVec2(left + (x * 0.5f + 0.5f) * displaySize.x, (0.5f - y * 0.5f) * displaySize.y), rad,
+                            green);
         dl->PopClipRect();
     }
 }
