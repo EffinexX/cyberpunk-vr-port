@@ -132,6 +132,10 @@ struct LiveControls {
     volatile int xrHandPush = 1;
     volatile int xrFingerContact = 1;
     volatile int xrPropGrab = 1;
+    // 1 = the collision view: capsules, PhysX shapes and rays drawn in the world. Never saved on: it costs frames.
+    volatile int xrDebugView = 0;
+    volatile int xrCarryPicture = 1;          // a carried thing is drawn on the hand, its body following
+    volatile float xrCarryLead = 0.03f;       // s a carried thing is put ahead of the hand
     volatile float xrContactMargin = 0.01f;   // m kept from a surface, because the collision is smaller than the mesh
     volatile int xrWheelAnywhere = 1;
 };

@@ -240,9 +240,37 @@ void DrawVRHandsControls() {
             SetLiveControlsUiState(&st, 1);
         }
         if (UI::IsItemHovered()) {
-            UI::SetTooltip("Squeeze the grip at a loose object up to 6 kg to carry it, let go to drop or throw it.\n"
-                              "On Index controllers, squeezing hard crushes it.\n"
+            UI::SetTooltip("Squeeze the grip at a loose object to carry it, let go to drop or throw it. One hand lifts\n"
+                              "about 6 kg, two about 30, and the other hand can take it over.\n"
                               "Experimental: turn it off if the player is ever thrown about.");
+        }
+        bool debugView = st.xrDebugView != 0;
+        if (UI::Checkbox("Show collision shapes and rays", &debugView)) {
+            st.xrDebugView = debugView ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("For finding faults, and it costs frame rate. Stays off after a restart.\n"
+                              "Blue the hands, cyan the fingers, magenta people. From PhysX within 2 m: grey the world, yellow what moves.\n"
+                              "Rays: green free, red up to what they hit. In a carried thing: orange the place taken, white the palm.");
+        }
+        bool carryPicture = st.xrCarryPicture != 0;
+        if (UI::Checkbox("Carried objects stick to the hand", &carryPicture)) {
+            st.xrCarryPicture = carryPicture ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Draws a carried thing on the hand in the same frame, while its body follows in the physics.\n"
+                              "Against a wall the picture goes back to the body. Off: the picture is on the body, and trails a swing.");
+        }
+        float leadMs = st.xrCarryLead * 1000.0f;
+        if (UI::SliderFloat("Carried objects lead the hand (ms)", &leadMs, 0.0f, 100.0f, "%.0f")) {
+            st.xrCarryLead = leadMs * 0.001f;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Physics reaches the screen after the hand does. Raise it until a thing swung fast stops trailing the hand,\n"
+                              "lower it if it runs ahead when the hand stops.");
         }
         float contactCm = st.xrContactMargin * 100.0f;
         if (UI::SliderFloat("Distance kept from surfaces (cm)", &contactCm, 0.0f, 5.0f, "%.1f")) {

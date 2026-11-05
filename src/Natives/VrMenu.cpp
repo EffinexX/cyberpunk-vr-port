@@ -341,13 +341,47 @@ void VRHandCollision(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, int32_t
 
 void VRFingerContact(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
     int32_t side = 0, digit = 0;
-    float gap = 1.0f;
+    float limit = 1.0f;
+    bool hold = false;
     RED4ext::GetParameter(stack, &side);
     RED4ext::GetParameter(stack, &digit);
-    RED4ext::GetParameter(stack, &gap);
+    RED4ext::GetParameter(stack, &limit);
+    RED4ext::GetParameter(stack, &hold);
     stack->code++;
-    cvr::gestures::FingerContact(side, digit, gap);
+    cvr::gestures::FingerContact(side, digit, limit, hold);
     if (out) *out = true;
+}
+
+void VRFingerBend(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    int32_t side = 0, digit = 0;
+    float angle = 0.0f;
+    RED4ext::GetParameter(stack, &side);
+    RED4ext::GetParameter(stack, &digit);
+    RED4ext::GetParameter(stack, &angle);
+    stack->code++;
+    cvr::gestures::FingerBend(side, digit, angle);
+    if (out) *out = true;
+}
+
+void VRFingerClosed(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, float* out, int64_t) {
+    int32_t side = 0, digit = 0;
+    RED4ext::GetParameter(stack, &side);
+    RED4ext::GetParameter(stack, &digit);
+    stack->code++;
+    if (out) *out = cvr::gestures::FingerClosed(side, digit);
+}
+
+void VRFingerWanted(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, float* out, int64_t) {
+    int32_t side = 0, digit = 0;
+    RED4ext::GetParameter(stack, &side);
+    RED4ext::GetParameter(stack, &digit);
+    stack->code++;
+    if (out) *out = cvr::gestures::FingerWanted(side, digit);
+}
+
+void VRCarryLead(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, float* out, int64_t) {
+    stack->code++;
+    if (out) *out = g_liveControls.xrCarryLead;
 }
 
 void VRHandContactMargin(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, float* out, int64_t) {

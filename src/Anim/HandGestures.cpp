@@ -8,6 +8,7 @@
 #include "Anim/WheelGrab.hpp"
 #include "Core/VrCoreShared.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstring>
 
 extern "C" int CyberpunkVR_CarryLeft;
@@ -25,6 +26,11 @@ struct State {Targets pose;CalibrationWeights calibration{};uint32_t epoch=~0u;u
 std::atomic<float> contactHeld[2][5]{};
 std::atomic<uint64_t> contactStamp[2]{};
 std::atomic<uint64_t> contactAsked[2][5]{};
+std::atomic<bool> contactForce[2][5]{};
+std::atomic<float> contactBack[2][5]{};
+std::atomic<uint64_t> contactBackAt[2][5]{};
+std::atomic<float> gestureWanted[2][5]{};
+float contactWaited[2][5]{};
 constexpr uint64_t kContactFreshMs=400;
 State state[2];
 uint64_t Byte(float v){return uint64_t(std::clamp(std::isfinite(v)?v:0.f,0.f,1.f)*255.f+.5f);}
@@ -62,15 +68,41 @@ void PublishFingers(int side,const float* closed) {
 void PublishEquipment(int mask) {
     equipment.store((GetTickCount64()<<2)|uint64_t(mask&3),std::memory_order_release);
 }
-void FingerContact(int side,int digit,float gap) {
-    if(side<0 || side>1 || digit<0 || digit>4 || !std::isfinite(gap))return;
+void FingerContact(int side,int digit,float limit,bool hold) {
+    if(side<0 || side>1 || digit<0 || digit>4 || !std::isfinite(limit))return;
+    limit=std::clamp(limit,0.f,1.f);
     const auto now=GetTickCount64();
     const auto asked=contactAsked[side][digit].exchange(now,std::memory_order_relaxed);
-    // long unasked, the finger has been free
-    const float limit=asked && now-asked<=kContactFreshMs ? 1-contactHeld[side][digit].load(std::memory_order_relaxed):1.f;
-    const float next=StepFingerLimit(limit,FingerLimit(CyberpunkVR_GestureClosed[side][digit],gap),float(now-asked)*.001f);
+    const bool wasHeld=contactForce[side][digit].exchange(hold,std::memory_order_relaxed);
+    // long unasked, the finger has been free; and letting go of a thing opens the hand at its own pace, not the surface's
+    const bool free=!asked || now-asked>kContactFreshMs || (wasHeld && !hold);
+    const float was=free?1.f:1-contactHeld[side][digit].load(std::memory_order_relaxed);
+    const float next=hold?limit:StepFingerLimit(was,limit,std::min(float(now-asked)*.001f,.1f),contactWaited[side][digit]);
     contactHeld[side][digit].store(1-next,std::memory_order_relaxed);
     contactStamp[side].store(now,std::memory_order_relaxed);
+}
+void FingerBend(int side,int digit,float angle) {
+    if(side<0 || side>1 || digit<1 || digit>4 || !std::isfinite(angle))return;
+    // A real clock: the tick count moves in 16 ms steps, and the calls come 2 and 21 ms apart. It eases in and out, and the rate is capped, so a wall found late does not snap a finger back.
+    constexpr float riseTau=.07f,fallTau=.18f,mostRate=7.f,most=1.5f;
+    static thread_local std::chrono::steady_clock::time_point last[2][5];
+    const auto clock=std::chrono::steady_clock::now();
+    const float wanted=std::clamp(angle,0.f,most);
+    const auto now=GetTickCount64();
+    const auto asked=contactBackAt[side][digit].exchange(now,std::memory_order_relaxed);
+    const bool fresh=asked && now-asked<=kContactFreshMs;
+    const float was=fresh?contactBack[side][digit].load(std::memory_order_relaxed):0.f;
+    const float dt=fresh?std::min(std::chrono::duration<float>(clock-last[side][digit]).count(),.1f):0.f;
+    last[side][digit]=clock;
+    const float pull=(wanted-was)*(1-std::exp(-dt/(wanted>was?riseTau:fallTau)));
+    const float next=was+std::clamp(pull,-mostRate*dt,mostRate*dt);
+    contactBack[side][digit].store(next,std::memory_order_relaxed);
+}
+float FingerClosed(int side,int digit) {
+    return side<0 || side>1 || digit<0 || digit>4 ? 0.f:CyberpunkVR_GestureClosed[side][digit];
+}
+float FingerWanted(int side,int digit) {
+    return side<0 || side>1 || digit<0 || digit>4 ? 0.f:gestureWanted[side][digit].load(std::memory_order_relaxed);
 }
 namespace {
 bool MeasuredFingers(int side,uint64_t now,float* closed) {
@@ -108,12 +140,14 @@ void Apply(uint8_t* buffer) {
         auto& s=state[side];
         if(s.epoch!=epoch) {
             auto wanted=tracked?FromFingers(measured):Evaluate(grip,trigger,thumb,wire,cyberware::WireDeployment(side));
+            for(int digit=0;digit<5;++digit)gestureWanted[side][digit].store(wanted.closed[digit],std::memory_order_relaxed);
             const auto contactAt=contactStamp[side].load(std::memory_order_relaxed);
             float mayClose[5]={1,1,1,1,1};
             if(!wire && contactAt && now>=contactAt && now-contactAt<=kContactFreshMs)
                 for(int digit=0;digit<5;++digit) {
                     mayClose[digit]=1-contactHeld[side][digit].load(std::memory_order_relaxed);
-                    wanted.closed[digit]=std::min(wanted.closed[digit],mayClose[digit]);
+                    wanted.closed[digit]=contactForce[side][digit].load(std::memory_order_relaxed)?mayClose[digit]:
+                        std::min(wanted.closed[digit],mayClose[digit]);
                 }
             const auto calibration=tracked?FingerCalibration(measured):CalibrationTargets(grip,trigger,thumb,wire);
             const float dt=s.stamp && now>=s.stamp?std::min(float(now-s.stamp)*.001f,.05f):.016f;
@@ -150,6 +184,20 @@ void Apply(uint8_t* buffer) {
                 if(std::strcmp(pose.suffix,"InHandThumb")==0)ThumbReference(side,straightGoal);
                 Blend(rest,straightGoal,s.pose.straight[pose.group],straight);
                 Blend(straight,closed,s.pose.closed[pose.group],q);
+                // PRESSED BACK, at the first joint and against the way this joint closes. Its closing is a turn on the parent's side, so this is too.
+                if(pose.group>0 && !std::strncmp(pose.suffix,"Hand",4) && pose.suffix[std::strlen(pose.suffix)-1]=='1') {
+                    const auto backAt=contactBackAt[side][pose.group].load(std::memory_order_relaxed);
+                    const float back=backAt && now-backAt<=kContactFreshMs?contactBack[side][pose.group].load(std::memory_order_relaxed):0.f;
+                    const float length=std::sqrt(delta[0]*delta[0]+delta[1]*delta[1]+delta[2]*delta[2]);
+                    if(back>.001f && length>1e-4f) {
+                        const float sign=delta[3]<0?1.f:-1.f;   // the short way round is the way it closes
+                        const float half=back*.5f,sine=std::sin(half)*sign/length;
+                        const float turn[4]={delta[0]*sine,delta[1]*sine,delta[2]*sine,std::cos(half)};
+                        float result[4];
+                        VRIK_QuatMul(turn,q,result);VRIK_QuatNorm(result);
+                        std::copy_n(result,4,q);
+                    }
+                }
                 break;
             }
             ApplyCalibration(side,names[k]+prefix,s.calibration,reinterpret_cast<float*>(buffer+bone*48+VRIK_ROT_OFF));

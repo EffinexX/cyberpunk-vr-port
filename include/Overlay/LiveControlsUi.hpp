@@ -144,6 +144,9 @@ struct LiveControlsUiState {
     int xrHandPush = 1;
     int xrFingerContact = 1;
     int xrPropGrab = 1;
+    int xrDebugView = 0;
+    int xrCarryPicture = 1;
+    float xrCarryLead = 0.03f;
     float xrContactMargin = 0.01f;
     int xrWheelAnywhere = 1;
     // Controller tilt that means full lock, degrees. 90 (default) = hands vertical, the 1:1 reading of

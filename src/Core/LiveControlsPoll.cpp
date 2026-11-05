@@ -651,6 +651,8 @@ void PollLiveControls() {
     int xrHandPush = g_liveControls.xrHandPush;
     int xrFingerContact = g_liveControls.xrFingerContact;
     int xrPropGrab = g_liveControls.xrPropGrab;
+    int xrCarryPicture = g_liveControls.xrCarryPicture;
+    float xrCarryLead = g_liveControls.xrCarryLead;
     float xrContactMargin = g_liveControls.xrContactMargin;
     int xrWheelAnywhere = g_liveControls.xrWheelAnywhere;
     float xrWheelRadius = g_liveControls.xrWheelRadius > 0.0f ? g_liveControls.xrWheelRadius : 0.28f;
@@ -1579,6 +1581,16 @@ void PollLiveControls() {
             xrPropGrab = intValue;
             continue;
         }
+        if (sscanf_s(line, "xr_carry_picture=%d", &intValue) == 1 ||
+            sscanf_s(line, "xr_carry_picture = %d", &intValue) == 1) {
+            xrCarryPicture = intValue;
+            continue;
+        }
+        if (sscanf_s(line, "xr_carry_lead=%f", &value) == 1 ||
+            sscanf_s(line, "xr_carry_lead = %f", &value) == 1) {
+            xrCarryLead = value;
+            continue;
+        }
         if (sscanf_s(line, "xr_contact_margin=%f", &value) == 1 ||
             sscanf_s(line, "xr_contact_margin = %f", &value) == 1) {
             xrContactMargin = value;
@@ -1781,6 +1793,8 @@ void PollLiveControls() {
     g_liveControls.xrHandPush = xrHandPush != 0 ? 1 : 0;
     g_liveControls.xrFingerContact = xrFingerContact != 0 ? 1 : 0;
     g_liveControls.xrPropGrab = xrPropGrab != 0 ? 1 : 0;
+    g_liveControls.xrCarryPicture = xrCarryPicture != 0 ? 1 : 0;
+    g_liveControls.xrCarryLead = xrCarryLead < 0.0f ? 0.0f : (xrCarryLead > 0.1f ? 0.1f : xrCarryLead);
     g_liveControls.xrContactMargin = xrContactMargin < 0.0f ? 0.0f : (xrContactMargin > 0.05f ? 0.05f : xrContactMargin);
     g_liveControls.xrWheelAnywhere = xrWheelAnywhere != 0 ? 1 : 0;
     // Clamped, not trusted: these come from a text file. Below ~8 cm the grab is unreachable for a
@@ -2118,6 +2132,9 @@ LiveControlsUiState MakeLiveControlsUiState() {
     state.xrHandPush = g_liveControls.xrHandPush;
     state.xrFingerContact = g_liveControls.xrFingerContact;
     state.xrPropGrab = g_liveControls.xrPropGrab;
+    state.xrDebugView = g_liveControls.xrDebugView;
+    state.xrCarryPicture = g_liveControls.xrCarryPicture;
+    state.xrCarryLead = g_liveControls.xrCarryLead;
     state.xrContactMargin = g_liveControls.xrContactMargin;
     state.xrWheelAnywhere = g_liveControls.xrWheelAnywhere;
     state.xrWheelRadius = g_liveControls.xrWheelRadius;
@@ -2470,6 +2487,8 @@ void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_hand_push=%d\n", state.xrHandPush != 0 ? 1 : 0);
     fprintf(file, "xr_finger_contact=%d\n", state.xrFingerContact != 0 ? 1 : 0);
     fprintf(file, "xr_prop_grab=%d\n", state.xrPropGrab != 0 ? 1 : 0);
+    fprintf(file, "xr_carry_picture=%d\n", state.xrCarryPicture != 0 ? 1 : 0);
+    fprintf(file, "xr_carry_lead=%.3f\n", state.xrCarryLead);
     fprintf(file, "xr_contact_margin=%.3f\n", state.xrContactMargin);
     fprintf(file, "xr_wheel_anywhere=%d\n", state.xrWheelAnywhere != 0 ? 1 : 0);
     fprintf(file, "xr_wheel_radius=%.3f\n", state.xrWheelRadius > 0.0f ? state.xrWheelRadius : 0.28f);
@@ -2620,6 +2639,9 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
     g_liveControls.xrHandPush = state->xrHandPush != 0 ? 1 : 0;
     g_liveControls.xrFingerContact = state->xrFingerContact != 0 ? 1 : 0;
     g_liveControls.xrPropGrab = state->xrPropGrab != 0 ? 1 : 0;
+    g_liveControls.xrDebugView = state->xrDebugView != 0 ? 1 : 0;
+    g_liveControls.xrCarryPicture = state->xrCarryPicture != 0 ? 1 : 0;
+    g_liveControls.xrCarryLead = state->xrCarryLead < 0.0f ? 0.0f : (state->xrCarryLead > 0.1f ? 0.1f : state->xrCarryLead);
     g_liveControls.xrContactMargin = state->xrContactMargin < 0.0f ? 0.0f : (state->xrContactMargin > 0.05f ? 0.05f : state->xrContactMargin);
     g_liveControls.xrWheelAnywhere = state->xrWheelAnywhere != 0 ? 1 : 0;
     g_liveControls.xrWheelHorn = state->xrWheelHorn != 0 ? 1 : 0;

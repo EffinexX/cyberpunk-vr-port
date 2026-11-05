@@ -549,9 +549,10 @@ local NPC_BODY = { recs = {}, at = {}, turn = 0, seen = false,
     slots = { 'Head', 'Chest', 'Hips', 'LeftArm', 'RightArm', 'LeftForeArm', 'RightForeArm', 'LeftHand', 'RightHand',
               'LegLeft', 'LegRight', 'LeftFoot', 'RightFoot' },
     -- joint, joint, radius, and how far the capsule's end sits above the joint
-    bones = { { 3, 2, 0.100 }, { 2, 1, 0.060 }, { 1, 1, 0.095, 0.09 }, { 2, 4, 0.070 }, { 2, 5, 0.070 },
+    -- The ragdoll's radii, wider on the trunk and legs: clothes and flesh stand further off a bone than its ragdoll does.
+    bones = { { 3, 2, 0.145 }, { 2, 1, 0.060 }, { 1, 1, 0.095, 0.09 }, { 2, 4, 0.070 }, { 2, 5, 0.070 },
               { 4, 6, 0.060 }, { 5, 7, 0.060 }, { 6, 8, 0.050 }, { 7, 9, 0.050 },
-              { 3, 10, 0.080 }, { 3, 11, 0.080 }, { 10, 12, 0.060 }, { 11, 13, 0.060 } },
+              { 3, 10, 0.105 }, { 3, 11, 0.105 }, { 10, 12, 0.080 }, { 11, 13, 0.080 } },
 }
 
 local function npcAlive(e)
@@ -1048,20 +1049,21 @@ local function bodyOf(tr)
     local ok, info = pcall(VRTraceInfo, tr)
     if not ok or not info then sayOnce('trace call failed') return nil end
     if info.y == 0.0 then sayOnce('trace without a proxy') return nil end
-    if info.x ~= 1.0 and info.x ~= 3.0 and info.x ~= 10.0 then return nil end
+    if info.x ~= 1.0 and info.x ~= 3.0 and info.x ~= 10.0 and info.x ~= 12.0 then return nil end
     local key = info.y * 4096.0 + info.z
     local rec = BODIES[key]
     if rec == nil then
         local okB, body = pcall(VRTraceBody, tr)
         if not okB or not body then sayOnce('no body from a trace') return nil end
         if bodyCount >= 128 then BODIES, bodyCount = {}, 0 end
-        rec = { key = key, body = body, kind = info.x, mass = info.w > 0.01 and info.w or 1.0 }
+        rec = { key = key, body = body, kind = info.x, proxy = info.y, index = info.z, mass = info.w > 0.01 and info.w or 1.0, massless = info.w <= 0.01 }
         BODIES[key] = rec
         bodyCount = bodyCount + 1
     end
     return rec
 end
 
+local WOKEN = {}
 local function bodyWake(rec, now)
     if rec.checked then return end
     rec.checked = true
@@ -1071,6 +1073,8 @@ local function bodyWake(rec, now)
     if ok and kin == 1 then
         pcall(VRBodySetKinematic, rec.body, false)
         rec.woke = now
+        rec.settled = 0.0
+        WOKEN[rec] = true
     end
 end
 
@@ -1119,8 +1123,18 @@ local function lightMaterial(name)
     return false
 end
 
+-- Every ray this mod sends goes through here, so the collision view sees them all: green free, red up to what it hit.
+local DBG = { on = false }
 local function castRay(sys, a, b, preset, staticOnly, dynamicOnly)
-    return sys:SyncRaycastByQueryPreset(a, b, preset, staticOnly, dynamicOnly)
+    if not DBG.on or DBG.arm then return sys:SyncRaycastByQueryPreset(a, b, preset, staticOnly, dynamicOnly) end
+    local hit, tr = sys:SyncRaycastByQueryPreset(a, b, preset, staticOnly, dynamicOnly)
+    if hit and tr then
+        local p = Vector4.new(tr.position.x, tr.position.y, tr.position.z, 1.0)
+        pcall(VRDebugRay, a, p, 2)
+    else
+        pcall(VRDebugRay, a, b, 1)
+    end
+    return hit, tr
 end
 
 -- A wall answers one preset or another (some are Sight Blockers, some only stop a Bullet), so a static ray that missed asks
@@ -1149,6 +1163,8 @@ local function worldRay(side, line, dynamic, ox, oy, oz, bx, by, bz, qi, qj, qk,
     local slot = worldSlot(side, line, dynamic)
     -- what this hand carries is in the way of every dynamic ray it sends, and is not a surface
     if dynamic and HOLD[side] then WORLD_HIT[slot] = false return end
+    -- the first frames after a load have no hand yet
+    if not PX[side] then WORLD_HIT[slot] = false return end
     local dx, dy, dz = PX[side] - ox, PY[side] - oy, PZ[side] - oz
     local len = math.sqrt(dx * dx + dy * dy + dz * dz)
     if len < WORLD_MIN_RAY then WORLD_HIT[slot] = false return end
@@ -1231,6 +1247,13 @@ local function worldRay(side, line, dynamic, ox, oy, oz, bx, by, bz, qi, qj, qk,
         if worldMisses >= 180 then worldMisses, worldPreset = 0, worldPreset % #WORLD_PRESETS + 1 end
     end
 end
+-- Not in the collision view: from the body along each arm to the hand, in turn, they only get in the way of what it is for.
+local worldRayDrawn = worldRay
+worldRay = function(...)
+    DBG.arm = true
+    worldRayDrawn(...)
+    DBG.arm = false
+end
 
 -- Keeps one wrist in front of every surface answered, each in turn. Works on PX/PY/PZ, so the body's answer comes first.
 -- `bare`: a hand with a gun in it has no fingers to lead with.
@@ -1307,8 +1330,74 @@ end
 --
 -- Static only: every ray starts inside the gun's own collider, and that collider is not static. A melee weapon is left
 -- out, or a swing would stop short of a target at a wall.
-local WEAPON_MAX = 0.60       -- m the wrist is pushed out before the wall is given up on: an arm's length, so it holds
+local WEAPON_MAX = 1.0        -- m the wrist is pushed out before the wall is given up on. A rifle is longer than an arm: at .6 it went into the wall before the wrist got there
 local WEAPON_RAYS = 3         -- a frame while nothing touches, so the whole box is fresh within five; touching, all of it
+-- The numbers of what follows, in one table: this function is at the limit of its locals.
+local K = {}
+do
+    local ok, t = pcall(function() return require('weapon_shapes') end)
+    K.WEAPON_SHAPES = ok and t or {}
+end
+K.OPEN_SPEED, K.OPEN_RANGE, K.OPEN_LIMIT = 1.0, 0.14, 0.3     -- m/s, m, how far fingers close at what the palm sees
+K.DEAD_RANGE, K.DEAD_NEAR, K.DEAD_AGAIN, K.DEAD_WAIT, K.FORCED = 2.5, 1.2, 4.0, 0.8, {}   -- m, m round the hand, s before asked again, s the closed hand waits for it to appear
+K.CORPSE_LOST = 3.0
+K.RAGDOLL_REST_EVERY = 5.0   -- s between asking whether one at rest is still there: its limbs are not looked at
+K.RAGDOLLS, K.RAGDOLL_SPEED, K.RAGDOLL_EVERY, K.RAGDOLL_CHECK, K.RAGDOLL_ASKED_FOR = {}, 0.1, 0.25, 0.6, 6.0   -- by proxy; m/s of its fastest limb; s between looks; s after it was told to sleep; s a ragdoll asked for and never taken stays
+K.NPC_GRIP, K.NPC_TEAR, K.NPC_TEAR_FOR, K.NPC_REACH = {}, 0.2, 0.1, 1.6     -- m past what the part can reach the grip gives, for this many seconds; and m from the person's chest in any case
+-- What a grip can take of a person: the part, the slot it is solved from, the slots near which it counts, m from the palm. Nearest by its own reach.
+K.NPC_PARTS = {
+    { part = 0, ref = 'LeftHand', slots = { 'LeftHand', 'LeftForeArm' }, reach = 0.2, name = 'left arm', skin = 0.04 },
+    { part = 1, ref = 'RightHand', slots = { 'RightHand', 'RightForeArm' }, reach = 0.2, name = 'right arm', skin = 0.04 },
+    { part = 2, ref = 'LeftFoot', slots = { 'LeftFoot', 'LegLeft' }, reach = 0.2, name = 'left leg', skin = 0.05 },
+    { part = 3, ref = 'RightFoot', slots = { 'RightFoot', 'LegRight' }, reach = 0.2, name = 'right leg', skin = 0.05 },
+    { part = 4, ref = 'Head', slots = { 'Head' }, reach = 0.24, name = 'head', skin = 0.07, up = 0.09 },
+    { part = 5, ref = 'Chest', slots = { 'Chest' }, reach = 0.26, name = 'chest', skin = 0.1, down = 0.3 },
+}
+-- WHAT A FRAME COSTS, by the part of this mod that spent it, every 10 s; and at once when a frame took long.
+K.PF_LONG, K.PF_NOW, K.PF_SUM, K.PF_MOST, K.PF_TICKS, K.PF_SAID, K.PF_SPIKES = 0.04, {}, {}, {}, 0, 0.0, 0
+K.pf = function(name)
+    local c = os.clock()
+    K.PF_NOW[name] = (K.PF_NOW[name] or 0.0) + (c - (K.PF_LAST or c))
+    K.PF_LAST = c
+end
+K.pfBegin = function()
+    local c = os.clock()
+    local total = 0.0
+    for name, spent in pairs(K.PF_NOW) do
+        total = total + spent
+        K.PF_SUM[name] = (K.PF_SUM[name] or 0.0) + spent
+        if spent > (K.PF_MOST[name] or 0.0) then K.PF_MOST[name] = spent end
+    end
+    if total > K.PF_LONG and K.PF_SPIKES < 3 then
+        K.PF_SPIKES = K.PF_SPIKES + 1
+        local rows = {}
+        for name, spent in pairs(K.PF_NOW) do
+            if spent > 0.002 then rows[#rows + 1] = string.format('%s %.0f', name, spent * 1000.0) end
+        end
+        local said = table.concat(rows, ', ')
+        pcall(function() spdlog.info(string.format('[cost] a long frame, %.0f ms: %s', total * 1000.0, said)) end)
+    end
+    for name in pairs(K.PF_NOW) do K.PF_NOW[name] = 0.0 end
+    K.PF_TICKS = K.PF_TICKS + 1
+    if c - K.PF_SAID > 10.0 then
+        local ticks, over = K.PF_TICKS, c - K.PF_SAID
+        local rows = {}
+        for name, spent in pairs(K.PF_SUM) do
+            if spent * 1000.0 / ticks > 0.05 or (K.PF_MOST[name] or 0.0) > 0.01 then rows[#rows + 1] = string.format('%s %.2f (%.0f)', name, spent * 1000.0 / ticks, (K.PF_MOST[name] or 0.0) * 1000.0) end
+        end
+        table.sort(rows)
+        local said = table.concat(rows, ', ')
+        pcall(function() spdlog.info(string.format('[cost] %.0f ticks a second; ms a tick (most): %s', ticks / over, said)) end)
+        K.PF_SUM, K.PF_MOST, K.PF_TICKS, K.PF_SAID, K.PF_SPIKES = {}, {}, 0, c, 0
+    end
+    K.PF_LAST = c
+end
+K.PULL_CONE = 0.2      -- rad either side of where the hand points
+K.HL_ON, K.HL_WANT, K.HL_NOW, K.HL_AIM, K.HL_LOCK = true, {}, {}, 5, 6
+K.PULL, K.PREVIEW, K.PREVIEW_EVERY, K.PULL_OUT, K.PULL_STILL = {}, {}, 6, 0.35, 1.5     -- marks: every so many turns, a hand this far off the body, at no more than this m/s
+K.PULL_RANGE, K.PULL_MASS, K.PULL_AIM_FOR, K.PULL_FLICK = 6.0, 6.0, 1.5, 1.0   -- m, kg, s the mark lasts, m/s of the hand back along the way to the thing
+K.PULL_SPEED, K.PULL_TIME_LEAST, K.PULL_TIME_MOST, K.PULL_WAIT_MORE, K.PULL_TAKE = 7.0, 0.25, 0.7, 0.5, 0.3
+K.NPC_TOUCH, K.NPC_MOVING, K.NPC_EVERY = 0.45, 0.5, 1.5        -- m round a person's axis, m/s of the hand, s between bumps
 local WEAPON_BOX_DEFAULT = { -0.03, 0.03, -0.20, 0.35, -0.12, 0.06 }
 local WEAPON_BOXES, WEAPON_ATTACHMENTS = {}, {}
 do
@@ -1376,6 +1465,25 @@ local function weaponBoxOf(w)
         end
     end
     if not base then return nil end
+    -- THE GUN'S SHAPE: its own boxes, and what is mounted on it as more of them. A muzzle goes on from the front of the foremost box, a scope stands on top of the middle.
+    do
+        local shapes = K.WEAPON_SHAPES[family] or { base }
+        local parts = {}
+        local front = shapes[1]
+        for i = 1, #shapes do
+            parts[i] = shapes[i]
+            if shapes[i][4] > front[4] then front = shapes[i] end
+        end
+        if reach > 0.0 then
+            local cx, cz = (front[1] + front[2]) * 0.5, (front[5] + front[6]) * 0.5
+            parts[#parts + 1] = { cx - 0.025, cx + 0.025, front[4], front[4] + reach, cz - 0.025, cz + 0.025 }
+        end
+        if up > 0.0 then
+            local mid, half = (base[3] + base[4]) * 0.5, math.max(wide, 0.02)
+            parts[#parts + 1] = { -half, half, mid - 0.08, mid + 0.08, base[6], base[6] + up }
+        end
+        K.GUN_PARTS, K.GUN_KEY = parts, family .. mounted
+    end
     local box = { base[1], base[2], base[3], base[4] + reach, base[5], base[6] + up }
     box[1], box[2] = math.min(box[1], -wide), math.max(box[2], wide)
     return box, family, mounted
@@ -1388,6 +1496,7 @@ local function weaponRanged(w)
     local key = w:GetEntityID().hash
     if key ~= rangedKey then
         rangedKey, rangedAnswer, weaponBox = key, false, WEAPON_BOX_DEFAULT
+        K.GUN_PARTS, K.GUN_KEY = nil, nil
         rangedWait, boxFound, boxTries = 0, false, 0
         for i = 1, GUN_SIDES do GDEPTH[i] = false end
         GO[0], GO[1] = nil, nil
@@ -1454,6 +1563,165 @@ local function gunShove(side, sys, x, y, z, dx, dy, dz, length, bx, by, bz, ii, 
     shoveAlong(side, tr, wx, wy, wz)
 end
 
+-- A body by its ids, as a ray's hit makes it.
+K.recOf = function(proxy, index)
+    local key = proxy * 4096.0 + index
+    local rec = BODIES[key]
+    if rec then return rec end
+    K.NOT_BODY = K.NOT_BODY or {}
+    local now = os.clock()
+    if K.NOT_BODY[key] and now < K.NOT_BODY[key] then return nil end
+    local okI, info = pcall(VRBodyInfo, proxy, index)
+    if not okI or not info or info.y == 0.0 then
+        K.NOT_BODY[key] = now + 2.0
+        return nil
+    end
+    local okB, body = pcall(VRBodyOf, proxy, index)
+    if not okB or not body then return nil end
+    if bodyCount >= 128 then BODIES, bodyCount = {}, 0 end
+    rec = { key = key, body = body, kind = info.x, proxy = proxy, index = index, mass = info.w > 0.01 and info.w or 1.0, massless = info.w <= 0.01 }
+    BODIES[key] = rec
+    bodyCount = bodyCount + 1
+    return rec
+end
+
+-- LOOSE THINGS AND THE GUN'S BOXES, by PhysX: what each box is inside of, and pushed the way out of it, at the hand's own speed, or at least enough to be felt.
+K.gunLoose = function(side, gx, gy, gz, qi, qj, qk, qr)
+    if type(VRGunTouches) ~= 'function' then return end
+    local ok, n = pcall(VRGunTouches, Vector4.new(gx, gy, gz, 1.0), Vector4.new(qi, qj, qk, qr))
+    if not ok or not n or n <= 0 then return end
+    for i = 0, n - 1 do
+        local okA, a = pcall(VRGunTouchOf, i)
+        local okW, w = pcall(VRGunTouchWay, i)
+        if okA and okW and a and w and a.w > 0.5 then
+            local rec = K.recOf(a.x, a.y)
+            if rec and not rec.massless then
+                if not K.OVER_SAID then
+                    K.OVER_SAID = true
+                    pcall(function() spdlog.info(string.format('[HandColl] first thing the gun\'s boxes met: kind %.0f, mass %.2f, %.3f m deep', rec.kind, rec.mass, w.w)) end)
+                end
+                -- the way out of it for the gun: outward from the thing's surface
+                local h = HV[side]
+                local along = -(h[1] * w.x + h[2] * w.y + h[3] * w.z)
+                local tx, ty, tz = h[1] + along * w.x, h[2] + along * w.y, h[3] + along * w.z
+                if along < SHOVE_MIN then along = SHOVE_MIN end
+                bodyPush(rec, -w.x * along + tx * SHOVE_DRAG, -w.y * along + ty * SHOVE_DRAG, -w.z * along + tz * SHOVE_DRAG, os.clock())
+            end
+        end
+    end
+end
+
+-- WHAT A HAND ASKS, THE GUN ASKS TOO. A hand goes by the game's own rays, and they see all there is. The gun's sweeps know the static actors alone: what stands in the world as a kinematic body, or too heavy to shove, or
+-- is not in that list for whatever reason, it went into, with only the hand stopping at it. So rays as well, from the drawn wrist to the middles and ends of its boxes where it is going. What they meet and it cannot shove
+-- becomes a plane, for a moment: a ray a frame for each of fourteen points would flicker. All from where the hand wants it, never from where this put it, so the answer cannot feed itself.
+K.GUN_PLANES, K.GUN_POINTS_NOW, K.GUN_WALL_TURN, K.GUN_WALL_RAYS, K.GUN_WALL_LIFE, K.GUN_WALL_SKIN, K.GUN_WALL_NEAR, K.GUN_BODY_FROM, K.GUN_WALL_SAID = {}, {}, 0, 2, 0.25, 0.02, 0.6, 0.32, 0
+K.gunPlane = function(side, tr, ax, ay, az, ex, ey, ez, how, now)
+    local px, py, pz = tr.position.x, tr.position.y, tr.position.z
+    local hx, hy, hz = px - ax, py - ay, pz - az
+    if hx * hx + hy * hy + hz * hz < GUN_INSIDE * GUN_INSIDE then return end
+    local nx, ny, nz = tr.normal.x, tr.normal.y, tr.normal.z
+    if nx * (ex - ax) + ny * (ey - ay) + nz * (ez - az) > 0.0 then nx, ny, nz = -nx, -ny, -nz end
+    local list = K.GUN_PLANES
+    for i = 1, #list do
+        local p = list[i]
+        if p.nx * nx + p.ny * ny + p.nz * nz > 0.95 and math.abs((px - p.x) * nx + (py - p.y) * ny + (pz - p.z) * nz) < 0.03 then
+            p.x, p.y, p.z, p.nx, p.ny, p.nz, p.till = px, py, pz, nx, ny, nz, now + K.GUN_WALL_LIFE
+            return
+        end
+    end
+    if #list >= 4 then table.remove(list, 1) end
+    list[#list + 1] = { x = px, y = py, z = pz, nx = nx, ny = ny, nz = nz, till = now + K.GUN_WALL_LIFE }
+    worldNote(side, 'gun at ' .. how, tr.material)
+end
+K.gunWalls = function(side, sys, ei, ej, ek, er, ox, oy, oz, fromX, fromY, fromZ, bx, by, bz, ii, ij, ik, ir)
+    local list = K.GUN_TARGETS
+    if not list or #list == 0 then return 0.0, 0.0, 0.0 end
+    local now = os.clock()
+    local at = K.GUN_POINTS_NOW
+    for i = 1, #list do
+        local p = list[i]
+        local q = at[i]
+        if not q then q = {}; at[i] = q end
+        local vx, vy, vz = qrot(ei, ej, ek, er, p[1], p[2], p[3])
+        q[1], q[2], q[3] = vx + ox, vy + oy, vz + oz
+    end
+    local ci, cj, ck = -ii, -ij, -ik
+    for _ = 1, K.GUN_WALL_RAYS do
+        K.GUN_WALL_TURN = K.GUN_WALL_TURN % #list + 1
+        local q = at[K.GUN_WALL_TURN]
+        local vx, vy, vz = q[1] - fromX, q[2] - fromY, q[3] - fromZ
+        local go = vx * vx + vy * vy + vz * vz > 0.0025
+        -- out of the player's own capsule, which a query sees
+        local t = 0.0
+        local r2 = fromX * fromX + fromY * fromY
+        if go and r2 < K.GUN_BODY_FROM * K.GUN_BODY_FROM then
+            local a = vx * vx + vy * vy
+            local b = fromX * vx + fromY * vy
+            if a < 1e-6 then go = false
+            else
+                t = (-b + math.sqrt(b * b - a * (r2 - K.GUN_BODY_FROM * K.GUN_BODY_FROM))) / a
+                go = t < 1.0
+            end
+        end
+        if go then
+            local sx, sy, sz = qrot(ci, cj, ck, ir, fromX + vx * t, fromY + vy * t, fromZ + vz * t)
+            local ex, ey, ez = qrot(ci, cj, ck, ir, q[1], q[2], q[3])
+            sx, sy, sz, ex, ey, ez = sx + bx, sy + by, sz + bz, ex + bx, ey + by, ez + bz
+            local a, e = Vector4.new(sx, sy, sz, 1.0), Vector4.new(ex, ey, ez, 1.0)
+            local ok, hit, tr = pcall(castRay, sys, a, e, WORLD_PRESETS[worldPreset], false, true)
+            if ok and hit and tr then
+                local rec = bodyOf(tr)
+                -- what the gun's boxes shove is shoved, and does not stop it
+                local loose = rec and not rec.massless and rec.mass <= SHOVE_MAX_MASS
+                local hx, hy = qrot(ii, ij, ik, ir, tr.position.x - bx, tr.position.y - by, tr.position.z - bz)
+                local own = rec and rec.massless and hx * hx + hy * hy < 0.2025
+                if not loose and not own then
+                    K.gunPlane(side, tr, sx, sy, sz, ex, ey, ez, 'dynamic', now)
+                    if K.GUN_WALL_SAID < 12 then
+                        K.GUN_WALL_SAID = K.GUN_WALL_SAID + 1
+                        local said = string.format('[HandColl] a ray stopped the gun at something moving: kind %s, mass %s', rec and tostring(rec.kind) or 'none', rec and (rec.massless and 'none' or tostring(rec.mass)) or 'none')
+                        pcall(function() spdlog.info(said) end)
+                    end
+                end
+            end
+            local okS, hitS, trS = pcall(castRay, sys, a, e, WORLD_PRESETS[worldPreset], true, false)
+            if okS and hitS and trS then
+                K.gunPlane(side, trS, sx, sy, sz, ex, ey, ez, 'static', now)
+                K.GUN_STATIC_RAYS = (K.GUN_STATIC_RAYS or 0) + 1
+                if K.GUN_STATIC_RAYS == 1 or K.GUN_STATIC_RAYS % 200 == 0 then
+                    local said = 'the sweeps let the gun past a static surface, a ray found it: ' .. tostring(K.GUN_STATIC_RAYS) .. ' times'
+                    pcall(function() spdlog.info('[HandColl] ' .. said) end)
+                end
+            end
+        end
+    end
+    -- out of each plane, the deepest point of those near where it was met
+    local tx, ty, tz = 0.0, 0.0, 0.0
+    local planes = K.GUN_PLANES
+    for i = #planes, 1, -1 do
+        local p = planes[i]
+        if now > p.till then
+            table.remove(planes, i)
+        else
+            local px, py, pz = qrot(ii, ij, ik, ir, p.x - bx, p.y - by, p.z - bz)
+            local nx, ny, nz = qrot(ii, ij, ik, ir, p.nx, p.ny, p.nz)
+            local worst = 0.0
+            for k = 1, #list do
+                local q = at[k]
+                local dx, dy, dz = px - q[1] - tx, py - q[2] - ty, pz - q[3] - tz
+                local along = dx * nx + dy * ny + dz * nz
+                -- near it along the surface: however deep the gun has gone in
+                if dx * dx + dy * dy + dz * dz - along * along < K.GUN_WALL_NEAR * K.GUN_WALL_NEAR then
+                    local depth = along + K.GUN_WALL_SKIN
+                    if depth > worst then worst = depth end
+                end
+            end
+            tx, ty, tz = tx + nx * worst, ty + ny * worst, tz + nz * worst
+        end
+    end
+    return tx, ty, tz
+end
+
 local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
     local okR, ranged = pcall(weaponRanged, w)
     if not okR or not ranged then return end
@@ -1497,10 +1765,64 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
     local mx, my, mz = (b[1] + b[2]) * 0.5, (b[3] + b[4]) * 0.5, (b[5] + b[6]) * 0.5
     local sx, sy, sz = (b[2] - b[1]) * 0.5, (b[4] - b[3]) * 0.5, (b[6] - b[5]) * 0.5
 
-    for _ = 1, gunTouching and GUN_SIDES or WEAPON_RAYS do
-        gunTurn = gunTurn % GUN_SIDES + 1
-        local p = GUN_POINTS[gunTurn]
-        local vx, vy, vz = qrot(ei, ej, ek, er, mx + sx * p[1], my + sy * p[2], mz + sz * p[3])
+    -- THE GUN ITSELF: its boxes against the world's shapes, by PhysX. Once that answers, the rays are left with what it cannot see: a wall passed right through in one frame, between the wrist and the
+    -- middle of a box. Asked for every box and the end of it, they also never reach for a corner of the outline where the gun is only air.
+    local pushX, pushY, pushZ = 0.0, 0.0, 0.0
+    local targets = nil
+    if type(VRGunPush) == 'function' then
+        local parts, key = K.GUN_PARTS or { b }, K.GUN_KEY or 'default'
+        if K.GUN_SENT ~= key then
+            K.GUN_SENT = key
+            pcall(VRGunBoxClear)
+            K.GUN_TARGETS = {}
+            for i = 1, #parts do
+                local s = parts[i]
+                pcall(VRGunBoxAdd, Vector4.new(s[1], s[3], s[5], 1.0), Vector4.new(s[2], s[4], s[6], 1.0))
+                local cx, cy, cz = (s[1] + s[2]) * 0.5, (s[3] + s[4]) * 0.5, (s[5] + s[6]) * 0.5
+                local list = K.GUN_TARGETS
+                if #list < GUN_SIDES then list[#list + 1] = { cx, cy, cz } end
+                if #list < GUN_SIDES then list[#list + 1] = { cx, s[4], cz } end
+            end
+            for i = 1, GUN_SIDES do GDEPTH[i] = false end
+        end
+        local gx, gy, gz = qrot(-ii, -ij, -ik, ir, rx + x, ry + y, rz + z)
+        local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, ei, ej, ek, er)
+        if type(VRGunAnchor) == 'function' then
+            local ax, ay, az = qrot(-ii, -ij, -ik, ir, x, y, z)
+            pcall(VRGunAnchor, Vector4.new(ax + bx, ay + by, az + bz, 1.0))
+        end
+        K.pf('gun before')
+        local okG, g = pcall(VRGunPush, Vector4.new(gx + bx, gy + by, gz + bz, 1.0), Vector4.new(qi, qj, qk, qr))
+        K.pf('gun walls')
+        if okG and g and g.w > 0.5 then
+            pushX, pushY, pushZ = qrot(ii, ij, ik, ir, g.x, g.y, g.z)
+            targets = K.GUN_TARGETS
+            -- Moved by sweeps it cannot have passed anything. Rays beside them only spoke of where the hand wants it, a surface a frame, three a frame: the jerks back against a wall.
+            if g.w > 1.5 and not K.GUN_SWEPT then
+                for i = 1, GUN_SIDES do GDEPTH[i] = false end
+            end
+            K.GUN_SWEPT = g.w > 1.5
+            if not K.GUN_ON then
+                K.GUN_ON = true
+                for i = 1, GUN_SIDES do GDEPTH[i] = false end
+                pcall(function() spdlog.info('[HandColl] the gun is its own shape now: ' .. tostring(key) .. ', ' .. tostring(#parts) .. ' boxes') end)
+            end
+        elseif K.GUN_ON then
+            K.GUN_ON = false
+            for i = 1, GUN_SIDES do GDEPTH[i] = false end
+        end
+    end
+    local sides = targets and #targets or GUN_SIDES
+    for _ = 1, (targets and K.GUN_SWEPT) and 0 or ((targets or not gunTouching) and WEAPON_RAYS or GUN_SIDES) do
+        gunTurn = gunTurn % sides + 1
+        local vx, vy, vz
+        if targets then
+            local p = targets[gunTurn]
+            vx, vy, vz = qrot(ei, ej, ek, er, p[1], p[2], p[3])
+        else
+            local p = GUN_POINTS[gunTurn]
+            vx, vy, vz = qrot(ei, ej, ek, er, mx + sx * p[1], my + sy * p[2], mz + sz * p[3])
+        end
         vx, vy, vz = vx + rx + x - fromX, vy + ry + y - fromY, vz + rz + z - fromZ
         local len = math.sqrt(vx * vx + vy * vy + vz * vz)
         if len > 1e-4 then
@@ -1517,14 +1839,22 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
             end
             -- AND WHAT IS LOOSE MOVES OUT OF ITS WAY, one point a frame. The gun does not stop at it. From a little past the
             -- wrist, since the gun's hand is near the player's capsule, and nothing nearer the hand than the gun could be.
-            if pushOn and gunTurn % WEAPON_RAYS == 0 and len > GUN_SHOVE_FROM then
+            if pushOn and not targets and gunTurn % WEAPON_RAYS == 0 and len > GUN_SHOVE_FROM then
                 gunShove(side, sys, fromX, fromY, fromZ, vx / len, vy / len, vz / len, len, bx, by, bz, ii, ij, ik, ir)
             end
         end
     end
 
+    if pushOn and targets then
+        -- where the gun is drawn now, the world's push done
+        local gx, gy, gz = qrot(-ii, -ij, -ik, ir, rx + x + pushX, ry + y + pushY, rz + z + pushZ)
+        local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, ei, ej, ek, er)
+        K.pf('gun rays')
+        K.gunLoose(side, gx + bx, gy + by, gz + bz, qi, qj, qk, qr)
+        K.pf('gun loose')
+    end
     -- out of every surface in turn, each measured against what the ones before it have done
-    local tx, ty, tz = 0.0, 0.0, 0.0
+    local tx, ty, tz = pushX, pushY, pushZ
     for i = 1, GUN_SIDES do
         local depth = GDEPTH[i]
         if depth then
@@ -1533,7 +1863,15 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
             if need > 0.0 then tx, ty, tz = tx + gx * need, ty + gy * need, tz + gz * need end
         end
     end
+    if targets then
+        local okW, wx, wy, wz = pcall(K.gunWalls, side, sys, ei, ej, ek, er, rx + x + tx, ry + y + ty, rz + z + tz, fromX, fromY, fromZ, bx, by, bz, ii, ij, ik, ir)
+        if okW then tx, ty, tz = tx + wx, ty + wy, tz + wz
+        else sayOnce('the gun\'s rays failed: ' .. tostring(wx)) end
+        K.pf('gun rays')
+    end
+    local wasTouching = gunTouching
     gunTouching = tx ~= 0.0 or ty ~= 0.0 or tz ~= 0.0
+    if gunTouching and not wasTouching then K.pulse(side) end
     FIRM[side] = gunTouching
     GO[side] = GO[side] or {}
     local out = GO[side]
@@ -1588,7 +1926,7 @@ local function handsPush(allowed, holder, now)
         pcall(pushScan)
     end
     for side = 0, 1 do
-        local want = allowed and holder ~= side and not SKIP[side] and not HOLD[side]
+        local want = allowed and holder ~= side and not SKIP[side] and not HOLD[0] and not HOLD[1]
         if want then
             local x, y = PX[side] or 0.0, PY[side] or 0.0
             local out = math.sqrt(x * x + y * y)
@@ -1598,12 +1936,19 @@ local function handsPush(allowed, holder, now)
     end
 end
 
--- THE FINGERS. Each is asked how far it is from what it would close on: along itself, from its second joint out past its tip, and
--- from the tip toward the palm, the way a closing finger goes. The plugin turns the distance straight into how far it may
--- close (cvr::gestures::FingerContact), so it lies on the surface in one movement. With anything near, a hand's five are asked every
--- second frame; with nothing near, one finger a frame, to find out.
-local FINGER_AHEAD = 0.03     -- m past the tip along the finger
-local FINGER_DOWN = 0.07      -- m from the tip toward the palm
+-- THE FINGERS. A finger's limit comes from the hand and the world, and never from where the finger is. Measuring from the drawn finger
+-- fed its own answer back: a tip stopped at a surface, or just inside it, no longer found it, closed further, and found it again, which
+-- is the jumping. So each finger has a path, its tip at five stages of closing in the hand's frame, and rays go along that path. The
+-- first thing on it is as far as the finger may close. The path is learned from the finger itself as it moves.
+-- The numbers of what follows are in the table K, above: this function is at the limit of its locals.
+K.FINGER_C = { 0.0, 0.25, 0.5, 0.75, 1.0 }
+K.FINGER_STEADY, K.FINGER_SNAP = 0.02, 0.05  -- how still a finger has to be to be measured, and how near a stage
+K.FINGER_SWEEP, K.FINGER_SHRINK = 2.6, 0.45  -- rad from open to fist and how much shorter it gets: until it is measured
+K.FINGER_NEAR_RAYS, K.FINGER_FAR_RAYS = 6, 2 -- a turn of a hand, with something near and without
+K.BEND_BEHIND, K.BEND_FORGIVE, K.BEND_CURLED, K.BEND_NEIGHBOUR = 0.05, 0.12, 0.5, 0.45   -- m behind the knuckle a ray starts, s a miss is forgiven, how closed is no longer straight, rad a neighbour may differ
+K.FINGER_LOOK_AHEAD = 0.25                 -- how much of the path past where the finger wants to be is watched
+K.FINGER_GRIP_MISS, K.FINGER_GRIP_MOST, K.FINGER_GRIP_LEAST = 0.8, 0.85, 0.1  -- how far it closes around a thing, finding nothing, and at most
+K.FINGER_GRIP_GAP = 0.012 -- m kept from a thing held: what is drawn is often larger than what collides
 local FINGER_FROM_BODY = 0.30 -- m from the body's axis before a dynamic ray: the player's capsule is dynamic to a query
 local FINGER_DIGIT = { thumb = 0, index = 1, mid = 2, ring = 3, pink = 4 }
 local FINGERS = { [0] = {}, [1] = {} }
@@ -1613,7 +1958,8 @@ for i = 1, #CAPS do
     local digit = name and FINGER_DIGIT[name]
     if digit then
         local f = FINGERS[letter == 'l' and 0 or 1]
-        f[digit] = f[digit] or {}
+        f[digit] = f[digit] or { curve = {}, hits = {} }
+        if joint == (digit == 0 and '0' or '1') then f[digit].base = c end
         -- thumb joints are 0, 1, 2, the rest 1, 2, 3: the second of them is where the ray starts, the last the tip
         if joint == (digit == 0 and '1' or '2') then f[digit].mid = c end
         if joint == (digit == 0 and '2' or '3') then f[digit].tip = c end
@@ -1621,7 +1967,7 @@ for i = 1, #CAPS do
 end
 local fingerTurn, fingerSide = 0, 0
 local fingerNear = { [0] = false, [1] = false }
-local fingerAskedNear = { [0] = false, [1] = false }
+local fingerAt = { [0] = { digit = 0, i = 0 }, [1] = { digit = 0, i = 0 } }
 local PALM_LOCAL = { [0] = nil, [1] = nil }
 
 -- A fingertip and the second joint it is measured from, model space.
@@ -1684,59 +2030,266 @@ local function rayDistance(sys, a, b, wx, wy, wz, dynamicToo)
     return math.sqrt(hx * hx + hy * hy + hz * hz)
 end
 
-local function fingerAsk(side, digit, sys, bx, by, bz, ii, ij, ik, ir)
-    local f = FINGERS[side][digit]
-    if not f or not f.mid or not f.tip then return false end
-    local mx, my, mz, cx, cy, cz = fingerEnds(f)
-    if not mx then return false end
-    local dx, dy, dz = cx - mx, cy - my, cz - mz
-    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
-    if len < 1e-3 then return false end
-    dx, dy, dz = dx / len, dy / len, dz / len
-    local clearance = f.tip.r + CONTACT
-    local dynamicToo = mx * mx + my * my >= FINGER_FROM_BODY * FINGER_FROM_BODY
-    local qi, qj, qk, qr = -ii, -ij, -ik, ir
-    local wx, wy, wz = qrot(qi, qj, qk, qr, mx, my, mz)
-    wx, wy, wz = wx + bx, wy + by, wz + bz
-    local far = len + clearance + FINGER_AHEAD
-    local ex, ey, ez = qrot(qi, qj, qk, qr, dx * far, dy * far, dz * far)
-    local gap = 1.0
-    local d = rayDistance(sys, Vector4.new(wx, wy, wz, 1.0), Vector4.new(wx + ex, wy + ey, wz + ez, 1.0), wx, wy, wz, dynamicToo)
-    if d then gap = d - len - clearance end
-    local nx, ny, nz = palmNormal(side)
-    if nx then
-        local tx, ty, tz = qrot(qi, qj, qk, qr, cx, cy, cz)
-        tx, ty, tz = tx + bx, ty + by, tz + bz
-        local ux, uy, uz = qrot(qi, qj, qk, qr, nx * FINGER_DOWN, ny * FINGER_DOWN, nz * FINGER_DOWN)
-        local d2 = rayDistance(sys, Vector4.new(tx, ty, tz, 1.0), Vector4.new(tx + ux, ty + uy, tz + uz, 1.0), tx, ty, tz, dynamicToo)
-        if d2 and d2 - clearance < gap then gap = d2 - clearance end
+-- Until a stage has been seen, a guess: the finger as it is now, swung toward the palm. The thumb moves too differently to guess.
+local function fingerSeed(side, f, c, lx, ly, lz)
+    local base = f.baseLocal
+    if not palmNormal(side) then return end
+    local n = PALM_LOCAL[side]
+    local vx, vy, vz = lx - base[1], ly - base[2], lz - base[3]
+    local ax, ay, az = vy * n[3] - vz * n[2], vz * n[1] - vx * n[3], vx * n[2] - vy * n[1]
+    local alen = math.sqrt(ax * ax + ay * ay + az * az)
+    if alen < 1e-5 then return end
+    ax, ay, az = ax / alen, ay / alen, az / alen
+    local tx, ty, tz = ay * vz - az * vy, az * vx - ax * vz, ax * vy - ay * vx
+    local seed = {}
+    for i = 1, #K.FINGER_C do
+        local to = K.FINGER_C[i]
+        local angle = (to - c) * K.FINGER_SWEEP
+        local s = (1.0 - K.FINGER_SHRINK * to) / (1.0 - K.FINGER_SHRINK * c)
+        local co, si = math.cos(angle) * s, math.sin(angle) * s
+        seed[i] = { base[1] + vx * co + tx * si, base[2] + vy * co + ty * si, base[3] + vz * co + tz * si }
     end
-    pcall(VRFingerContact, side, digit, gap)
-    return gap < 1.0
+    f.seed = seed
+end
+
+-- A still finger is a sample of its path.
+local function fingerMeasure(side, hx, hy, hz, hi, hj, hk, hr)
+    if type(VRFingerClosed) ~= 'function' then return end
+    for digit = 0, 4 do
+        local f = FINGERS[side][digit]
+        if f and f.base and f.mid and f.tip then
+            local ok, c = pcall(VRFingerClosed, side, digit)
+            local was = f.closedWas
+            f.closedWas = ok and c or nil
+            if ok and c and was and math.abs(c - was) < K.FINGER_STEADY then
+                local mx, _, _, tx, ty, tz = fingerEnds(f)
+                local bbx, bby, bbz = bone(f.base.index)
+                if mx and bbx then
+                    f.baseLocal = { qrot(-hi, -hj, -hk, hr, bbx - hx, bby - hy, bbz - hz) }
+                    local lx, ly, lz = qrot(-hi, -hj, -hk, hr, tx - hx, ty - hy, tz - hz)
+                    if digit > 0 and not f.seed then fingerSeed(side, f, c, lx, ly, lz) end
+                    local i = math.floor(c * (#K.FINGER_C - 1) + 0.5) + 1
+                    if math.abs(c - K.FINGER_C[i]) <= K.FINGER_SNAP then
+                        local n = f.curve[i]
+                        if n then
+                            n[1], n[2], n[3] = n[1] + (lx - n[1]) * 0.25, n[2] + (ly - n[2]) * 0.25, n[3] + (lz - n[3]) * 0.25
+                        else
+                            f.curve[i] = { lx, ly, lz }
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function fingerNode(f, i)
+    return f.curve[i] or (f.seed and f.seed[i])
+end
+
+-- Stage i-1 to stage i of a finger's path, from the base of the finger for the first it has.
+local function fingerSegment(f, i)
+    local to = fingerNode(f, i)
+    if not to or not f.baseLocal then return nil end
+    for j = i - 1, 1, -1 do
+        local n = fingerNode(f, j)
+        if n then return n, to, K.FINGER_C[j], K.FINGER_C[i] end
+    end
+    return f.baseLocal, to, K.FINGER_C[i], K.FINGER_C[i]
+end
+
+local function fingerWorld(F, p)
+    local x, y, z = qrot(F[4], F[5], F[6], F[7], p[1], p[2], p[3])
+    x, y, z = qrot(F[11], F[12], F[13], F[14], x + F[1], y + F[2], z + F[3])
+    return x + F[8], y + F[9], z + F[10]
+end
+
+-- The frame of a hand, for fingerWorld. nil without a hand.
+local function fingerFrame(side, bx, by, bz, ii, ij, ik, ir)
+    local h = HAND[side]
+    if not h then return nil end
+    local hx, hy, hz, hi, hj, hk, hr = bone(h.index)
+    if not hx then return nil end
+    return { hx, hy, hz, hi, hj, hk, hr, bx, by, bz, -ii, -ij, -ik, ir }
+end
+
+-- How far along the path this segment lets the finger close, or nil with nothing on it.
+local function fingerCast(F, sys, f, i, dynamicToo)
+    local a, b, c0, c1 = fingerSegment(f, i)
+    if not a then return nil end
+    local ax, ay, az = fingerWorld(F, a)
+    local ex, ey, ez = fingerWorld(F, b)
+    local dx, dy, dz = ex - ax, ey - ay, ez - az
+    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if len < 1e-3 then return nil end
+    local d = rayDistance(sys, Vector4.new(ax, ay, az, 1.0), Vector4.new(ex, ey, ez, 1.0), ax, ay, az, dynamicToo)
+    if not d then return nil end
+    return math.max(0.0, c0 + (c1 - c0) * (d - f.tip.r - CONTACT) / len)
+end
+
+-- How much of the straight finger's length there is room for, or nil with nothing on it. From behind the knuckle: a knuckle already in the wall sees no wall from there.
+local function fingerRoom(F, sys, f, dynamicToo)
+    local b = fingerNode(f, 1)
+    if not b or not f.baseLocal then return nil end
+    local ax, ay, az = fingerWorld(F, f.baseLocal)
+    local ex, ey, ez = fingerWorld(F, b)
+    local dx, dy, dz = ex - ax, ey - ay, ez - az
+    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if len < 1e-3 then return nil end
+    local k = K.BEND_BEHIND / len
+    local sx, sy, sz = ax - dx * k, ay - dy * k, az - dz * k
+    local d = rayDistance(sys, Vector4.new(sx, sy, sz, 1.0), Vector4.new(ex, ey, ez, 1.0), sx, sy, sz, dynamicToo)
+    -- a ray that begins inside something says nothing
+    if not d or d < 0.002 then return nil end
+    return (d - K.BEND_BEHIND - f.tip.r - CONTACT) / len
+end
+
+-- The fingers around what the hand has just taken, as it will be: the hand is moved to the thing by (sx, sy, sz), and only that
+-- thing counts.
+local function fingersAround(H, side, rec, sys, sx, sy, sz, bx, by, bz, ii, ij, ik, ir)
+    local F = fingerFrame(side, bx, by, bz, ii, ij, ik, ir)
+    if not F then return end
+    local values = {}
+    for digit = 0, 4 do
+        local f = FINGERS[side][digit]
+        local value = K.FINGER_GRIP_MISS
+        if f then
+            for i = 1, #K.FINGER_C do
+                local a, b, c0, c1 = fingerSegment(f, i)
+                if a then
+                    local ax, ay, az = fingerWorld(F, a)
+                    local ex, ey, ez = fingerWorld(F, b)
+                    ax, ay, az, ex, ey, ez = ax + sx, ay + sy, az + sz, ex + sx, ey + sy, ez + sz
+                    local dx, dy, dz = ex - ax, ey - ay, ez - az
+                    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    if len >= 1e-3 then
+                        local ok, hit, tr = pcall(castRay, sys, Vector4.new(ax, ay, az, 1.0), Vector4.new(ex, ey, ez, 1.0), WORLD_PRESETS[worldPreset], false, true)
+                        if ok and hit and tr and bodyOf(tr) == rec then
+                            local hx, hy, hz = tr.position.x - ax, tr.position.y - ay, tr.position.z - az
+                            local d = math.sqrt(hx * hx + hy * hy + hz * hz)
+                            value = c0 + (c1 - c0) * (d - f.tip.r - CONTACT - K.FINGER_GRIP_GAP) / len
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        values[digit] = math.max(K.FINGER_GRIP_LEAST, math.min(K.FINGER_GRIP_MOST, value))
+    end
+    H.fingers = values
+end
+
+local function fingersFree(side)
+    if type(VRFingerContact) ~= 'function' then return end
+    for digit = 0, 4 do
+        pcall(VRFingerContact, side, digit, 1.0, false)
+        local f = FINGERS[side][digit]
+        if f then f.hits, f.sent, f.room, f.roomAt = {}, 1.0, nil, nil end
+    end
 end
 
 local function fingerContact(holder, bx, by, bz, ii, ij, ik, ir)
     if type(VRFingerContact) ~= 'function' then return end
+    DBG.arm = true    -- the fingers' rays are not drawn either: reset by the next drawn ray's caller
     local sys = worldSystem()
-    if not sys then return end
+    if not sys then DBG.arm = false return end
     fingerSide = 1 - fingerSide
     local side = fingerSide
-    if SKIP[side] or holder == side then return end
+    if SKIP[side] or holder == side then DBG.arm = false return end
+    local H = HOLD[side]
+    if H then
+        for digit = 0, 4 do
+            pcall(VRFingerContact, side, digit, H.fingers and H.fingers[digit] or 1.0, H.fingers ~= nil)
+        end
+        DBG.arm = false
+        return
+    end
+    local F = fingerFrame(side, bx, by, bz, ii, ij, ik, ir)
+    if not F then DBG.arm = false return end
+    fingerMeasure(side, F[1], F[2], F[3], F[4], F[5], F[6], F[7])
     local near = fingerNear[side]
     for slot = side * 6, side * 6 + 5 do near = near or WORLD_HIT[slot] end
-    if near then
-        -- three a turn: each finger is fresh within about four frames, at a fraction of the rays of all five
-        local any = fingerNear[side] and fingerAskedNear[side] or false
-        for _ = 1, 3 do
-            fingerTurn = (fingerTurn + 1) % 5
-            if fingerAsk(side, fingerTurn, sys, bx, by, bz, ii, ij, ik, ir) then any = true end
+    local dynamicToo = F[1] * F[1] + F[2] * F[2] >= FINGER_FROM_BODY * FINGER_FROM_BODY
+    local rays = near and K.FINGER_NEAR_RAYS or K.FINGER_FAR_RAYS
+    local at = fingerAt[side]
+    -- round the paths, skipping what the finger is nowhere near
+    for _ = 1, 5 * #K.FINGER_C do
+        if rays <= 0 then break end
+        at.i = at.i + 1
+        if at.i > #K.FINGER_C then at.i, at.digit = 1, (at.digit + 1) % 5 end
+        local f = FINGERS[side][at.digit]
+        if f and f.tip then
+            local want = 1.0
+            if type(VRFingerWanted) == 'function' then
+                local ok, w = pcall(VRFingerWanted, side, at.digit)
+                if ok and w then want = w end
+            end
+            if K.FINGER_C[math.max(1, at.i - 1)] > want + K.FINGER_LOOK_AHEAD then
+                f.hits[at.i] = nil
+            elseif fingerSegment(f, at.i) then
+                f.hits[at.i] = fingerCast(F, sys, f, at.i, dynamicToo)
+                rays = rays - 1
+            end
         end
-        fingerAskedNear[side] = fingerTurn ~= 4
-        fingerNear[side] = any
-    else
-        fingerTurn = (fingerTurn + 1) % 5
-        fingerNear[side] = fingerAsk(side, fingerTurn, sys, bx, by, bz, ii, ij, ik, ir)
     end
+    -- PRESSED BACK: each finger's own ray, far more often than the round above could. A miss is forgiven for a moment.
+    at.bend = (at.bend or 0) + 1
+    local bends = {}
+    do
+        local clock = os.clock()
+        local asked = near and 4 or 2
+        for a = 1, asked do
+            local digit = 1 + (((at.bend - 1) * asked + a - 1) % 4)
+            local f = FINGERS[side][digit]
+            if f and f.tip then
+                local room = fingerRoom(F, sys, f, dynamicToo)
+                if room then f.room, f.roomAt = room, clock
+                elseif f.roomAt and clock - f.roomAt > K.BEND_FORGIVE then f.room, f.roomAt = nil, nil end
+            end
+        end
+        for digit = 1, 4 do
+            local f = FINGERS[side][digit]
+            local angle = 0.0
+            if f and f.room then
+                angle = math.acos(math.max(0.0, math.min(1.0, f.room)))
+                -- a curled finger is not on the straight path
+                if type(VRFingerWanted) == 'function' then
+                    local ok, w = pcall(VRFingerWanted, side, digit)
+                    if ok and w then angle = angle * math.max(0.0, math.min(1.0, (K.BEND_CURLED - w) / K.BEND_CURLED)) end
+                end
+            end
+            bends[digit] = angle
+        end
+        -- a wall is flat: a finger whose ray missed it does not stay straight beside one bent back
+        for digit = 2, 4 do bends[digit] = math.max(bends[digit], bends[digit - 1] - K.BEND_NEIGHBOUR) end
+        for digit = 3, 1, -1 do bends[digit] = math.max(bends[digit], bends[digit + 1] - K.BEND_NEIGHBOUR) end
+    end
+    local open = K.palmSees(side, sys, F, bx, by, bz, ii, ij, ik, ir)
+    local any = false
+    for digit = 0, 4 do
+        local f = FINGERS[side][digit]
+        if f then
+            local limit = open and K.OPEN_LIMIT or 1.0
+            for i = 1, #K.FINGER_C do
+                local hit = f.hits[i]
+                if hit and hit < limit then limit = hit end
+            end
+            if limit < 1.0 then any = true end
+            if limit < 1.0 or f.sent ~= 1.0 then
+                pcall(VRFingerContact, side, digit, limit, false)
+                f.sent = limit
+            end
+            if digit > 0 and type(VRFingerBend) == 'function' then
+                local angle = bends[digit] or 0.0
+                if angle > 0.0 or f.bent then
+                    pcall(VRFingerBend, side, digit, angle)
+                    f.bent = angle > 0.0
+                end
+            end
+        end
+    end
+    fingerNear[side] = any
+    DBG.arm = false
 end
 
 -- FRICTION. The stops above only push a hand out along a surface's normal, so along the surface it slid with no resistance at all.
@@ -1777,6 +2330,10 @@ local function trackHands(dt, bx, by, bz, ii, ij, ik, ir)
         local ok, m = pcall(VRHandContactMargin)
         if ok and m then CONTACT = m end
     end
+    if type(VRCarryLead) == 'function' then
+        local ok, m = pcall(VRCarryLead)
+        if ok and m then K.CARRY_LEAD = m end
+    end
     local k = 1.0 - math.exp(-math.max(dt, 0.001) / HV_TAU)
     for side = 0, 1 do
         local r = RAW[side]
@@ -1799,24 +2356,55 @@ local function trackHands(dt, bx, by, bz, ii, ij, ik, ir)
     end
 end
 
--- CARRYING. A grip that closes at a loose thing takes that body: it is driven after the hand by velocity, the way the lobby's items
--- and the ball are, so it still stops at what it runs into, and it keeps how it was taken. Let go, it has the hand's speed. Squeezed
--- hard on Index controllers, it is given a blow a fragile thing does not survive, and whatever did survive it is put out of the
--- world, so that it is gone from the hand either way.
-local CARRY_MAX_MASS = 6.0    -- kg
-local CARRY_REACH = 0.17      -- m from the wrist
+-- CARRYING. A grip that closes at a loose thing takes that body: it is driven after the hand by velocity, the way the lobby's items and the
+-- ball are, so it stops at what it runs into. What a hand can do is limited by how much the thing weighs, as the change of speed it may
+-- give it per second, so a heavy thing lags and past a weight it does not lift at all. Two hands on one thing count as much more than
+-- double, because the back and legs join in. And the hand is drawn on the thing: where the thing stays behind, it stays with it.
+K.CARRY_MAX_MASS, K.CARRY_EASY_MASS = 30.0, 6.0   -- kg: what a grip takes at all, and what is pulled into the palm
+K.CARRY_REACH = 0.17      -- m from the wrist
+K.CARRY_NEAR = 0.1        -- m from the palm: past the rays, what PhysX has this near is taken
+K.REGRIP_MOST = 0.03      -- m a hand left alone with a thing can be off the place it took and just goes on holding it there. Further off, in the air, the place comes to it: a thing hung in front of the hand
+K.REACH_EVERY = 8         -- calls between looks by a closed hand for what the other holds
+K.STEP_MOST = 0.05        -- s without the body moving before it is commanded anyway: it may be stuck
+K.PULL_WAIT = 0.12        -- s before a thing comes to the palm: both hands closing on it together find it where it was
+K.TRACE_FRAMES, K.TRACE_SPEED, K.TRACE_TIMES = 90, 2.0, 4   -- what is measured of a swing, from what hand speed, and how many a session
+K.CARRY_PALM = 0.085      -- m from the wrist along the fingers, until the knuckles have been seen
+K.CARRY_PALM_ALONG = 0.55 -- of the way from the wrist to the knuckles
+K.CARRY_PALM_REACH, K.CARRY_PALM_SKIN = 0.13, 0.03 -- m out of the palm a thing is looked for, and from the hand's middle to the palm's skin
+K.CARRY_PULL_MOST, K.CARRY_PULL_TIME = 0.25, 0.15  -- m and s: the place on it that was taken comes to the palm
 -- All of the way to where the hand will be, each frame, less a little for stability. A gentler pull is a thing trailing the hand.
-local CARRY_FOLLOW, CARRY_SPIN, CARRY_MAX_SPEED = 0.85, 12.0, 30.0
--- A THROW IS THE PEAK OF THE SWING, over a short window, and not the speed at the instant the grip opens: by then the hand has
--- begun to stop.
-local THROW_WINDOW, THROW_GAIN = 0.15, 1.25
-local CARRY_LOST_AT, CARRY_LOST_FOR = 0.8, 0.4   -- m behind the hand, for that many seconds, and it has been lost
-local CRUSH_FORCE, CRUSH_FOR = 0.7, 0.15
-local CRUSH_LATER = 0.15      -- s for a fragile thing to have broken
-local CRUSH_BLOW = 40.0       -- m/s of velocity change
+K.CARRY_FOLLOW, K.CARRY_SPIN, K.CARRY_MAX_SPEED = 0.85, 25.0, 30.0
+K.TURN_TAU, K.TURN_MOST = 0.02, 40.0   -- s the wanted turn is smoothed over, rad/s at most
+-- m/s^2. Up to 3 kg a hand keeps up with any swing; past it the limit falls steeply, to 12 at 6 kg, which about holds it up. Two hands count
+-- as a fifth of the mass.
+K.CARRY_ACCEL, K.CARRY_EASY, K.CARRY_MASS_POWER, K.CARRY_TWO_HANDS = 500.0, 3.0, 5.4, 5.0
+-- s the thing is put ahead of the hand: the hand is drawn where it will be when the frame is seen, the thing where physics has left it.
+K.CARRY_LEAD = 0.03       -- until the setting is read
+-- A THING THAT CANNOT GO WHERE IT IS PULLED, by a wall or a table: it is not going at the speed it was given. Pulled at full speed it beats
+-- against the surface, which is the shaking, so it only leans on it. It leaves that gently, in case it has got free and only has to catch up.
+K.TWO_TURN_FROM, K.TWO_TURN_FULL = 0.05, 0.15  -- m between the hands: under the first they turn it as one, past the second the line between them does
+K.HAND_TO_IT_TIME = 0.2   -- s for a drawn hand to go to the place it took
+K.HAND_STILL = 0.15       -- m/s: slower than this, the bone and the arm's target are the same moment
+-- BY ITS SPEED, WRITTEN EACH FRAME, and nothing else. Measured in game, each of these was worse: its position written each frame sends it to sleep, after which
+-- it stands in the world until something runs into it; an impulse each frame adds up, because the speed read back is a physics step old, and it flies off.
+-- A world prop has no entity to hang on the hand's slot the way a lobby item is (to be confirmed: `[proxy]` in the log), so a body it stays, a physics
+-- step behind what is drawn: hence the lead.
+-- WHAT WAS WOKEN GOES BACK TO SLEEP FOR GOOD once it has lain still that long: kinematic, as the world had it, until a hand comes for it again.
+K.SETTLE_SPEED, K.SETTLE_FOR = 0.05, 3.0   -- m/s and s
+K.BLOCK_MISS, K.BLOCK_FREE_MISS, K.BLOCK_SLIP, K.BLOCK_SPEED, K.BLOCK_RAMP = 0.03, 0.02, 0.25, 0.6, 30.0
+K.PICTURE_STEPS = 1.5
+K.PICTURE_GAP, K.PICTURE_MEASURE, K.PICTURE_MARGIN = 0.003, 0.05, 0.005   -- m: no ray for less, what a thing measures if it does not say, and room kept from the wall
+K.QUERY_HAND, K.QUERY_AFTER, K.QUERY_BACK = 0.3, 0.3, {}   -- m a free hand is near, s after letting go it stays hidden (it may still be inside the player), and what is waiting for that
+K.BLOCK_ALONG, K.BLOCK_STEPS, K.BLOCK_FREE_STEPS = 0.5, 3, 6   -- less of the told speed than this along it, this many steps running, and this many free steps end it
+K.HAND_SLACK, K.HAND_TRAIL = 0.02, 0.25          -- m the drawn hand ignores, and the most it stays behind
+K.HAND_LOST_AT, K.HAND_LOST_FOR = 0.45, 0.6       -- m from the real hand, for that many seconds, and the hand lets go
+-- A THROW IS THE PEAK OF THE SWING, over a short window, and not the speed at the instant the grip opens: by then the hand has begun to stop.
+K.THROW_WINDOW, K.THROW_GAIN, K.THROW_GAIN_FROM = 0.15, 1.25, 1.0
+K.THROW_ARM = 0.6         -- m over which the hand's limit worked on it: no thing leaves faster than that allows
+K.THROW_TANGENT_MOST, K.THROW_SPIN_MOST = 5.0, 20.0   -- m/s from the wrist's turn, and rad/s kept
+K.THROW_TOGETHER = 0.2    -- s: both hands letting go within this is a two-handed throw
 local GRIP_SLOT = { [0] = 155, [1] = 49 }
 local gripWas = { [0] = false, [1] = false }
-local crushed = {}
 
 local function handWorld(side, bx, by, bz, ii, ij, ik, ir)
     local h = HAND[side]
@@ -1829,152 +2417,1336 @@ local function handWorld(side, bx, by, bz, ii, ij, ik, ir)
     return px + bx, py + by, pz + bz, qi, qj, qk, qr
 end
 
-local function carryRelease(side, keepSpeed)
-    local H = HOLD[side]
-    HOLD[side] = nil
-    if not H then return end
-    local speed = 0.0
-    if keepSpeed then
-        local vx, vy, vz = 0.0, 0.0, 0.0
-        for i = 1, #H.trail do
-            local s = H.trail[i]
-            local v = s[2] * s[2] + s[3] * s[3] + s[4] * s[4]
-            if v > speed then speed, vx, vy, vz = v, s[2], s[3], s[4] end
-        end
-        speed = math.sqrt(speed) * THROW_GAIN
-        H.rec.thrown = os.clock()
-        pcall(VRBodySetVel, H.rec.body, Vector4.new(vx * THROW_GAIN, vy * THROW_GAIN, vz * THROW_GAIN, 0.0))
-    end
-    pcall(function() spdlog.info(string.format('[HandColl] let go: %.1f m/s, grip force at most %.2f', speed, H.peak or -1.0)) end)
+-- The real hand, world space: what a carried thing goes by, since the drawn one goes by the carried thing. The arm's target and the wrist it
+-- arrives at are not quite one point, so how they differ is measured in the hand's frame while nothing holds the hand.
+local RD = { [0] = nil, [1] = nil }
+local function handMeasure(side)
+    local h, r = HAND[side], RAW[side]
+    if not h or not r or HOLD[side] or SKIP[side] or (DRAWN[side] and DRAWN[side].on) then return end
+    local v = HV[side]
+    if v[1] * v[1] + v[2] * v[2] + v[3] * v[3] > K.HAND_STILL * K.HAND_STILL then return end
+    local hx, hy, hz, hi, hj, hk, hr = bone(h.index)
+    if not hx then return end
+    local x, y, z = qrot(-hi, -hj, -hk, hr, hx - r.x, hy - r.y, hz - r.z)
+    if x * x + y * y + z * z > 0.04 then return end
+    local d = RD[side]
+    if not d then RD[side] = { x, y, z } return end
+    d[1], d[2], d[3] = d[1] + (x - d[1]) * 0.05, d[2] + (y - d[2]) * 0.05, d[3] + (z - d[3]) * 0.05
 end
 
-local function carryFind(side, bx, by, bz, ii, ij, ik, ir)
-    local sys = worldSystem()
-    local h = HAND[side]
-    if not sys or not h then return end
-    local hx, hy, hz, hi, hj, hk, hr = bone(h.index)
-    if not hx or hx * hx + hy * hy < FINGER_FROM_BODY * FINGER_FROM_BODY then return end
-    local px, py, pz, wqi, wqj, wqk, wqr = handWorld(side, bx, by, bz, ii, ij, ik, ir)
-    if not px then return end
-    local fx, fy, fz = qrot(hi, hj, hk, hr, h.cx >= 0.0 and 1.0 or -1.0, 0.0, 0.0)
-    local nx, ny, nz = palmNormal(side)
-    if not nx then nx, ny, nz = 0.0, 0.0, -1.0 end
-    local a = Vector4.new(px, py, pz, 1.0)
-    -- along the fingers, out of the palm, and between the two
-    local rays = { { fx, fy, fz }, { fx + nx, fy + ny, fz + nz }, { nx, ny, nz }, { fx - nx, fy - ny, fz - nz } }
-    for i = 1, #rays do
-        local d = rays[i]
-        local len = math.sqrt(d[1] * d[1] + d[2] * d[2] + d[3] * d[3])
-        local wx, wy, wz = qrot(-ii, -ij, -ik, ir, d[1] / len * CARRY_REACH, d[2] / len * CARRY_REACH, d[3] / len * CARRY_REACH)
-        local ok, hit, tr = pcall(castRay, sys, a, Vector4.new(px + wx, py + wy, pz + wz, 1.0), WORLD_PRESETS[worldPreset], false, true)
-        if ok and hit and tr then
-            local okN, name = pcall(NameToString, tr.material)
-            local rec = okN and name and not name:find('_car', 1, true) and bodyOf(tr)
-            if rec and rec.mass <= CARRY_MAX_MASS and not (HOLD[1 - side] and HOLD[1 - side].rec == rec) then
-                bodyWake(rec, os.clock())
-                local okP, pos = pcall(VRBodyGetPos, rec.body)
-                local okQ, rot = pcall(VRBodyGetRot, rec.body)
-                if okP and okQ and pos and pos.w > 0.5 and rot then
-                    local ci, cj, ck, cr = -wqi, -wqj, -wqk, wqr
-                    local H = { rec = rec, lost = 0.0, force = 0.0, peak = 0.0, trail = {} }
-                    H.x, H.y, H.z = qrot(ci, cj, ck, cr, pos.x - px, pos.y - py, pos.z - pz)
-                    H.i, H.j, H.k, H.r = qmul(ci, cj, ck, cr, rot.i, rot.j, rot.k, rot.r)
-                    HOLD[side] = H
-                    sayOnce('carrying, mass ' .. tostring(rec.mass))
+local function handReal(side, bx, by, bz, ii, ij, ik, ir)
+    local h, r = HAND[side], RAW[side]
+    if not h or not r then return nil end
+    local hx, _, _, hi, hj, hk, hr = bone(h.index)
+    if not hx then return nil end
+    local mx, my, mz = r.x, r.y, r.z
+    local d = RD[side]
+    if d then
+        local ox, oy, oz = qrot(hi, hj, hk, hr, d[1], d[2], d[3])
+        mx, my, mz = mx + ox, my + oy, mz + oz
+    end
+    local px, py, pz = qrot(-ii, -ij, -ik, ir, mx, my, mz)
+    local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, hi, hj, hk, hr)
+    return px + bx, py + by, pz + bz, qi, qj, qk, qr
+end
+
+-- The middle of the palm in the hand's frame: part of the way from the wrist to the knuckles, once they have been seen.
+local function palmSpot(side)
+    local x, y, z, n = 0.0, 0.0, 0.0, 0
+    for digit = 1, 4 do
+        local f = FINGERS[side][digit]
+        if f and f.baseLocal then
+            x, y, z, n = x + f.baseLocal[1], y + f.baseLocal[2], z + f.baseLocal[3], n + 1
+        end
+    end
+    if n >= 2 then
+        local k = K.CARRY_PALM_ALONG / n
+        return x * k, y * k, z * k
+    end
+    return (HAND[side].cx >= 0.0 and 1.0 or -1.0) * K.CARRY_PALM, 0.0, 0.0
+end
+
+-- And its skin: where a thing in the hand touches it.
+local function palmSkin(side)
+    local x, y, z = palmSpot(side)
+    local n = PALM_LOCAL[side]
+    if n then x, y, z = x + n[1] * K.CARRY_PALM_SKIN, y + n[2] * K.CARRY_PALM_SKIN, z + n[3] * K.CARRY_PALM_SKIN end
+    return x, y, z
+end
+
+local function carryAccel(mass, hands)
+    local m = hands >= 2 and mass / K.CARRY_TWO_HANDS or mass
+    if m <= K.CARRY_EASY then return K.CARRY_ACCEL end
+    return K.CARRY_ACCEL * (K.CARRY_EASY / m) ^ K.CARRY_MASS_POWER
+end
+
+-- How a hand holds the thing, from how they stand now: the place it took (lx, ly, lz, in the thing's frame) is at (ax, ay, az) in the hand's, and
+-- that is one point: a thing turned in the hand turns about it. (gx, gy, gz) is the wrist, in the thing's frame, for two hands.
+local function carryBase(H, pos, rot)
+    local ci, cj, ck, cr = -H.qi, -H.qj, -H.qk, H.qr
+    local wx, wy, wz = qrot(rot.i, rot.j, rot.k, rot.r, H.lx, H.ly, H.lz)
+    H.ax, H.ay, H.az = qrot(ci, cj, ck, cr, pos.x + wx - H.px, pos.y + wy - H.py, pos.z + wz - H.pz)
+    H.i, H.j, H.k, H.r = qmul(ci, cj, ck, cr, rot.i, rot.j, rot.k, rot.r)
+    H.gx, H.gy, H.gz = qrot(-rot.i, -rot.j, -rot.k, rot.r, H.px - pos.x, H.py - pos.y, H.pz - pos.z)
+end
+
+-- From here on this hand has it alone, and a thing it can manage comes to its palm.
+local function carryAlone(H, side, pos, rot)
+    carryBase(H, pos, rot)
+    local px, py, pz = palmSkin(side)
+    local ox, oy, oz = H.ax - px, H.ay - py, H.az - pz
+    -- a heavy thing too: nothing hangs in the air before a hand. Only it does not come from far.
+    if H.rec.mass <= K.CARRY_EASY_MASS or ox * ox + oy * oy + oz * oz <= K.CARRY_PULL_MOST * K.CARRY_PULL_MOST then
+        H.tx, H.ty, H.tz = px, py, pz
+    else
+        H.tx, H.ty, H.tz = H.ax, H.ay, H.az
+    end
+end
+
+-- A BODY LYING DEAD. Its limbs keep their weight: with gravity taken off them and a share of the hand's speed it was a balloon. The hand simply has the strength: the limb in it goes where it goes, and the
+-- rest hangs from it, each limb no further below the hand than it lay from that limb. Only what would hang lower than that is held up, gently, so a hand near the floor drags a body with all its weight
+-- and a hand raised lifts it from the top down. Limbs lower than they could hang cost one command each and the rest none.
+K.corpseTick = function(rec, pos, dt)
+    if type(VRCorpseHold) ~= 'function' then return end
+    local other = -1
+    for side = 0, 1 do
+        local H = HOLD[side]
+        if H and H.rec ~= rec and H.rec.proxy == rec.proxy then other = H.rec.index end
+    end
+    local ok, whole = pcall(VRCorpseHold, rec.proxy, rec.index, other, pos.z, dt)
+    if ok and whole and whole > 0.0 then rec.whole = whole end
+end
+
+-- A RAGDOLL GOES BACK TO REST as a prop does: three seconds without a hand on it and with no limb moving. First the game's own event; if its limbs go on moving after it, kinematic where they lie. A grip wakes it again.
+K.ragdollPerson = function(px, py, pz)
+    local pl = Game.GetPlayer()
+    local q = TSQ_ALL()
+    q.maxDistance = K.DEAD_RANGE
+    q.testedSet = TargetingSet.Complete
+    q.ignoreInstigator = true
+    local ok, parts = Game.GetTargetingSystem():GetTargetParts(pl, q)
+    if not ok or not parts then return nil end
+    local best, bestD = nil, K.DEAD_NEAR * K.DEAD_NEAR
+    for _, part in ipairs(parts) do
+        local c = part:GetComponent()
+        local e = c and c:GetEntity()
+        if e and e:IsA('NPCPuppet') then
+            local okD, dead = pcall(function() return e:IsDead() end)
+            local at = okD and dead and e:GetWorldPosition()
+            if at then
+                local d = (at.x - px) * (at.x - px) + (at.y - py) * (at.y - py)
+                if d < bestD then best, bestD = e, d end
+            end
+        end
+    end
+    return best
+end
+K.ragdollEvent = function(id, name, activation)
+    local e = id and Game.FindEntityByID(id)
+    if not e then return false end
+    local ev = NewObject(name)
+    if activation then
+        local d = ev.data
+        d.type = Enum.new('entragdollActivationRequestType', activation)
+        ev.data = d
+    end
+    e:QueueEvent(ev)
+    return true
+end
+K.ragdollTaken = function(rec, px, py, pz)
+    local R = K.RAGDOLLS[rec.proxy]
+    if not R then
+        R = { proxy = rec.proxy, still = 0.0, next = 0.0 }
+        K.RAGDOLLS[rec.proxy] = R
+        local okE, e = pcall(K.ragdollPerson, px, py, pz)
+        if okE and e then R.id = e:GetEntityID() end
+    end
+    if R.frozen then
+        pcall(VRCorpseFreeze, rec.proxy, false)
+        R.frozen = nil
+    end
+    if R.resting then
+        local ok, err = pcall(K.ragdollEvent, R.id, 'entRagdollActivationRequestEvent', 'Forced')
+        pcall(function() spdlog.info('[HandColl] a ragdoll at rest woken by a grip: ' .. tostring(ok and err or err)) end)
+        R.resting, R.check = nil, nil
+    end
+    R.still, R.next = 0.0, 0.0
+    if R.id and K.DEAD_LOOSE then K.DEAD_LOOSE[tostring(R.id.hash)] = nil end
+end
+K.ragdollTick = function(dt)
+    local now = os.clock()
+    if K.DEAD_LOOSE then
+        for key, L in pairs(K.DEAD_LOOSE) do
+            if now > L.at + K.RAGDOLL_ASKED_FOR then
+                K.DEAD_LOOSE[key] = nil
+                pcall(K.ragdollEvent, L.id, 'entRagdollPutToSleepEvent')
+            end
+        end
+    end
+    if type(VRCorpseSpeed) ~= 'function' then return end
+    for proxy, R in pairs(K.RAGDOLLS) do
+        if now >= R.next then
+            local since = now - (R.looked or now)
+            R.looked, R.next = now, now + K.RAGDOLL_EVERY
+            local held = (HOLD[0] and HOLD[0].rec.proxy == proxy) or (HOLD[1] and HOLD[1].rec.proxy == proxy)
+            if R.resting and not R.check and not held then
+                R.next = now + K.RAGDOLL_REST_EVERY
+                local okI, info = pcall(VRBodyInfo, proxy, 0)
+                if not okI or not info or info.x ~= 12.0 then K.RAGDOLLS[proxy] = nil end
+            elseif not held then
+                local ok, speed = pcall(VRCorpseSpeed, proxy)
+                if not ok or not speed or speed < 0.0 then
+                    K.RAGDOLLS[proxy] = nil
+                elseif R.check then
+                    if now >= R.check then
+                        R.check = nil
+                        local frozen = false
+                        if speed > 0.01 then frozen = select(2, pcall(VRCorpseFreeze, proxy, true)) == true; R.frozen = frozen end
+                        local said = string.format('[HandColl] a ragdoll told to rest: fastest limb %.3f m/s after it%s', speed, frozen and ', so made kinematic' or '')
+                        pcall(function() spdlog.info(said) end)
+                    end
+                elseif not R.resting then
+                    if speed > K.RAGDOLL_SPEED then
+                        R.still = 0.0
+                    else
+                        R.still = R.still + since
+                        if R.still >= K.SETTLE_FOR then
+                            local okE, sent = pcall(K.ragdollEvent, R.id, 'entRagdollPutToSleepEvent')
+                            R.resting, R.check = true, now + K.RAGDOLL_CHECK
+                            local said = string.format('[HandColl] a ragdoll lay still %.1f s: asked it to sleep, %s', R.still, tostring(okE and sent or sent))
+                            pcall(function() spdlog.info(said) end)
+                        end
+                    end
                 end
+            else
+                R.still = 0.0
+            end
+        end
+    end
+end
+
+-- A BODY WITHOUT ANY OF THAT. A person killed by an animation lies there with no ragdoll in the physics, or only the grey collision of its rest, and nothing for a hand to hold. A grip on it asks the game for the ragdoll.
+K.deadForce = function(side, bx, by, bz, ii, ij, ik, ir)
+    local px, py, pz = handWorld(side, bx, by, bz, ii, ij, ik, ir)
+    if not px then return end
+    local pl = Game.GetPlayer()
+    local q = TSQ_ALL()
+    q.maxDistance = K.DEAD_RANGE
+    q.testedSet = TargetingSet.Complete
+    q.ignoreInstigator = true
+    local ok, parts = Game.GetTargetingSystem():GetTargetParts(pl, q)
+    if not ok or not parts then return end
+    local now = os.clock()
+    K.DEAD_ASKED = K.DEAD_ASKED or {}
+    for _, part in ipairs(parts) do
+        local c = part:GetComponent()
+        local e = c and c:GetEntity()
+        if e and e:IsA('NPCPuppet') then
+            local okD, dead = pcall(function() return e:IsDead() end)
+            local at = okD and dead and e:GetWorldPosition()
+            if at and (at.x - px) * (at.x - px) + (at.y - py) * (at.y - py) < K.DEAD_NEAR * K.DEAD_NEAR then
+                local id = tostring(e:GetEntityID().hash)
+                if now - (K.DEAD_ASKED[id] or -100.0) > K.DEAD_AGAIN then
+                    K.DEAD_ASKED[id] = now
+                    local okE, err = pcall(function()
+                        local ev = NewObject('entRagdollActivationRequestEvent')
+                        local d = ev.data
+                        d.type = Enum.new('entragdollActivationRequestType', 'Forced')
+                        ev.data = d
+                        e:QueueEvent(ev)
+                    end)
+                    pcall(function() spdlog.info('[HandColl] a body lying dead with no ragdoll in reach: ' .. (okE and 'asked for one' or tostring(err))) end)
+                    K.DEAD_LOOSE = K.DEAD_LOOSE or {}
+                    K.DEAD_LOOSE[id] = { id = e:GetEntityID(), at = now }
+                end
+                K.FORCED[side] = now + K.DEAD_WAIT
                 return
             end
         end
     end
 end
 
-local function carryDrive(side, dt, bx, by, bz, ii, ij, ik, ir)
+local function carryRelease(side, keepSpeed)
     local H = HOLD[side]
-    local px, py, pz, qi, qj, qk, qr = handWorld(side, bx, by, bz, ii, ij, ik, ir)
-    if not px then return end
-    local body = H.rec.body
-    local okP, pos = pcall(VRBodyGetPos, body)
-    if not okP or not pos or pos.w < 0.5 then sayOnce('a carried body stopped answering') HOLD[side] = nil return end
-    local ox, oy, oz = qrot(qi, qj, qk, qr, H.x, H.y, H.z)
-    local ex, ey, ez = px + ox - pos.x, py + oy - pos.y, pz + oz - pos.z
-    local miss = math.sqrt(ex * ex + ey * ey + ez * ez)
-    H.lost = miss > CARRY_LOST_AT and H.lost + dt or 0.0
-    if H.lost > CARRY_LOST_FOR then carryRelease(side, false) return end
-    local h = HF[side]
-    local now = os.clock()
-    local trail = H.trail
-    trail[#trail + 1] = { now, h[1], h[2], h[3] }
-    while #trail > 1 and now - trail[1][1] > THROW_WINDOW do table.remove(trail, 1) end
-    local step = math.max(dt, 1.0 / 120.0)
-    local follow = CARRY_FOLLOW / step
-    local vx, vy, vz = h[1] + ex * follow, h[2] + ey * follow, h[3] + ez * follow + 9.81 * dt
-    local s = math.sqrt(vx * vx + vy * vy + vz * vz)
-    if s > CARRY_MAX_SPEED then
-        local k = CARRY_MAX_SPEED / s
-        vx, vy, vz = vx * k, vy * k, vz * k
+    HOLD[side] = nil
+    if not H then return end
+    fingersFree(side)
+    local rec = H.rec
+    local other = HOLD[1 - side]
+    if other and other.rec == rec then
+        -- the other hand has it now, as it is
+        rec.two = nil
+        rec.parted = os.clock()
+        local okP, pos = pcall(VRBodyGetPos, rec.body)
+        local okQ, rot = pcall(VRBodyGetRot, rec.body)
+        if okP and okQ and pos and rot and other.px then
+            -- IT STAYS WHERE IT IS, for a hand on it. A hand that took it from a little way off has the place it took come into its palm.
+            local sx, sy, sz = qrot(other.qi, other.qj, other.qk, other.qr, palmSkin(1 - side))
+            local nx, ny, nz = qrot(-rot.i, -rot.j, -rot.k, rot.r, other.px + sx - pos.x, other.py + sy - pos.y, other.pz + sz - pos.z)
+            local dx, dy, dz = nx - other.lx, ny - other.ly, nz - other.lz
+            if dx * dx + dy * dy + dz * dz < K.REGRIP_MOST * K.REGRIP_MOST then other.lx, other.ly, other.lz = nx, ny, nz end
+            carryAlone(other, 1 - side, pos, rot)
+        end
+        pcall(function() spdlog.info('[HandColl] the other hand has it') end)
+        return
     end
-    pcall(VRBodySetVel, body, Vector4.new(vx, vy, vz, 0.0))
+    if type(VRHeldPictureLetGo) == 'function' then pcall(VRHeldPictureLetGo, rec.proxy, rec.index) end
+    if rec.queryOff then K.QUERY_BACK[rec] = os.clock() + K.QUERY_AFTER end
+    local speed = 0.0
+    if keepSpeed then
+        local vx, vy, vz, wx, wy, wz = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        for i = 1, #H.trail do
+            local s = H.trail[i]
+            local v = s[2] * s[2] + s[3] * s[3] + s[4] * s[4]
+            if v > speed then speed, vx, vy, vz, wx, wy, wz = v, s[2], s[3], s[4], s[5], s[6], s[7] end
+        end
+        speed = math.sqrt(speed)
+        local gain = speed > K.THROW_GAIN_FROM and K.THROW_GAIN or 1.0
+        local hands = rec.parted and os.clock() - rec.parted < K.THROW_TOGETHER and 2 or 1
+        local most = math.sqrt(2.0 * carryAccel(rec.mass, hands) * K.THROW_ARM)
+        if speed * gain > most then gain = most / math.max(speed, 1e-3) end
+        vx, vy, vz = vx * gain, vy * gain, vz * gain
+        speed = speed * gain
+        local okP, pos = pcall(VRBodyGetPos, rec.body)
+        if okP and pos and pos.w > 0.5 and H.px then
+            -- the wrist's turn carries a thing held away from it
+            local rx, ry, rz = pos.x - H.px, pos.y - H.py, pos.z - H.pz
+            local tx, ty, tz = wy * rz - wz * ry, wz * rx - wx * rz, wx * ry - wy * rx
+            local t = math.sqrt(tx * tx + ty * ty + tz * tz)
+            if t > K.THROW_TANGENT_MOST then
+                local k = K.THROW_TANGENT_MOST / t
+                tx, ty, tz = tx * k, ty * k, tz * k
+            end
+            vx, vy, vz = vx + tx, vy + ty, vz + tz
+        end
+        local w = math.sqrt(wx * wx + wy * wy + wz * wz)
+        if w > K.THROW_SPIN_MOST then
+            local k = K.THROW_SPIN_MOST / w
+            wx, wy, wz = wx * k, wy * k, wz * k
+        end
+        rec.thrown = os.clock()
+        pcall(VRBodySetVel, rec.body, Vector4.new(vx, vy, vz, 0.0))
+        pcall(VRBodySetAngVel, rec.body, Vector4.new(wx, wy, wz, 0.0))
+    end
+    pcall(function() spdlog.info(string.format('[HandColl] let go: %.1f m/s', speed)) end)
+end
+
+-- `only`: the thing the other hand has, for a hand already closed that comes to it.
+local function carryFind(side, bx, by, bz, ii, ij, ik, ir, only)
+    local sys = worldSystem()
+    local h = HAND[side]
+    if not sys or not h then return end
+    local hx, hy, hz, hi, hj, hk, hr = bone(h.index)
+    if not hx or hx * hx + hy * hy < FINGER_FROM_BODY * FINGER_FROM_BODY then return end
+    local px, py, pz = handWorld(side, bx, by, bz, ii, ij, ik, ir)
+    if not px then return end
+    local fx, fy, fz = qrot(hi, hj, hk, hr, h.cx >= 0.0 and 1.0 or -1.0, 0.0, 0.0)
+    local nx, ny, nz = palmNormal(side)
+    if not nx then nx, ny, nz = 0.0, 0.0, -1.0 end
+    -- What the palm faces comes first, then what lies ahead of the fingers.
+    local spotx, spoty, spotz = qrot(hi, hj, hk, hr, palmSpot(side))
+    local pfx, pfy, pfz = qrot(-ii, -ij, -ik, ir, spotx, spoty, spotz)
+    local palm = Vector4.new(px + pfx, py + pfy, pz + pfz, 1.0)
+    local wrist = Vector4.new(px, py, pz, 1.0)
+    local rays = { { palm, nx, ny, nz, K.CARRY_PALM_REACH }, { palm, fx + nx, fy + ny, fz + nz, K.CARRY_PALM_REACH }, { palm, nx - fx, ny - fy, nz - fz, K.CARRY_PALM_REACH },
+        { wrist, fx, fy, fz, K.CARRY_REACH }, { wrist, fx - nx, fy - ny, fz - nz, K.CARRY_REACH } }
+    local rec, point
+    for i = 1, #rays do
+        local d = rays[i]
+        local a, reach = d[1], d[5]
+        local len = math.sqrt(d[2] * d[2] + d[3] * d[3] + d[4] * d[4])
+        local wx, wy, wz = qrot(-ii, -ij, -ik, ir, d[2] / len * reach, d[3] / len * reach, d[4] / len * reach)
+        local ok, hit, tr = pcall(castRay, sys, a, Vector4.new(a.x + wx, a.y + wy, a.z + wz, 1.0), WORLD_PRESETS[worldPreset], false, true)
+        if ok and hit and tr then
+            local okN, name = pcall(NameToString, tr.material)
+            local r = okN and name and not name:find('_car', 1, true) and bodyOf(tr)
+            K.TAKEN_BY = i
+            if r and r.massless then
+                -- WHAT IS IT? No mass: a character's or a device's collider, not a loose thing. Said a few times, for finding out which.
+                K.MASSLESS_SAID = (K.MASSLESS_SAID or 0) + 1
+                if K.MASSLESS_SAID <= 6 then
+                    pcall(function()
+                        local okP, pos = pcall(VRBodyGetPos, r.body)
+                        local px, py, pz = 0.0, 0.0, 0.0
+                        if okP and pos then px, py, pz = pos.x, pos.y, pos.z end
+                        local me = Game.GetPlayer():GetWorldPosition()
+                        local best = 999.0
+                        for n = 1, #npcList do
+                            local e = npcList[n]:GetWorldPosition()
+                            local d = math.sqrt((e.x - px) * (e.x - px) + (e.y - py) * (e.y - py))
+                            if d < best then best = d end
+                        end
+                        spdlog.info(string.format('[HandColl] a hand closed on a thing without mass: kind %.0f, proxy %.0f, %.2f m from the player, %.2f m from a person, %d people near; material %s',
+                            r.kind, r.proxy, math.sqrt((me.x - px) * (me.x - px) + (me.y - py) * (me.y - py)), best, #npcList, name))
+                    end)
+                    if type(VRDebugProbeBody) == 'function' then pcall(VRDebugProbeBody, r.proxy, r.index, Vector4.new(0.0, 0.0, 0.0, 1.0)) end
+                end
+            elseif r and r.mass <= K.CARRY_MAX_MASS then
+                rec, point = r, tr.position
+                break
+            end
+        end
+    end
+    -- No ray happened to meet it: what PhysX has near the palm, and the place taken is where a ray to its middle meets it.
+    if not rec and type(VRNearBody) == 'function' then
+        local okB, info = pcall(VRNearBody, palm, K.CARRY_NEAR, K.CARRY_MAX_MASS)
+        if okB and info and info.y ~= 0.0 then
+            local key = info.y * 4096.0 + info.z
+            rec = BODIES[key]
+            if rec == nil then
+                local okH, body = pcall(VRBodyOf, info.y, info.z)
+                if okH and body then
+                    if bodyCount >= 128 then BODIES, bodyCount = {}, 0 end
+                    rec = { key = key, body = body, kind = info.x, proxy = info.y, index = info.z, mass = info.w > 0.01 and info.w or 1.0 }
+                    BODIES[key] = rec
+                    bodyCount = bodyCount + 1
+                end
+            end
+            if rec then
+                local okP, pos = pcall(VRBodyGetPos, rec.body)
+                if okP and pos and pos.w > 0.5 then
+                    -- WHERE THE PALM IS, when no ray meets it, as with a palm already inside it. Its middle was taken for that place, and the thing went there: most things in the hand were held by their pivot.
+                    point = palm
+                    K.TAKEN_BY = 0
+                    local ok, hit, tr = pcall(castRay, sys, palm, Vector4.new(pos.x, pos.y, pos.z, 1.0), WORLD_PRESETS[worldPreset], false, true)
+                    if ok and hit and tr and bodyOf(tr) == rec then point = tr.position; K.TAKEN_BY = -1 end
+                    sayOnce('a hand took a thing PhysX found, where no ray met it')
+                else
+                    rec = nil
+                end
+            end
+        end
+    end
+    if not rec or (only and rec ~= only) then return end
+    bodyWake(rec, os.clock())
+    local okP, pos = pcall(VRBodyGetPos, rec.body)
+    local okQ, rot = pcall(VRBodyGetRot, rec.body)
+    local rx, ry, rz, qi, qj, qk, qr = handReal(side, bx, by, bz, ii, ij, ik, ir)
+    if okP and okQ and pos and pos.w > 0.5 and rot and rx then
+        local H = { rec = rec, lost = 0.0, trail = {}, age = 0.0 }
+        H.px, H.py, H.pz, H.qi, H.qj, H.qk, H.qr = rx, ry, rz, qi, qj, qk, qr
+        H.lx, H.ly, H.lz = qrot(-rot.i, -rot.j, -rot.k, rot.r, point.x - pos.x, point.y - pos.y, point.z - pos.z)
+        local other = HOLD[1 - side]
+        local sx, sy, sz = 0.0, 0.0, 0.0
+        if other and other.rec == rec then
+            -- the second hand: from here on both turn it, as they turned since now, and the line between them does
+            other.px, other.py, other.pz, other.qi, other.qj, other.qk, other.qr = handReal(1 - side, bx, by, bz, ii, ij, ik, ir)
+            if not other.px then return end
+            carryBase(other, pos, rot)
+            carryBase(H, pos, rot)
+            H.tx, H.ty, H.tz = H.ax, H.ay, H.az
+            local p0, p1 = side == 0 and H or other, side == 0 and other or H
+            local ux, uy, uz = p1.px - p0.px, p1.py - p0.py, p1.pz - p0.pz
+            local ulen = math.sqrt(ux * ux + uy * uy + uz * uz)
+            rec.two = { ux = ux / math.max(ulen, 1e-3), uy = uy / math.max(ulen, 1e-3), uz = uz / math.max(ulen, 1e-3), len = ulen,
+                i = rot.i, j = rot.j, k = rot.k, r = rot.r }
+            H.q0i, H.q0j, H.q0k, H.q0r = qi, qj, qk, qr
+            other.q0i, other.q0j, other.q0k, other.q0r = other.qi, other.qj, other.qk, other.qr
+        else
+            carryAlone(H, side, pos, rot)
+            -- the fingers are worked out as if it had come already
+            local dx, dy, dz = H.tx - H.ax, H.ty - H.ay, H.tz - H.az
+            sx, sy, sz = qrot(qi, qj, qk, qr, -dx, -dy, -dz)
+        end
+        fingersAround(H, side, rec, sys, sx, sy, sz, bx, by, bz, ii, ij, ik, ir)
+        HOLD[side] = H
+        K.pulse(side)
+        if rec.mass > K.CARRY_EASY then K.pulse(side) end
+        if rec.kind == 12 then pcall(K.ragdollTaken, rec, px, py, pz) end
+        if type(VRDebugProbeBody) == 'function' then pcall(VRDebugProbeBody, rec.proxy, rec.index, pos) end
+        local said = string.format('[HandColl] took a thing: mass %.2f, kind %.0f, %s, by %s, the place %.3f m from the palm', rec.mass, rec.kind,
+            (other and other.rec == rec) and 'second hand' or 'one hand',
+            K.TAKEN_BY == 0 and 'where the palm is' or K.TAKEN_BY == -1 and 'a ray to its middle' or 'ray ' .. tostring(K.TAKEN_BY),
+            math.sqrt((point.x - palm.x) * (point.x - palm.x) + (point.y - palm.y) * (point.y - palm.y) + (point.z - palm.z) * (point.z - palm.z)))
+        pcall(function() spdlog.info(said) end)
+    end
+end
+
+-- Everything on one body, once a frame, however many hands are on it.
+local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
+    local body = rec.body
+    local okP, pos = pcall(VRBodyGetPos, body)
     local okQ, rot = pcall(VRBodyGetRot, body)
-    if okQ and rot then
-        local ti, tj, tk, tr = qmul(qi, qj, qk, qr, H.i, H.j, H.k, H.r)
+    if not okP or not pos or pos.w < 0.5 or not okQ or not rot then
+        sayOnce('a carried body stopped answering')
+        for side = 0, 1 do
+            if HOLD[side] and HOLD[side].rec == rec then HOLD[side] = nil; fingersFree(side) end
+        end
+        return
+    end
+    -- THE SCRIPT IS CALLED TWICE A FRAME (measured: 2 ms and 21 ms apart, the body moving only every second call). The later command replaces the earlier, and a pull
+    -- worked out for 2 ms given over a whole step overshoots by the step's length. So one command for each time the body has moved, reckoned over the time it took.
+    rec.since = (rec.since or 0.0) + dt
+    if rec.atx == pos.x and rec.aty == pos.y and rec.atz == pos.z and rec.since < K.STEP_MOST then return end
+    rec.atx, rec.aty, rec.atz = pos.x, pos.y, pos.z
+    local step = math.max(math.min(rec.since, K.STEP_MOST), 1.0 / 120.0)
+    rec.since = 0.0
+    dt = step
+    local now = os.clock()
+    local hands, n = {}, 0
+    local vx, vy, vz = 0.0, 0.0, 0.0
+    -- the player's own speed, for what leaves the hand
+    local pvx, pvy, pvz = 0.0, 0.0, 0.0
+    if rec.bwas then
+        pvx, pvy, pvz = (bx - rec.bwas[1]) / step, (by - rec.bwas[2]) / step, (bz - rec.bwas[3]) / step
+    end
+    rec.bwas = { bx, by, bz }
+    for side = 0, 1 do
+        local H = HOLD[side]
+        if H and H.rec == rec then
+            local px, py, pz, qi, qj, qk, qr = handReal(side, bx, by, bz, ii, ij, ik, ir)
+            if not px then return end
+            -- how fast the wrist turns, world space
+            local wx, wy, wz = 0.0, 0.0, 0.0
+            if H.qr then
+                local di, dj, dk, dr = qmul(qi, qj, qk, qr, -H.qi, -H.qj, -H.qk, H.qr)
+                local sign = dr < 0.0 and -2.0 or 2.0
+                wx, wy, wz = di * sign / step, dj * sign / step, dk * sign / step
+            end
+            H.px, H.py, H.pz, H.qi, H.qj, H.qk, H.qr = px, py, pz, qi, qj, qk, qr
+            H.age = H.age + dt
+            local v = HF[side]
+            local trail = H.trail
+            trail[#trail + 1] = { now, v[1] + pvx, v[2] + pvy, v[3] + pvz, wx, wy, wz }
+            while #trail > 1 and now - trail[1][1] > K.THROW_WINDOW do table.remove(trail, 1) end
+            vx, vy, vz = vx + v[1], vy + v[2], vz + v[3]
+            n = n + 1
+            hands[n] = side
+        end
+    end
+    if n == 0 then return end
+    vx, vy, vz = vx / n, vy / n, vz / n
+
+    -- where it should be, and how it should stand
+    local tx, ty, tz, ti, tj, tk, tr
+    if n == 1 or not rec.two then
+        local H = HOLD[hands[1]]
+        local k = math.min(1.0, step / K.CARRY_PULL_TIME)
+        if H.age >= K.PULL_WAIT then
+            H.ax, H.ay, H.az = H.ax + (H.tx - H.ax) * k, H.ay + (H.ty - H.ay) * k, H.az + (H.tz - H.az) * k
+        end
+        ti, tj, tk, tr = qmul(H.qi, H.qj, H.qk, H.qr, H.i, H.j, H.k, H.r)
+        local ax, ay, az = qrot(H.qi, H.qj, H.qk, H.qr, H.ax, H.ay, H.az)
+        local lx, ly, lz = qrot(ti, tj, tk, tr, H.lx, H.ly, H.lz)
+        tx, ty, tz = H.px + ax - lx, H.py + ay - ly, H.pz + az - lz
+    else
+        local A, B = HOLD[0], HOLD[1]
+        local two = rec.two
+        -- how the two hands have turned since they took it, together
+        local ai, aj, ak, ar = qmul(A.qi, A.qj, A.qk, A.qr, -A.q0i, -A.q0j, -A.q0k, A.q0r)
+        local bi, bj, bk, br = qmul(B.qi, B.qj, B.qk, B.qr, -B.q0i, -B.q0j, -B.q0k, B.q0r)
+        if ai * bi + aj * bj + ak * bk + ar * br < 0.0 then bi, bj, bk, br = -bi, -bj, -bk, -br end
+        local di, dj, dk, dr = ai + bi, aj + bj, ak + bk, ar + br
+        local dn = math.sqrt(di * di + dj * dj + dk * dk + dr * dr)
+        if dn < 1e-4 then di, dj, dk, dr, dn = 0.0, 0.0, 0.0, 1.0, 1.0 end
+        di, dj, dk, dr = di / dn, dj / dn, dk / dn, dr / dn
+        -- far apart, the line between them is what carries it, and of their turn only the part about that line
+        local ux, uy, uz = B.px - A.px, B.py - A.py, B.pz - A.pz
+        local ulen = math.sqrt(ux * ux + uy * uy + uz * uz)
+        local far = two.len > K.TWO_TURN_FROM and math.max(0.0, math.min(1.0, (ulen - K.TWO_TURN_FROM) / (K.TWO_TURN_FULL - K.TWO_TURN_FROM))) or 0.0
+        if far > 0.0 then
+            ux, uy, uz = ux / ulen, uy / ulen, uz / ulen
+            local dot = two.ux * ux + two.uy * uy + two.uz * uz
+            if dot > -0.99 then
+                local ci, cj, ck = two.uy * uz - two.uz * uy, two.uz * ux - two.ux * uz, two.ux * uy - two.uy * ux
+                local cr = 1.0 + dot
+                local c = math.sqrt(ci * ci + cj * cj + ck * ck + cr * cr)
+                ci, cj, ck, cr = ci / c, cj / c, ck / c, cr / c
+                local along = di * two.ux + dj * two.uy + dk * two.uz
+                local si, sj, sk, sr = two.ux * along, two.uy * along, two.uz * along, dr
+                local sn = math.sqrt(si * si + sj * sj + sk * sk + sr * sr)
+                if sn < 1e-4 then si, sj, sk, sr, sn = 0.0, 0.0, 0.0, 1.0, 1.0 end
+                local li, lj, lk, lr = qmul(ci, cj, ck, cr, si / sn, sj / sn, sk / sn, sr / sn)
+                if li * di + lj * dj + lk * dk + lr * dr < 0.0 then li, lj, lk, lr = -li, -lj, -lk, -lr end
+                di, dj, dk, dr = di + (li - di) * far, dj + (lj - dj) * far, dk + (lk - dk) * far, dr + (lr - dr) * far
+                dn = math.sqrt(di * di + dj * dj + dk * dk + dr * dr)
+                di, dj, dk, dr = di / dn, dj / dn, dk / dn, dr / dn
+            end
+        end
+        ti, tj, tk, tr = qmul(di, dj, dk, dr, two.i, two.j, two.k, two.r)
+        local gx, gy, gz = qrot(ti, tj, tk, tr, (A.gx + B.gx) * 0.5, (A.gy + B.gy) * 0.5, (A.gz + B.gz) * 0.5)
+        tx, ty, tz = (A.px + B.px) * 0.5 - gx, (A.py + B.py) * 0.5 - gy, (A.pz + B.pz) * 0.5 - gz
+    end
+
+    -- HOW THE TARGET TURNS. Asked of the target itself, so one hand or two alike. Until now the turn was only chased from behind, 80 ms behind at best, and a grip point away from the
+    -- middle of the thing swung round the hand with nobody telling it to.
+    -- THE PICTURE (src/Natives/HeldPicture.cpp): where the thing sits in the first hand's frame, for drawing it on that hand as drawn. Before any lead: the hand has no lag to make up.
+    local pa = HOLD[hands[1]]
+    -- the picture goes on the hand as drawn, so where that hand is drawn off the real one is taken out
+    local dwx, dwy, dwz = 0.0, 0.0, 0.0
+    if n == 2 and pa.dx then dwx, dwy, dwz = qrot(-ii, -ij, -ik, ir, pa.dx, pa.dy, pa.dz) end
+    local pgx, pgy, pgz = qrot(-pa.qi, -pa.qj, -pa.qk, pa.qr, tx - pa.px - dwx, ty - pa.py - dwy, tz - pa.pz - dwz)
+    local wti, wtj, wtk, wtr = ti, tj, tk, tr
+    local pti, ptj, ptk, ptr = qmul(-pa.qi, -pa.qj, -pa.qk, pa.qr, ti, tj, tk, tr)
+    local ptx, pty, ptz = tx, ty, tz
+    -- HOW FAST THE TARGET GOES, asked of the target: the hand, the player's own walking and turning (the hand's speed is measured against the player and knows nothing of them), the swing of a
+    -- grip point held off the thing's middle, two hands alike. A frame's walk at a run was all left to the chase.
+    do
+        local w = rec.went
+        if w then
+            local k = math.min(1.0, step / K.TURN_TAU)
+            rec.gox = rec.gox + ((tx - w[1]) / step - rec.gox) * k
+            rec.goy = rec.goy + ((ty - w[2]) / step - rec.goy) * k
+            rec.goz = rec.goz + ((tz - w[3]) / step - rec.goz) * k
+            w[1], w[2], w[3] = tx, ty, tz
+        else
+            rec.went = { tx, ty, tz }
+            rec.gox, rec.goy, rec.goz = vx, vy, vz
+        end
+        vx, vy, vz = rec.gox, rec.goy, rec.goz
+    end
+    local wx, wy, wz = 0.0, 0.0, 0.0
+    do
+        local T = rec.turn
+        if T then
+            local di, dj, dk, dr = qmul(ti, tj, tk, tr, -T.i, -T.j, -T.k, T.r)
+            local sign = dr < 0.0 and -2.0 or 2.0
+            local k = math.min(1.0, step / K.TURN_TAU)
+            T.wx = T.wx + (di * sign / step - T.wx) * k
+            T.wy = T.wy + (dj * sign / step - T.wy) * k
+            T.wz = T.wz + (dk * sign / step - T.wz) * k
+            T.i, T.j, T.k, T.r = ti, tj, tk, tr
+            local w = math.sqrt(T.wx * T.wx + T.wy * T.wy + T.wz * T.wz)
+            local c = w > K.TURN_MOST and K.TURN_MOST / w or 1.0
+            wx, wy, wz = T.wx * c, T.wy * c, T.wz * c
+        else
+            rec.turn = { i = ti, j = tj, k = tk, r = tr, wx = 0.0, wy = 0.0, wz = 0.0 }
+        end
+        -- and how it will stand, as where it will be
+        local a = K.CARRY_LEAD
+        local ai, aj, ak = wx * a * 0.5, wy * a * 0.5, wz * a * 0.5
+        local an = math.sqrt(ai * ai + aj * aj + ak * ak + 1.0)
+        ti, tj, tk, tr = qmul(ai / an, aj / an, ak / an, 1.0 / an, ti, tj, tk, tr)
+    end
+
+    -- WHERE IT WILL BE, going as it goes, for comparing with where the hand will be. Measured from where it is now, any thing in motion
+    -- would look left behind, by its speed times a frame.
+    local okV, v = pcall(VRBodyGetVel, body)
+    local hasV = okV and v and v.w > 0.5
+    local ahead = step + K.CARRY_LEAD
+    local goesx, goesy, goesz = pos.x, pos.y, pos.z
+    if hasV then goesx, goesy, goesz = pos.x + v.x * ahead, pos.y + v.y * ahead, pos.z + v.z * ahead end
+    tx, ty, tz = tx + vx * K.CARRY_LEAD, ty + vy * K.CARRY_LEAD, tz + vz * K.CARRY_LEAD
+    -- The player's own walking turns round no faster than legs do, so there is nothing to overshoot: that part of the lead is a step, whatever the slider says of the hand's.
+    do
+        local more = math.max(0.0, step - K.CARRY_LEAD)
+        tx, ty, tz = tx + pvx * more, ty + pvy * more, tz + pvz * more
+    end
+    local mx, my, mz = tx - goesx, ty - goesy, tz - goesz
+    local miss = math.sqrt(mx * mx + my * my + mz * mz)
+
+    -- Is it going as it was told?
+    local slipped = false
+    if hasV and rec.toldx then
+        local sx, sy, sz = rec.toldx - v.x, rec.toldy - v.y, rec.toldz - v.z
+        -- A step's command can land a step late, and at a fast hand that alone is metres per second between told and read. What has hit something does not go where it is told, step after step.
+        local tn = rec.toldx * rec.toldx + rec.toldy * rec.toldy + rec.toldz * rec.toldz
+        slipped = sx * sx + sy * sy + sz * sz > K.BLOCK_SLIP * K.BLOCK_SLIP and
+            (tn < 1e-4 or (v.x * rec.toldx + v.y * rec.toldy + v.z * rec.toldz) / tn < K.BLOCK_ALONG)
+    end
+    rec.slips = slipped and (rec.slips or 0) + 1 or 0
+    rec.clear = slipped and 0 or (rec.clear or 0) + 1
+    if rec.blocked then
+        if miss < K.BLOCK_FREE_MISS or rec.clear >= K.BLOCK_FREE_STEPS then rec.blocked = nil
+        elseif slipped then rec.blocked = K.BLOCK_SPEED
+        else rec.blocked = rec.blocked + K.BLOCK_RAMP * dt end
+    elseif rec.kind ~= 12 and miss > K.BLOCK_MISS and rec.slips >= K.BLOCK_STEPS then
+        rec.blocked = K.BLOCK_SPEED
+        K.BLOCK_SAID = (K.BLOCK_SAID or 0) + 1
+        if K.BLOCK_SAID <= 20 then
+            pcall(function() spdlog.info(string.format('[HandColl] a carried thing ran into something: %.3f m off, told (%.2f %.2f %.2f), going (%.2f %.2f %.2f), target going (%.2f %.2f %.2f)',
+                miss, rec.toldx, rec.toldy, rec.toldz, v.x, v.y, v.z, vx, vy, vz)) end)
+        end
+    end
+
+    -- NOT IN THE PLAYER'S WAY. To the player's movement a carried thing is an obstacle, so with it in front of them they walked into their own hand and stood still. Queries off hides it from
+    -- movement, as the lobby does with what it carries; it goes on colliding with walls. But rays do not see it either, so a free hand coming to it gets it back: for taking hold, and to lay its fingers on it.
+    if type(VRBodySetQueryable) == 'function' then
+        local off = true
+        if n == 1 then
+            local ox, oy, oz = handReal(1 - hands[1], bx, by, bz, ii, ij, ik, ir)
+            if ox then
+                local dx, dy, dz = ox - pos.x, oy - pos.y, oz - pos.z
+                off = dx * dx + dy * dy + dz * dz > K.QUERY_HAND * K.QUERY_HAND
+            end
+        end
+        if K.QUERY_BACK[rec] then K.QUERY_BACK[rec] = nil end
+        if rec.queryOff ~= off then
+            rec.queryOff = off
+            pcall(VRBodySetQueryable, body, not off)
+        end
+    end
+    rec.pictured = false
+    if type(VRHeldPicture) == 'function' then
+        -- A WALL AHEAD. The body stops at it, but learning that from the body takes some steps, and meanwhile the picture is in the wall. So ask the wall: along the way from the body to where the
+        -- picture goes, how much room is there, less what the thing measures in that direction? Too much of a measure only means the picture is on its body a little sooner, near a wall.
+        local reach = -1.0
+        local gx, gy, gz = ptx - pos.x, pty - pos.y, ptz - pos.z
+        local gap = math.sqrt(gx * gx + gy * gy + gz * gz)
+        local sys = gap > K.PICTURE_GAP and worldSystem() or nil
+        if sys then
+            if rec.dims == nil then
+                local okD, d = pcall(VRBodyGetDims, body)
+                rec.dims = okD and d and d.w > 0.5 and { d.x, d.y, d.z } or false
+            end
+            local ex = K.PICTURE_MEASURE
+            if rec.dims then
+                local lx, ly, lz = qrot(-rot.i, -rot.j, -rot.k, rot.r, gx / gap, gy / gap, gz / gap)
+                ex = math.abs(lx) * rec.dims[1] + math.abs(ly) * rec.dims[2] + math.abs(lz) * rec.dims[3]
+            end
+            -- the body will have gone on by the time this is used
+            local run = hasV and math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) * step * K.PICTURE_STEPS or 0.0
+            ex = ex + run
+            local k = (gap + ex + K.PICTURE_MARGIN) / gap
+            local d = rayDistance(sys, Vector4.new(pos.x, pos.y, pos.z, 1.0), Vector4.new(pos.x + gx * k, pos.y + gy * k, pos.z + gz * k, 1.0), pos.x, pos.y, pos.z, false)
+            if d then reach = math.max(0.0, d - ex - K.PICTURE_MARGIN) end
+        end
+        local ok, on = pcall(VRHeldPicture, rec.proxy, rec.index, HAND[hands[1]].index, Vector4.new(pgx, pgy, pgz, reach), Vector4.new(pti, ptj, ptk, ptr), rec.blocked ~= nil)
+        -- held short of the wall, the hand stays on it too
+        rec.pictured = ok and on and not rec.blocked and (reach < 0.0 or reach > gap * 0.5) or false
+        if ok and not on then sayOnce('a carried thing whose picture stays on its body: kind ' .. tostring(rec.kind)) end
+    end
+
+    -- the pull, as far as these hands can give it
+    local accel = rec.kind == 12 and K.CARRY_ACCEL or carryAccel(rec.mass, n)
+    local follow = K.CARRY_FOLLOW / step
+    local ex, ey, ez = (tx - pos.x) * follow, (ty - pos.y) * follow, (tz - pos.z) * follow
+    if rec.blocked then
+        vx, vy, vz = 0.0, 0.0, 0.0
+        local e = math.sqrt(ex * ex + ey * ey + ez * ez)
+        if e > rec.blocked then
+            local k = rec.blocked / e
+            ex, ey, ez = ex * k, ey * k, ez * k
+        end
+    end
+    local wantx, wanty, wantz = vx + ex, vy + ey, vz + ez + 9.81 * dt
+    local s = math.sqrt(wantx * wantx + wanty * wanty + wantz * wantz)
+    if s > K.CARRY_MAX_SPEED then
+        local k = K.CARRY_MAX_SPEED / s
+        wantx, wanty, wantz = wantx * k, wanty * k, wantz * k
+    end
+    if hasV then
+        local dvx, dvy, dvz = wantx - v.x, wanty - v.y, wantz - v.z
+        local dv = math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz)
+        local most = accel * step
+        if dv > most then
+            local k = most / dv
+            wantx, wanty, wantz = v.x + dvx * k, v.y + dvy * k, v.z + dvz * k
+        end
+    end
+    pcall(VRBodySetVel, body, Vector4.new(wantx, wanty, wantz, 0.0))
+    if rec.kind == 12 then K.corpseTick(rec, pos, dt) end
+    -- THE MEASUREMENT: a swing, frame by frame. Only reads. It goes to the log in one piece at its end.
+    do
+        local T = rec.trace
+        if not T and (K.TRACE_DONE or 0) < K.TRACE_TIMES and n == 1 and (vx * vx + vy * vy + vz * vz > K.TRACE_SPEED * K.TRACE_SPEED or wx * wx + wy * wy + wz * wz > 36.0) and type(VRBodyPhysXPos) == 'function' then
+            K.TRACE_DONE = (K.TRACE_DONE or 0) + 1
+            T = { rows = {} }
+            rec.trace = T
+        end
+        if T and #T.rows < K.TRACE_FRAMES then
+            local okX, px = pcall(VRBodyPhysXPos, rec.proxy, rec.index)
+            local okW, rw = pcall(VRBodyGetAngVel, body)
+            local ei, ej, ek, er = qmul(ti, tj, tk, tr, -rot.i, -rot.j, -rot.k, rot.r)
+            T.rows[#T.rows + 1] = string.format('%.4f t %.3f %.3f %.3f hand %.3f %.3f told %.2f %.2f %.2f read %.2f %.2f %.2f game %.3f %.3f %.3f px %.3f %.3f %.3f turn %.2f %.2f %.2f spun %.2f %.2f %.2f off %.3f',
+                now, tx, ty, tz, vx, vy, wantx, wanty, wantz, hasV and v.x or 0.0, hasV and v.y or 0.0, hasV and v.z or 0.0,
+                pos.x, pos.y, pos.z, okX and px and px.x or 0.0, okX and px and px.y or 0.0, okX and px and px.z or 0.0,
+                wx, wy, wz, okW and rw and rw.x or 0.0, okW and rw and rw.y or 0.0, okW and rw and rw.z or 0.0,
+                2.0 * math.atan2(math.sqrt(ei * ei + ej * ej + ek * ek), math.abs(er)))
+            if #T.rows == K.TRACE_FRAMES then
+                pcall(function()
+                    for i = 1, #T.rows do spdlog.info('[trace] ' .. T.rows[i]) end
+                end)
+            end
+        end
+    end
+    -- what it was told, less the fall a step of gravity takes off it again
+    rec.toldx, rec.toldy, rec.toldz = wantx, wanty, wantz - 9.81 * dt
+    do
+        local spin = K.CARRY_SPIN * math.min(1.0, accel / 60.0) * (rec.blocked and 0.3 or 1.0)
         local ei, ej, ek, er = qmul(ti, tj, tk, tr, -rot.i, -rot.j, -rot.k, rot.r)
         local sign = er < 0.0 and -1.0 or 1.0
-        pcall(VRBodySetAngVel, body, Vector4.new(2.0 * CARRY_SPIN * ei * sign, 2.0 * CARRY_SPIN * ej * sign, 2.0 * CARRY_SPIN * ek * sign, 0.0))
+        local ff = rec.blocked and 0.0 or 1.0
+        pcall(VRBodySetAngVel, body, Vector4.new(wx * ff + 2.0 * spin * ei * sign, wy * ff + 2.0 * spin * ej * sign, wz * ff + 2.0 * spin * ek * sign, 0.0))
     end
-    -- squeezed past closed
-    if type(VRGripForce) == 'function' then
-        local okF, force = pcall(VRGripForce, side)
-        if okF and force then
-            H.peak = math.max(H.peak or 0.0, force)
-            H.force = force >= CRUSH_FORCE and H.force + dt or 0.0
-            if H.force >= CRUSH_FOR then
-                HOLD[side] = nil
-                pcall(function() spdlog.info(string.format('[HandColl] crushed a body: mass %.2f, kind %.0f', H.rec.mass, H.rec.kind)) end)
-                pcall(function() body:AddLinearImpulse(Vector4.new(0.0, 0.0, -CRUSH_BLOW * H.rec.mass, 0.0), true) end)
-                crushed[#crushed + 1] = { body = body, at = os.clock() }
+
+    -- each hand: drawn on the thing, and how hard it squeezes
+    for a = 1, n do
+        local side = hands[a]
+        local H = HOLD[side]
+        local lx, ly, lz = qrot(rot.i, rot.j, rot.k, rot.r, H.lx, H.ly, H.lz)
+        local sx, sy, sz = palmSkin(side)
+        sx, sy, sz = qrot(H.qi, H.qj, H.qk, H.qr, sx, sy, sz)
+        -- and where this hand is going
+        local hv = HF[side]
+        local dx = goesx + lx - sx - H.px - hv[1] * K.CARRY_LEAD
+        local dy = goesy + ly - sy - H.py - hv[2] * K.CARRY_LEAD
+        local dz = goesz + lz - sz - H.pz - hv[3] * K.CARRY_LEAD
+        local dev = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if DBG.on then
+            -- the place taken, and from it to the palm, as it should be with the hand where it really is
+            local px, py, pz = goesx + lx, goesy + ly, goesz + lz
+            local tox, toy, toz = H.px + sx, H.py + sy, H.pz + sz
+            pcall(VRDebugPoint, Vector4.new(px, py, pz, 1.0), 0.02, 7)
+            pcall(VRDebugLine, Vector4.new(px, py, pz, 1.0), Vector4.new(tox, toy, toz, 1.0), 7)
+        end
+        -- WHAT WAS MEASURED, once: how far the place it took is from the palm as drawn. The first test of where a thing really sits.
+        if not H.said and H.age > 0.5 then
+            H.said = true
+            local h = HAND[side]
+            local hx, hy, hz = bone(h.index)
+            if hx then
+                local mx2, my2, mz2 = qrot(-ii, -ij, -ik, ir, hx, hy, hz)
+                local rx2, ry2, rz2 = qrot(H.qi, H.qj, H.qk, H.qr, palmSkin(side))
+                local gx2, gy2, gz2 = pos.x + lx - (mx2 + bx + rx2), pos.y + ly - (my2 + by + ry2), pos.z + lz - (mz2 + bz + rz2)
+                local lx2, ly2, lz2 = qrot(-H.qi, -H.qj, -H.qk, H.qr, gx2, gy2, gz2)
+                local nl = PALM_LOCAL[side]
+                local d = RD[side]
+                pcall(function() spdlog.info(string.format(
+                    '[HandColl] in the hand: place taken is (%.3f %.3f %.3f) from the palm, %.3f out of it; palm normal (%.2f %.2f %.2f), wrist off target (%.3f %.3f %.3f), %s, %d hands',
+                    lx2, ly2, lz2, nl and (lx2 * nl[1] + ly2 * nl[2] + lz2 * nl[3]) or 0.0, nl and nl[1] or 0.0, nl and nl[2] or 0.0, nl and nl[3] or 0.0,
+                    d and d[1] or 0.0, d and d[2] or 0.0, d and d[3] or 0.0, rec.blocked and 'blocked' or 'free', n)) end)
+            end
+        end
+        H.lost = dev > K.HAND_LOST_AT and H.lost + dt or 0.0
+        -- TWO HANDS, ONE TAKEN FROM A LITTLE WAY OFF: drawn on the place it took, on the picture, since neither hand's real place moves the thing away from it. Nothing to feed back: the target goes by the real hands.
+        local onPicture = rec.pictured and n == 2
+        if onPicture then
+            local plx, ply, plz = qrot(wti, wtj, wtk, wtr, H.lx, H.ly, H.lz)
+            dx, dy, dz = ptx + plx - sx - H.px, pty + ply - sy - H.py, ptz + plz - sz - H.pz
+            dev = math.sqrt(dx * dx + dy * dy + dz * dz)
+        end
+        -- With its picture on the hand, the hand does not go to the body: that would bring the body's lag back into both.
+        if dev > K.HAND_SLACK and (onPicture or not rec.pictured) then
+            local k = math.min(K.HAND_TRAIL, dev - K.HAND_SLACK) / dev * math.min(1.0, H.age / K.HAND_TO_IT_TIME)
+            H.dx, H.dy, H.dz = qrot(ii, ij, ik, ir, dx * k, dy * k, dz * k)
+        else
+            H.dx, H.dy, H.dz = nil, nil, nil
+        end
+    end
+    for a = 1, n do
+        local H = HOLD[hands[a]]
+        if H and H.lost > (rec.kind == 12 and K.CORPSE_LOST or K.HAND_LOST_FOR) then carryRelease(hands[a], false) end
+    end
+end
+
+-- THE COLLISION VIEW: the capsules this mod knows, the palms, and what PhysX itself has around the hands. The rays draw themselves, in castRay.
+local function debugDraw(holder, bx, by, bz, ii, ij, ik, ir)
+    local was = DBG.on
+    DBG.on = false
+    if type(VRDebugOn) ~= 'function' then return end
+    local okOn, on = pcall(VRDebugOn)
+    if not okOn or not on then
+        if was then pcall(VRDebugFlush) end
+        return
+    end
+    DBG.on = true
+    local function world(x, y, z)
+        local wx, wy, wz = qrot(-ii, -ij, -ik, ir, x, y, z)
+        return Vector4.new(wx + bx, wy + by, wz + bz, 1.0)
+    end
+    for i = 1, #CAPS do
+        local c = CAPS[i]
+        local ax, ay, az, ex, ey, ez = endpoints(c)
+        if ax then
+            pcall(VRDebugCapsule, world(ax, ay, az), world(ex, ey, ez), c.r, c.slot:find('vrp_f_', 1, true) and 5 or 3)
+        end
+    end
+    local list = { n = 0 }
+    buildObstacles(0, list)
+    for i = 1, list.n do
+        local c = list[i]
+        if c.label == 'npc' then pcall(VRDebugCapsule, world(c.ax, c.ay, c.az), world(c.bx, c.by, c.bz), c.r, 6) end
+    end
+    local cx, cy, cz, n = 0.0, 0.0, 0.0, 0
+    for side = 0, 1 do
+        local h = HAND[side]
+        local hx, hy, hz, hi, hj, hk, hr
+        if h then hx, hy, hz, hi, hj, hk, hr = bone(h.index) end
+        if hx then
+            cx, cy, cz, n = cx + hx, cy + hy, cz + hz, n + 1
+            palmNormal(side)
+            local px, py, pz = qrot(hi, hj, hk, hr, palmSkin(side))
+            pcall(VRDebugPoint, world(hx + px, hy + py, hz + pz), 0.015, 0)
+            local nl = PALM_LOCAL[side]
+            if nl then
+                local ox, oy, oz = qrot(hi, hj, hk, hr, nl[1] * 0.1, nl[2] * 0.1, nl[3] * 0.1)
+                pcall(VRDebugLine, world(hx + px, hy + py, hz + pz), world(hx + px + ox, hy + py + oy, hz + pz + oz), 0)
+            end
+        end
+    end
+    if n > 0 then
+        local okW, shapes = pcall(VRDebugWorld, world(cx / n, cy / n, cz / n), 2.0)
+        if okW and shapes and shapes > 0 then sayOnce('the view found shapes: ' .. tostring(shapes)) end
+    end
+    pcall(VRDebugFlush)
+end
+
+-- The drawn hand stays on what it carries. Before the hold is published, so it goes out this frame.
+local function carryHand()
+    for side = 0, 1 do
+        local H, r = HOLD[side], RAW[side]
+        if H and r and H.dx and not SKIP[side] then
+            PX[side], PY[side], PZ[side] = r.x + H.dx, r.y + H.dy, r.z + H.dz
+            FIRM[side] = false
+        end
+        local G = K.NPC_GRIP[side]
+        if G and r and G.dx and not SKIP[side] then
+            PX[side], PY[side], PZ[side] = r.x + G.dx, r.y + G.dy, r.z + G.dz
+            FIRM[side] = false
+        end
+    end
+end
+
+-- Kinematic again, what has lain still long enough.
+local function settleTick(dt)
+    local okR, errR = pcall(K.ragdollTick, dt)
+    if not okR then sayOnce('ragdolls at rest failed: ' .. tostring(errR)) end
+    for rec, at in pairs(K.QUERY_BACK) do
+        if os.clock() >= at then
+            K.QUERY_BACK[rec] = nil
+            rec.queryOff = nil
+            local ok, p = pcall(VRBodyGetPos, rec.body)
+            if ok and p and p.w > 0.5 then pcall(VRBodySetQueryable, rec.body, true) end
+        end
+    end
+    for rec in pairs(WOKEN) do
+        if (HOLD[0] and HOLD[0].rec == rec) or (HOLD[1] and HOLD[1].rec == rec) then
+            rec.settled = 0.0
+        else
+            local ok, v = pcall(VRBodyGetVel, rec.body)
+            if not ok or not v or v.w < 0.5 then
+                WOKEN[rec] = nil
+            elseif v.x * v.x + v.y * v.y + v.z * v.z > K.SETTLE_SPEED * K.SETTLE_SPEED then
+                rec.settled = 0.0
+            else
+                rec.settled = rec.settled + dt
+                if rec.settled >= K.SETTLE_FOR then
+                    pcall(VRBodySetKinematic, rec.body, true)
+                    WOKEN[rec] = nil
+                    rec.checked, rec.woke = nil, nil
+                    sayOnce('a thing lay still and went back to being kinematic')
+                end
             end
         end
     end
 end
 
--- Whatever came through its blow whole is taken out of the world, under it.
-local function crushTick()
-    local now = os.clock()
-    for i = #crushed, 1, -1 do
-        local c = crushed[i]
-        if now - c.at >= CRUSH_LATER then
-            table.remove(crushed, i)
-            local okP, pos = pcall(VRBodyGetPos, c.body)
-            local answered = okP and pos and pos.w > 0.5
-            sayOnce('a crushed body ' .. (answered and 'survived its blow' or 'broke'))
-            if answered then
-                local okQ, rot = pcall(VRBodyGetRot, c.body)
-                pcall(VRBodySetVel, c.body, Vector4.new(0.0, 0.0, 0.0, 0.0))
-                if okQ and rot then pcall(VRBodySetPos, c.body, Vector4.new(pos.x, pos.y, pos.z - 300.0, 1.0), rot) end
+-- WHAT THE HANDS FEEL. Row 20 is a click, on the hand's own side.
+K.pulse = function(side)
+    if type(VRHapticEvent) == 'function' then pcall(VRHapticEvent, 20, side == 0 and 1 or 2) end
+end
+
+-- WEIGHT SLOWS THE PLAYER, from 3 kg on, to half at 30. A plain modifier: it is not saved, and it is taken off again with the last thing let go.
+K.weightTick = function()
+    local mass = 0.0
+    local seen = {}
+    for side = 0, 1 do
+        local H = HOLD[side]
+        if H and not seen[H.rec] then
+            seen[H.rec] = true
+            mass = mass + (H.rec.whole or H.rec.mass) / ((HOLD[1 - side] and HOLD[1 - side].rec == H.rec) and K.CARRY_TWO_HANDS or 1.0)
+        end
+    end
+    local want = math.max(0.5, 1.0 - math.max(0.0, mass - 3.0) / 54.0)
+    if K.WEIGHT_AT and math.abs(K.WEIGHT_AT - want) < 0.02 then return end
+    K.WEIGHT_AT = want
+    local ok, err = pcall(function()
+        local pl = Game.GetPlayer()
+        if not pl then return end
+        local id = pl:GetEntityID()
+        local stats = Game.GetStatsSystem()
+        if K.WEIGHT_MOD then stats:RemoveModifier(id, K.WEIGHT_MOD); K.WEIGHT_MOD = nil end
+        if want < 0.999 then
+            K.WEIGHT_MOD = RPGManager.CreateStatModifier(gamedataStatType.MaxSpeed, gameStatModifierType.Multiplier, want)
+            stats:AddModifier(id, K.WEIGHT_MOD)
+        end
+    end)
+    if not ok then
+        K.WEIGHT_AT = 1.0
+        sayOnce('no slowing the player down: ' .. tostring(err))
+    end
+end
+
+-- THE HAND OPENS at what it could take: a ray from the palm, one a turn, and the fingers are held back from closing while it sees something. The grip closes them on it anyway.
+K.palmSees = function(side, sys, F, bx, by, bz, ii, ij, ik, ir)
+    local nx, ny, nz = palmNormal(side)
+    if not nx then return false end
+    local v = HF[side]
+    if v[1] * v[1] + v[2] * v[2] + v[3] * v[3] > K.OPEN_SPEED * K.OPEN_SPEED then return false end
+    local px, py, pz = qrot(-ii, -ij, -ik, ir, F[1], F[2], F[3])
+    local dx, dy, dz = qrot(-ii, -ij, -ik, ir, nx, ny, nz)
+    local a = Vector4.new(px + bx, py + by, pz + bz, 1.0)
+    local b = Vector4.new(a.x + dx * K.OPEN_RANGE, a.y + dy * K.OPEN_RANGE, a.z + dz * K.OPEN_RANGE, 1.0)
+    local ok, hit, tr = pcall(castRay, sys, a, b, WORLD_PRESETS[worldPreset], false, true)
+    return ok and hit and tr and bodyOf(tr) ~= nil or false
+end
+
+-- GRAVITY GLOVES. Grip closed on nothing: what the fingers or the palm point at, up to a few metres, is marked, with a click. A flick of the hand back towards the player and it flies to the hand, and
+-- the closed hand takes it when it arrives. Letting go at any point ends it, and what is on its way just goes on.
+K.pullAim = function(side, sys, bx, by, bz, ii, ij, ik, ir)
+    if type(VRPickCone) ~= 'function' then return end
+    local h = HAND[side]
+    if not h then return end
+    local hx, hy, hz, hi, hj, hk, hr = bone(h.index)
+    if not hx then return end
+    local ax, ay, az = qrot(hi, hj, hk, hr, h.cx >= 0.0 and 1.0 or -1.0, 0.0, 0.0)
+    local nx, ny, nz = palmNormal(side)
+    if not nx then nx, ny, nz = ax, ay, az end
+    local px, py, pz = handWorld(side, bx, by, bz, ii, ij, ik, ir)
+    if not px then return end
+    local dx, dy, dz = qrot(-ii, -ij, -ik, ir, ax, ay, az)
+    local ex, ey, ez = qrot(-ii, -ij, -ik, ir, nx, ny, nz)
+    local keep = K.PREVIEW[side]
+    K.pf('pointing')
+    local ok, info = pcall(VRPickCone, Vector4.new(px, py, pz, 1.0), Vector4.new(dx, dy, dz, 0.0), Vector4.new(ex, ey, ez, 0.0), K.PULL_CONE, K.PULL_RANGE, K.PULL_MASS, keep and keep.proxy or 0, keep and keep.index or 0)
+    K.pf('aim cone')
+    if not ok or not info or info.y == 0.0 then return end
+    local rec = K.recOf(info.y, info.z)
+    K.pf('aim body')
+    if not rec or rec.massless then return end
+    -- not through a wall
+    local okP, p = pcall(VRBodyGetPos, rec.body)
+    if not okP or not p or p.w < 0.5 then return end
+    local through = staticCast(sys, Vector4.new(px, py, pz, 1.0), Vector4.new(p.x, p.y, p.z, 1.0))
+    K.pf('aim wall')
+    if through then return end
+    return rec
+end
+-- The Reach mod marks things and moves real loot, food and drink first: where it has something for this hand, this one stands back. And its marker is the mark of what these gloves point at too.
+K.reachMod = function()
+    if K.REACH == nil then
+        local ok, mod = pcall(GetMod, 'CyberpunkVRPort_Reach')
+        K.REACH = ok and mod or false
+    end
+    return K.REACH or nil
+end
+K.reachBusy = function(side)
+    local mod = K.reachMod()
+    if not mod or not mod.world then return false end
+    local ok, s = pcall(mod.world)
+    if not ok or not s then return false end
+    local h = side + 1
+    return s.eating == h or (s.flight and s.flight.hand == h) or (s.target and s.target.hand == h and s.target.confirmed) or false
+end
+-- The mark on a loose thing is its own outline: its real collision shape, in lines. It has no entity for the game's highlight to go on. Cyan pointed at, orange held from afar.
+-- Where the game's own highlight can go, it goes there: what it needs is a render proxy, which a prop has. Elsewhere the lines.
+K.markThing = function(side, rec, kind, px, py, pz)
+    K.HL_WANT[side] = { proxy = rec.proxy, index = rec.index, kind = kind }
+    if K.HL_NOW[side] and K.HL_NOW[side].proxy == rec.proxy and K.HL_NOW[side].lit then return end
+    if K.HL_NOW[side] and K.HL_NOW[side].proxy == rec.proxy and K.HL_NOW[side].kind == kind then
+        K.pf('pointing')
+        pcall(VRThingOutline, rec.proxy, rec.index, kind == 'lock' and 7 or 5)
+        K.pf('outline')
+        K.MARKED = true
+    end
+end
+K.markTick = function()
+    for side = 0, 1 do
+        local want, now = K.HL_WANT[side], K.HL_NOW[side]
+        K.HL_WANT[side] = nil
+        local same = want and now and want.proxy == now.proxy and want.kind == now.kind
+        if not same then
+            if K.HL_ON and now and now.lit and type(VRThingHighlight) == 'function' then pcall(VRThingHighlight, now.proxy, 0, 0, false) end
+            K.HL_NOW[side] = nil
+            if want then
+                local lit = false
+                if K.HL_ON and type(VRThingHighlight) == 'function' then
+                    local ok, on = pcall(VRThingHighlight, want.proxy, 0, want.kind == 'lock' and K.HL_LOCK or K.HL_AIM, false)
+                    lit = ok and on == true
+                end
+                want.lit = lit
+                K.HL_NOW[side] = want
+                K.HL_SAID = (K.HL_SAID or 0) + 1
+                if K.HL_SAID <= 6 then pcall(function() spdlog.info('[HandColl] marked a thing: ' .. (lit and 'the game\'s highlight' or 'its lines') .. ', proxy ' .. tostring(want.proxy)) end) end
             end
         end
     end
+end
+-- What an open hand held out points at: looked for every few frames, marked on every one.
+K.pullPreview = function(side, sys, px, py, pz, bx, by, bz, ii, ij, ik, ir)
+    local h = HAND[side]
+    local hx, hy = 0.0, 0.0
+    if h then hx, hy = bone(h.index) end
+    local v = HF[side]
+    if not hx or hx * hx + hy * hy < K.PULL_OUT * K.PULL_OUT or v[1] * v[1] + v[2] * v[2] + v[3] * v[3] > K.PULL_STILL * K.PULL_STILL then
+        K.PREVIEW[side] = nil
+        return
+    end
+    K.PREVIEW_TURN = (K.PREVIEW_TURN or 0) + 1
+    if K.PREVIEW_TURN % K.PREVIEW_EVERY == 0 then
+        K.PREVIEW[side] = K.reachBusy(side) and false or K.pullAim(side, sys, bx, by, bz, ii, ij, ik, ir) or false
+    end
+    if K.PREVIEW[side] then K.markThing(side, K.PREVIEW[side], 'aim', px, py, pz) end
+end
+-- Not for loose things any more (asked for, 2026-11-05): what the gloves bring is what can be used, and that is the Reach mod's. It cost too: the look up to 47 ms, the outline up to 62, and an outline lights a whole node's copies.
+-- True brings them back.
+K.GLOVES_LOOSE = false
+K.pullTick = function(side, grip, edge, bx, by, bz, ii, ij, ik, ir)
+    if not K.GLOVES_LOOSE then return end
+    local P = K.PULL[side]
+    if HOLD[side] then K.PULL[side] = nil return end
+    if not grip then
+        K.PULL[side] = nil
+        local sysP = worldSystem()
+        local ax, ay, az = handWorld(side, bx, by, bz, ii, ij, ik, ir)
+        if sysP and ax then K.pullPreview(side, sysP, ax, ay, az, bx, by, bz, ii, ij, ik, ir) end
+        return
+    end
+    local sys = worldSystem()
+    if not sys then return end
+    local px, py, pz = handWorld(side, bx, by, bz, ii, ij, ik, ir)
+    if not px then return end
+    if not P then
+        if not edge or K.reachBusy(side) then return end
+        local rec = K.pullAim(side, sys, bx, by, bz, ii, ij, ik, ir)
+        if not rec then return end
+        K.PULL[side] = { rec = rec, at = os.clock() }
+        K.pulse(side)
+        return
+    end
+    local rec = P.rec
+    local ok, pos = pcall(VRBodyGetPos, rec.body)
+    if not ok or not pos or pos.w < 0.5 then K.PULL[side] = nil return end
+    local dx, dy, dz = px - pos.x, py - pos.y, pz - pos.z
+    local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    K.markThing(side, rec, 'lock', px, py, pz)
+    if not P.flown then
+        if os.clock() - P.at > K.PULL_AIM_FOR then K.PULL[side] = nil return end
+        local v = HF[side]
+        local to = d > 1e-3 and (v[1] * dx + v[2] * dy + v[3] * dz) / d or 0.0
+        if to < K.PULL_FLICK then return end
+        local T = math.max(K.PULL_TIME_LEAST, math.min(K.PULL_TIME_MOST, d / K.PULL_SPEED))
+        bodyWake(rec, os.clock())
+        pcall(VRBodySetVel, rec.body, Vector4.new(dx / T, dy / T, dz / T + 0.5 * 9.81 * T, 0.0))
+        P.flown, P.until_ = true, os.clock() + T + K.PULL_WAIT_MORE
+        K.pulse(side)
+        pcall(function() spdlog.info(string.format('[HandColl] pulled a thing: %.2f m, %.2f kg, %.2f s', d, rec.mass, T)) end)
+        return
+    end
+    if os.clock() > P.until_ then K.PULL[side] = nil return end
+    if d < K.PULL_TAKE then
+        pcall(carryFind, side, bx, by, bz, ii, ij, ik, ir, rec)
+        if HOLD[side] then K.pulse(side); K.PULL[side] = nil end
+    end
+end
+
+-- PEOPLE. What a test has to decide: does a touched person react at all (the game's own bump, a stimulus it sends itself), and does a person gripped go into the "Animated" ragdoll, where a body gives way?
+-- Both only ask the game, and say in the log what it answered. A hand within a person's cylinder, moving, is a touch; a grip closing there is the other. What lies dead is taken by its limb like any body.
+K.npcNear = function(side, bx, by, bz, ii, ij, ik, ir)
+    local px, py, pz = handWorld(side, bx, by, bz, ii, ij, ik, ir)
+    if not px then return nil end
+    for i = 1, #npcList do
+        local n = npcList[i]
+        local ok, e = pcall(worldPos, n)
+        if ok and e then
+            local dx, dy, dz = px - e.x, py - e.y, pz - e.z
+            if dx * dx + dy * dy < K.NPC_TOUCH * K.NPC_TOUCH and dz > 0.0 and dz < 2.0 then
+                local okD, dead = pcall(function() return n:IsDead() end)
+                if not (okD and dead) then return n end
+            end
+        end
+    end
+end
+-- A PERSON TAKEN (src/Anim/NpcArmGrip.cpp), by what is nearest the palm: an arm, a leg, the head, the chest. What is held stays where the grip has it, as it stood from the wrist when it closed, and the rest of them goes on. Past
+-- what that part can reach, however it bends, the grip gives.
+K.npcGripStart = function(side, bx, by, bz, ii, ij, ik, ir)
+    if type(VRNpcGrip) ~= 'function' then return false end
+    -- the real hand: the drawn one stops at the person's capsules, and from here on lies on them
+    local px, py, pz, qi, qj, qk, qr = handReal(side, bx, by, bz, ii, ij, ik, ir)
+    if not px then return false end
+    local sx, sy, sz = qrot(qi, qj, qk, qr, palmSkin(side))
+    local ax, ay, az = px + sx, py + sy, pz + sz
+    local function slotAt(comp, slot)
+        local o, found, tr = pcall(slotTransform, comp, CName.new(slot))
+        if not o or not found or not tr then return nil end
+        local okP, wp = pcall(slotPosition, tr)
+        return okP and wp or nil
+    end
+    local best, bestAt, bestPart, bestD, bestSpot = nil, nil, nil, 1.0, nil
+    for i = 1, #npcList do
+        local rec = NPC_BODY.at[i]
+        if rec and rec.comp then
+            for _, P in ipairs(K.NPC_PARTS) do
+                for _, slot in ipairs(P.slots) do
+                    local wp = slotAt(rec.comp, slot)
+                    if wp then
+                        local d = math.sqrt((wp.x - ax) * (wp.x - ax) + (wp.y - ay) * (wp.y - ay) + (wp.z - az) * (wp.z - az)) / P.reach
+                        if d < bestD then best, bestAt, bestPart, bestD, bestSpot = npcList[i], rec, P, d, wp end
+                    end
+                end
+            end
+        end
+    end
+    if not best then return false end
+    -- where that part is now, from this wrist's frame: kept as it is
+    local wp = slotAt(bestAt.comp, bestPart.ref)
+    local okQ, q = pcall(worldRot, best)
+    if not wp or not okQ or not q then return false end
+    local ox, oy, oz = qrot(-qi, -qj, -qk, qr, wp.x - px, wp.y - py, wp.z - pz)
+    local mi, mj, mk, mr = qmul(-q.i, -q.j, -q.k, q.r, qi, qj, qk, qr)
+    K.NPC_GRIP[side] = { npc = best, part = bestPart.part, ox = ox, oy = oy, oz = oz, mi = mi, mj = mj, mk = mk, mr = mr, torn = 0.0, age = 0.0 }
+    -- THE HAND LIES ON THEM. It closed up to a quarter of a metre off, and what is held stays as it stood from the hand: so it is the drawn hand that goes the rest of the way, to the skin of what it took.
+    do
+        local cx, cy, cz = bestSpot.x, bestSpot.y, bestSpot.z
+        cz = cz + math.max(-(bestPart.down or 0.0), math.min(bestPart.up or 0.0, az - cz))
+        local dx, dy, dz = cx - ax, cy - ay, cz - az
+        local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        local gap = math.min(d - bestPart.skin, 0.3)
+        K.NPC_GRIP[side].gap = gap
+        if gap > 0.0 and d > 1e-3 then
+            local wx, wy, wz = dx / d * gap, dy / d * gap, dz / d * gap
+            local G = K.NPC_GRIP[side]
+            -- kept in the person's frame for what follows the palm's place, in the hand's for what turns with it
+            if bestPart.part >= 4 then G.dwx, G.dwy, G.dwz = qrot(-q.i, -q.j, -q.k, q.r, wx, wy, wz)
+            else G.dwx, G.dwy, G.dwz = qrot(-qi, -qj, -qk, qr, wx, wy, wz) end
+        end
+    end
+    local said = string.format('[HandColl] a person taken by the %s, %.2f m from the palm', bestPart.name, bestD * bestPart.reach)
+    pcall(function() spdlog.info(said) end)
+    K.pulse(side)
+    return true
+end
+K.npcGripTick = function(side, grip, dt, bx, by, bz, ii, ij, ik, ir)
+    local G = K.NPC_GRIP[side]
+    if not G then return end
+    local px, py, pz, qi, qj, qk, qr = handReal(side, bx, by, bz, ii, ij, ik, ir)
+    local okE, e = pcall(worldPos, G.npc)
+    local okQ, q = pcall(worldRot, G.npc)
+    local ok = grip and px and okE and e and okQ and q
+    local mx, my, mz = 0.0, 0.0, 0.0
+    local ti, tj, tk, tr = 0.0, 0.0, 0.0, 1.0
+    if ok then
+        -- A HEAD OR A CHEST GOES WHERE THE PALM GOES. A point 20 cm off the wrist, turned with it, swung round on a neck half as long: the head went round twice as fast as the hand. The turn itself is passed on below.
+        local wx, wy, wz
+        if G.part >= 4 then wx, wy, wz = qrot(qi, qj, qk, qr, palmSkin(side))
+        else wx, wy, wz = qrot(qi, qj, qk, qr, G.ox, G.oy, G.oz) end
+        mx, my, mz = qrot(-q.i, -q.j, -q.k, q.r, px + wx - e.x, py + wy - e.y, pz + wz - e.z)
+        ok = mx * mx + my * my + (mz - 1.3) * (mz - 1.3) < K.NPC_REACH * K.NPC_REACH
+        local ni, nj, nk, nr = qmul(-q.i, -q.j, -q.k, q.r, qi, qj, qk, qr)
+        ti, tj, tk, tr = qmul(ni, nj, nk, nr, -G.mi, -G.mj, -G.mk, G.mr)
+    end
+    local miss = 0.0
+    if ok then
+        local okS, answer = pcall(VRNpcGrip, G.npc, side, G.part, Vector4.new(mx, my, mz, 1.0), Vector4.new(ti, tj, tk, tr))
+        if not okS or not answer or answer < 0.0 then
+            K.NPC_GRIP[side] = nil
+            sayOnce('a person could not be held: ' .. tostring(answer))
+            return
+        end
+        miss = answer
+        -- solved once on a pose, a neck gives some 11 cm, no longer four times that: a head or a chest is let go of a little further off
+        G.torn = miss > (G.part >= 4 and 0.25 or K.NPC_TEAR) and G.torn + dt or 0.0
+        ok = G.torn < K.NPC_TEAR_FOR
+        if not ok then K.pulse(side) end
+    end
+    if not ok then
+        pcall(VRNpcGrip, G.npc, side, G.part, Vector4.new(0.0, 0.0, 0.0, 0.0), Vector4.new(0.0, 0.0, 0.0, 1.0))
+        K.NPC_GRIP[side] = nil
+    elseif G.dwx then
+        G.age = G.age + dt
+        local k = math.min(1.0, G.age / K.HAND_TO_IT_TIME)
+        local wx, wy, wz
+        if G.part >= 4 then wx, wy, wz = qrot(q.i, q.j, q.k, q.r, G.dwx, G.dwy, G.dwz)
+        else wx, wy, wz = qrot(qi, qj, qk, qr, G.dwx, G.dwy, G.dwz) end
+        G.dx, G.dy, G.dz = qrot(ii, ij, ik, ir, wx * k, wy * k, wz * k)
+        -- did it get there? For the test.
+        if not G.said and G.age > 0.5 then
+            G.said = true
+            local dw = math.sqrt(wx * wx + wy * wy + wz * wz)
+            local r = RAW[side]
+            local h = HAND[side]
+            local hx, hy, hz
+            if h then hx, hy, hz = bone(h.index) end
+            local real = r and hx and math.sqrt((hx - r.x) * (hx - r.x) + (hy - r.y) * (hy - r.y) + (hz - r.z) * (hz - r.z)) or -1.0
+            local said = string.format('[HandColl] the hand on a person: to go %.3f m, asked %.3f m, the drawn wrist is %.3f m from the real one', G.gap or 0.0, dw, real)
+            pcall(function() spdlog.info(said) end)
+        end
+    end
+end
+K.npcTick = function(side, edge, bx, by, bz, ii, ij, ik, ir)
+    local now = os.clock()
+    if not edge then
+        local v = HF[side]
+        if v[1] * v[1] + v[2] * v[2] + v[3] * v[3] < K.NPC_MOVING * K.NPC_MOVING then return end
+        if now < (K.NPC_NEXT or 0.0) then return end
+    end
+    local n = K.npcNear(side, bx, by, bz, ii, ij, ik, ir)
+    if not n then return end
+    -- The Animated ragdoll was tried: the bodies appear, and the person goes on as they were (test 2026-11-04). So a grip is a touch too, for now.
+    K.NPC_NEXT = now + K.NPC_EVERY
+    local pl = Game.GetPlayer()
+    local ok, err = pcall(function() pl:GetStimBroadcasterComponent():SendDrirectStimuliToTarget(pl, gamedataStimType.Bump, n) end)
+    K.NPC_SAID = (K.NPC_SAID or 0) + 1
+    if K.NPC_SAID <= 6 then pcall(function() spdlog.info('[HandColl] a person touched: bump stimulus, ' .. (ok and 'sent' or tostring(err))) end) end
+    K.pulse(side)
 end
 
 local function carry(allowed, holder, dt, bx, by, bz, ii, ij, ik, ir)
-    crushTick()
+    K.pf('before carrying')
+    settleTick(dt)
+    K.pf('settle')
     for side = 0, 1 do
+        handMeasure(side)
         local slot = type(GetVRSharedSlot) == 'function' and GetVRSharedSlot(GRIP_SLOT[side]) or 0.0
         local grip = slot > 0.5
         local edge = grip and not gripWas[side]
         gripWas[side] = grip
+        if K.NPC_GRIP[side] then
+            local okG, errG = pcall(K.npcGripTick, side, grip and allowed and holder ~= side and not SKIP[side], dt, bx, by, bz, ii, ij, ik, ir)
+            if not okG then K.NPC_GRIP[side] = nil; sayOnce('holding a person failed: ' .. tostring(errG)) end
+        elseif edge and allowed and holder ~= side and not SKIP[side] then
+            local okG, gripped = pcall(K.npcGripStart, side, bx, by, bz, ii, ij, ik, ir)
+            if okG and gripped then edge = false end
+        end
+        if allowed and holder ~= side and not SKIP[side] and not K.NPC_GRIP[side] then pcall(K.npcTick, side, edge, bx, by, bz, ii, ij, ik, ir) end
+        K.pf('people')
         if HOLD[side] then
             if not allowed or holder == side or SKIP[side] then carryRelease(side, false)
-            elseif not grip then carryRelease(side, true)
-            else carryDrive(side, dt, bx, by, bz, ii, ij, ik, ir) end
-        elseif edge and allowed and holder ~= side and not SKIP[side] then
+            elseif not grip then carryRelease(side, true) end
+        elseif edge and allowed and holder ~= side and not SKIP[side] and not K.reachBusy(side) then
             pcall(carryFind, side, bx, by, bz, ii, ij, ik, ir)
+            if not HOLD[side] then pcall(K.deadForce, side, bx, by, bz, ii, ij, ik, ir) end
+        elseif grip and K.FORCED[side] and allowed and holder ~= side and not SKIP[side] then
+            if os.clock() > K.FORCED[side] then K.FORCED[side] = nil
+            else pcall(carryFind, side, bx, by, bz, ii, ij, ik, ir) end
+        elseif grip and allowed and holder ~= side and not SKIP[side] and HOLD[1 - side] and not K.NPC_GRIP[side] then
+            -- closed already, and coming to what the other hand has: it takes hold when it gets there
+            K.REACH_TURN = (K.REACH_TURN or 0) + 1
+            if K.REACH_TURN % K.REACH_EVERY == 0 then pcall(carryFind, side, bx, by, bz, ii, ij, ik, ir, HOLD[1 - side].rec) end
+        end
+        K.pf('taking')
+        if allowed and holder ~= side and not SKIP[side] and not K.NPC_GRIP[side] then
+            local had = HOLD[side]
+            if not had or K.PULL[side] then
+                local okP, errP = pcall(K.pullTick, side, grip, edge and not had, bx, by, bz, ii, ij, ik, ir)
+                if not okP then sayOnce('pulling failed: ' .. tostring(errP)) end
+            end
+        end
+        K.pf('pointing')
+    end
+    K.weightTick()
+    K.pf('weight')
+    K.markTick()
+    K.pf('marks')
+    if K.MARKED then
+        K.MARKED = false
+        if not DBG.on and type(VRDebugFlush) == 'function' then pcall(VRDebugFlush) end
+    end
+    local first = HOLD[0] and HOLD[0].rec
+    local second = HOLD[1] and HOLD[1].rec
+    for pass = 1, 2 do
+        local rec = pass == 1 and first or (second ~= first and second or nil)
+        if rec then
+            local ok, err = pcall(carryDrive, rec, dt, bx, by, bz, ii, ij, ik, ir)
+            if not ok then sayOnce('carrying failed: ' .. tostring(err)) end
         end
     end
+    K.pf('carrying')
 end
 
-return { worldStop = worldStop, weaponStop = weaponStop, handsPush = handsPush, weaponRanged = weaponRanged,
-    freeStop = freeStop, fingerContact = fingerContact, friction = friction, trackHands = trackHands, carry = carry, stateKey = nil }
+return { worldStop = worldStop, pf = K.pf, pfBegin = K.pfBegin, weaponStop = weaponStop, handsPush = handsPush, weaponRanged = weaponRanged,
+    freeStop = freeStop, fingerContact = fingerContact, friction = friction, trackHands = trackHands, carry = carry, carryHand = carryHand, debugDraw = debugDraw, stateKey = nil }
 end)()
 
 registerForEvent('onUpdate', function(dt)
@@ -2024,6 +3796,7 @@ registerForEvent('onUpdate', function(dt)
     if rl and rl.w < 0.5 then rl = nil end
     if rr and rr.w < 0.5 then rr = nil end
     if not rl and not rr then return end
+    HC.pfBegin()
     RAW[0], RAW[1] = rl, rr
     if rl then PX[0], PY[0], PZ[0] = rl.x, rl.y, rl.z end
     if rr then PX[1], PY[1], PZ[1] = rr.x, rr.y, rr.z end
@@ -2101,12 +3874,15 @@ registerForEvent('onUpdate', function(dt)
         local okR, ranged = pcall(HC.weaponRanged, lastW)
         npcOn = okR and ranged
     end
+    HC.pf('reading')
     if npcOn then npcPlace(dt or 0.016) end
+    HC.pf('people list')
 
     do
         local wx, wy, wz, wi, wj, wk, wr = worldFrame()
         if wx then HC.trackHands(dt or 0.016, wx, wy, wz, wi, wj, wk, wr) end
     end
+    HC.pf('tracking')
 
     if holder ~= nil then
         -- 1. THE HOLDER: its hand, its fingers and the whole gun, against the body. Placed from the RAW wrist, so
@@ -2139,12 +3915,15 @@ registerForEvent('onUpdate', function(dt)
         elseif f then
             PX[free], PY[free], PZ[free] = f.x, f.y, f.z    -- the reload owns it: leave it exactly where tracking says
         end
+        HC.pf('body solve')
         -- 2b. AND THE WORLD, for the gun in the holder's hand. The holder only: a support hand follows the gun.
         if WORLD_ON and not SKIP[holder] and lastW then
             local wx, wy, wz, wi, wj, wk, wr = worldFrame()
             if wx then
                 HC.weaponStop(holder, lastW, wx, wy, wz, wi, wj, wk, wr)
+                HC.pf('gun rest')
                 if not SKIP[free] and f then HC.freeStop(free, wx, wy, wz, wi, wj, wk, wr) end
+                HC.pf('free hand')
             end
         end
         HC.friction(holder, false)
@@ -2174,13 +3953,17 @@ registerForEvent('onUpdate', function(dt)
         end
         -- 4. AND THE WORLD.
         FIRM[0], FIRM[1] = false, false
+        HC.pf('body solve')
         if WORLD_ON then
             local wx, wy, wz, wi, wj, wk, wr = worldFrame()
             if wx then HC.worldStop(wx, wy, wz, wi, wj, wk, wr) end
         end
+        HC.pf('world rays')
         HC.friction(0, true)
         HC.friction(1, true)
     end
+
+    HC.carryHand()
 
     -- Publishing, with a limit and a soft release. Past MAX_HOLD the drawn hand is so far from the real one that
     -- keeping it there is worse than letting go -- but letting go in one frame is the snap that reads as a
@@ -2235,12 +4018,17 @@ registerForEvent('onUpdate', function(dt)
     end
 
     local offL, offR = send(0), send(1)
+    HC.pf('publishing')
     HC.handsPush(pushAllowed, holder, os.clock())
+    HC.pf('pushing')
     do
         local wx, wy, wz, wi, wj, wk, wr = worldFrame()
         if wx then
             if math.floor(collMask / 16) % 2 == 1 then HC.fingerContact(holder, wx, wy, wz, wi, wj, wk, wr) end
+            HC.pf('fingers')
             HC.carry(pushAllowed and math.floor(collMask / 32) % 2 == 1, holder, dt or 0.016, wx, wy, wz, wi, wj, wk, wr)
+            HC.debugDraw(holder, wx, wy, wz, wi, wj, wk, wr)
+            HC.pf('the view')
         end
     end
 
