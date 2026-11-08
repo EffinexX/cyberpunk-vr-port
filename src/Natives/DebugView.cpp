@@ -548,16 +548,15 @@ int gunSaid=0;
 
 inline int GunObstacleCount() {return gunNearCount+gunMovingCount;}
 // WHICH MOVING THINGS STOP THE GUN, once per kind (geometry, filter words), for the log.
-uint64_t gunMovingSeen[32];
+uint64_t gunMovingSeen[96];
 int gunMovingSeenCount=0;
 void GunSayMoving(int i,const char* how) {
-    if(i<gunNearCount)return;
     const NearShape& s=GunObstacle(i);
     const uint64_t key=(uint64_t(s.query[2])<<32)^uint64_t(s.sim[0])^(uint64_t(s.type)<<60)^(uint64_t(s.flags)<<56);
     for(int k=0;k<gunMovingSeenCount;++k)if(gunMovingSeen[k]==key)return;
-    if(gunMovingSeenCount>=32)return;
+    if(gunMovingSeenCount>=96)return;
     gunMovingSeen[gunMovingSeenCount++]=key;
-    Log("[gunshape] a moving thing %s the gun: geometry %d, flags %u, bounds %.2f x %.2f x %.2f m, query %08x %08x %08x %08x, sim %08x %08x %08x %08x\n",how,s.type,unsigned(s.flags),
+    Log("[gunshape] a %s thing %s a hand or the gun: geometry %d, flags %u, bounds %.2f x %.2f x %.2f m, query %08x %08x %08x %08x, sim %08x %08x %08x %08x\n",i<gunNearCount?"static":"moving",how,s.type,unsigned(s.flags),
         s.bounds.hi.x-s.bounds.lo.x,s.bounds.hi.y-s.bounds.lo.y,s.bounds.hi.z-s.bounds.lo.z,s.query[0],s.query[1],s.query[2],s.query[3],s.sim[0],s.sim[1],s.sim[2],s.sim[3]);
 }
 inline const NearShape& GunObstacle(int i) {return i<gunNearCount?gunNear[i]:gunMoving[i-gunNearCount];}
@@ -634,6 +633,8 @@ void GunAddActor(void* actor,const Vec3& center,float radius,const Vec3& origin)
         s.flags=flags;
         Slot<void*(*)(void*,uint32_t*)>(shape,kShapeGetQueryFilter)(shape,s.query);
         Slot<void*(*)(void*,uint32_t*)>(shape,kShapeGetSimFilter)(shape,s.sim);
+        // A PALM'S CROWN IS A BIG SPHERE (2.15 m seen 2026-11-08; query word2 00100000, sim words all zero): the hands and the gun stopped in the air round it.
+        if(s.type==GeomSphere && s.query[2]==0x00100000u && !(s.sim[0]|s.sim[1]|s.sim[2]|s.sim[3]))continue;
         ++gunNextCount;
     }
     if(n<kGunActorShapes)break;
@@ -934,7 +935,7 @@ constexpr float kGunHeavy=30.f;     // kg: what HandCollision does not shove (SH
 constexpr float kGunMovingSlack=.5f;  // m round the gun's reach: how far it can go in a call before a jump throws all away
 void** gunBodyTable=nullptr;
 int gunBodyProved=0;
-uint64_t gunMovingStops=0,gunMovingShoved=0;
+uint64_t gunMovingStops=0,gunMovingShoved=0,gunMovingOwnSkipped=0;
 bool GunStopsAt(void* actor) {
     void** table=*reinterpret_cast<void***>(actor);
     if(gunBodyProved==0) {
@@ -987,7 +988,19 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
         if(stop) {
             // ONLY WHAT TAKES PART IN THE SIMULATION: a person carries a big query-only shape round it (bullets, sight), flags 10 (2026-11-08),
             // and the gun stopped a hand's width off every NPC at it. Nothing solid in the game is query-only.
-            if(gunMovingCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunMoving[gunMovingCount],true))++gunMovingCount;
+            // NOR THE PLAYER'S OWN BODY CAPSULES: they follow the hands, carry filter words that are all zero, and escape the chest test once an
+            // arm is out. A hand stopped at its own capsule was pushed, the capsule followed, and the arms moved by themselves (2026-11-08).
+            if(gunMovingCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunMoving[gunMovingCount],true)) {
+                const NearShape& got=gunMoving[gunMovingCount];
+                // AND NO CHARACTER'S CAPSULE: a tall, thin, upright capsule on something moving (seen 2026-11-08: 0.12 x 0.12 x 1.72 and 0.40 x 0.40 x 1.44 m).
+                // The player's own stands beside the chest, so "bounds hold the chest" misses it, and the gun stopped at it.
+                const float wide=got.bounds.hi.x-got.bounds.lo.x,deep=got.bounds.hi.y-got.bounds.lo.y,tall=got.bounds.hi.z-got.bounds.lo.z;
+                // By its filter words as well, at any height: crouched, the same capsule is 0.80 m tall and both hands were pushed off the body.
+                const bool characterWords=got.type==GeomCapsule && got.query[2]==0x00002000u && got.sim[0]==1u && got.sim[2]==0x000041ceu;
+                const bool character=characterWords || (got.type==GeomCapsule && tall>1.f && wide<.6f && deep<.6f);
+                if(!character && (got.query[0]|got.query[1]|got.query[2]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]))++gunMovingCount;
+                else ++gunMovingOwnSkipped;
+            }
         } else if(gunLooseCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunLoose[gunLooseCount].s,true)) {
             gunLoose[gunLooseCount].proxy=proxy;
             gunLoose[gunLooseCount].body=body;
@@ -1904,8 +1917,9 @@ void VRWorldCenter(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out
     worldMs += MsSince(t0);
     ++worldCalls;
     if (now - worldSaid > 10000) {
-        Log("[world] round the chest: %d near shapes, %d moving that stop, %d loose; %.3f ms a frame for both lists; hands %u calls, %.3f ms mean\n",
-            gunNearCount, gunMovingCount, gunLooseCount, worldMs / worldCalls, handCalls, handCalls ? handMs / handCalls : 0.0);
+        Log("[world] round the chest: %d near shapes, %d moving that stop, %d loose, %.1f own capsules skipped a frame; %.3f ms a frame for both lists; hands %u calls, %.3f ms mean\n",
+            gunNearCount, gunMovingCount, gunLooseCount, double(gunMovingOwnSkipped) / worldCalls, worldMs / worldCalls, handCalls, handCalls ? handMs / handCalls : 0.0);
+        gunMovingOwnSkipped = 0;
         worldSaid = now;
         worldMs = 0;
         worldCalls = 0;

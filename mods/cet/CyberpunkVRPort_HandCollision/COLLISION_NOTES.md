@@ -39,6 +39,18 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 - A **failed build still ran the install script** once (it reinstalled the old DLL, verified by file compare). Build and
   install only in one command with an exit-code check.
 
+- **Arms moved by themselves** once a hand was out past ~50 cm (2026-11-08). `[hand-probe]` showed pushes of 10-36 cm in free air, turning
+  every sample, 15 static shapes unchanged, the tether hitting at about the wrist's own distance, and `moving that stop` going 0 -> 1 -> 2 with
+  the arms involved. The obstacle was a capsule of 0.13 x 0.11 x 0.17 m, flags 11, **all query and sim words zero**: very likely the player's own
+  body capsule following the hand. Inferred, not proved: arm and hand are one actor, so the "bounds hold the chest" skip lets it through only once
+  the arm is out. Moving shapes with all filter words zero are no longer obstacles. Check `own capsules skipped` in the `[world]` line.
+
+- **The gun stopped at the player's own capsule**: a moving upright capsule beside the chest (0.12 x 0.12 x 1.72 m, query word2 `48000002`, sim word0 `2`; also seen
+  0.40 x 0.40 x 1.44 m). Moving capsules taller than 1 m and under 0.6 m across are no longer obstacles. Crouched, the 0.40 m one is 0.80 m tall with the same words (query word2 `00002000`, sim word0 `1`, sim word2 `41ce`), so it is very likely the player's; capsules with those words are skipped at any height.
+
+- **Palms have big round colliders.** After touching a palm the log named one round static kind: a sphere 2.15 m across, flags 11, query word2 `00100000`, sim words zero.
+  Exactly that kind (sphere + those words) is left out of the near list. Identified from one test run by shape and timing, not by material: if something else stops being solid, look here first.
+
 ## PhysX facts (PhysX 3.4.2, `PhysX3_x64.dll` of the game)
 
 - Scene vtable at RVA `0x20CAF0`: slot 94 raycast, 95 sweep, 96 overlap.
@@ -112,17 +124,15 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 ## Diagnostics left in
 
 - `[gunshape] ...` every 10 s while a gun is out: boxes, near shapes, ms per call, rescans, moving things that stop/are shoved.
-- `[gunshape] a moving thing stopped/pushed out the gun: geometry, flags, bounds, filter words` once per kind of shape.
-- `[world] round the chest: near shapes, moving, ms a frame, hands calls/ms` every 10 s.
+- `[gunshape] a static/moving thing stopped/pushed out a hand or the gun: geometry, flags, bounds, filter words` once per kind of shape.
+- `[world] round the chest: near shapes, moving, own capsules skipped, ms a frame, hands calls/ms` every 10 s.
 - `[hand-probe]` when a hand is pushed > 10 cm, the push reverses from the last frame, or the chest tether fires.
 - `[HandColl] probe: static ray ...` / `[gun-probe]` only while the gun's backup rays are on (the scene walk is disabled: it cost 2.5 ms).
 - `VROverlapProbe` and `VRGunProbeAt` natives are still registered but unused by default.
 
 ## Open
 
-- **Arms moving by themselves** once a hand was out past ~40 cm, seen once before a save load, not reproduced. Suspects:
-  the chest tether hitting a surface ~40 cm ahead, or two overlapping meshes pushing a hand back and forth. `[hand-probe]`
-  is there to catch it.
+- Whether the zero-filter skip ends the arm fault still has to be confirmed in game, and why it does not happen in every session is unknown.
 - **Weapons with borrowed parts got another weapon's boxes** (fixed 2026-11-08, found from the `.app` component order, not yet tested in
   game): `weaponBoxOf` took the family from the last component with a known weapon's name; Igla and Testera end on Satara parts, Unity on
   Liberty's rail, some Sidewinder and Umbra skins on Copperhead and Masamune parts. Now the family with the highest score wins (body part
