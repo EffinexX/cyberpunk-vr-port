@@ -146,6 +146,8 @@ struct LiveControls {
     volatile int xrCarryPicture = 1;          // a carried thing is drawn on the hand, its body following
     volatile float xrCarryLead = 0.03f;       // s a carried thing is put ahead of the hand
     volatile float xrContactMargin = 0.01f;   // m kept from a surface, because the collision is smaller than the mesh
+    volatile float xrTouchObjectVolume = 0.5f;   // 0..1, what a surface sounds like when the gun or a hand meets it
+    volatile float xrTouchWeaponVolume = 0.03f;   // 0..1, the weapon's own knock on that
     volatile int xrWheelAnywhere = 1;
 };
 

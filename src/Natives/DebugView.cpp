@@ -510,7 +510,9 @@ inline void PartGeometry(const GunBox& b,PartGeom& g) {
 // A BODY THAT IS STOPPED BY THE WORLD (2026-11-08): the gun, and each hand. Its parts in its own frame, where it was left last call,
 // and what it must stay on this side of (the gun: the wrist; a hand: the chest).
 struct Mover {GunBox parts[kGunMostBoxes];int count=0;Vec3 prev{};bool prevOn=false;Vec3 anchor{};bool anchorOn=false;float anchorSkip=0;uint64_t lastCall=0;Vec3 lastAt{};
-    uint32_t tethered=0,gaveUp=0;Vec3 lastPush{};uint64_t saidAt=0;float tetherAt=0;int lastHitPart=-1;};
+    uint32_t tethered=0,gaveUp=0;Vec3 lastPush{};uint64_t saidAt=0;float tetherAt=0;int lastHitPart=-1;
+    // The last surface a sweep stopped it at, for the contact sounds (VRMoverContact): world point, the surface's normal, how fast it came at it, in which move.
+    Vec3 contactAt{},contactNormal{};float contactSpeed=0,contactSlide=0;bool contactExact=false,contactEver=false,contactMoving=false;uint64_t moves=0,contactMove=0;int64_t lastMoveAt=0;};
 Mover movers[3];   // 0 the left hand, 1 the right, 2 the gun
 Mover& gunMover=movers[2];
 NearShape gunNear[kGunNear],gunNext[kGunNear];
@@ -784,6 +786,13 @@ bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
     constexpr float kSkin=.002f,kGiveUp=1.f;
     constexpr uint16_t kFlags=1|2|4|16|128|256;   // position, normal, distance, assume no overlap at the start, both sides of a mesh, precise
     *push={0,0,0};
+    LARGE_INTEGER moveAt,moveFreq;
+    QueryPerformanceCounter(&moveAt);
+    QueryPerformanceFrequency(&moveFreq);
+    float moveDt=m.lastMoveAt?float(double(moveAt.QuadPart-m.lastMoveAt)/double(moveFreq.QuadPart)):.011f;
+    moveDt=moveDt<.004f?.004f:moveDt>.1f?.1f:moveDt;
+    m.lastMoveAt=moveAt.QuadPart;
+    ++m.moves;
     if(!m.prevOn || !gunSweep || gunSweepBad) {
         GunQueryInner(m,target,turn,push);
         m.prev={target.x+push->x,target.y+push->y,target.z+push->z};
@@ -804,6 +813,8 @@ bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
         const Vec3 dir{left.x/dist,left.y/dist,left.z/dist};
         float best=dist;
         Vec3 normal{};
+        Vec3 hitAt{};
+        bool hitExact=false,hitMoving=false;
         bool hit=false;
         const Transform gun{turn,pos};
         for(int b=0;b<m.count && tests<kGunMostTests;++b) {
@@ -838,13 +849,29 @@ bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
                 const float* f=reinterpret_cast<const float*>(h.bytes+gunHitNormalAt);
                 const float size=f[0]*f[0]+f[1]*f[1]+f[2]*f[2];
                 if(!(size>.9f && size<1.1f) || !(f[3]>=0.f) || !std::isfinite(f[3]))continue;
-                if(f[3]<=best) {best=f[3];normal=Vec3{f[0],f[1],f[2]};hit=true;GunSayMoving(i,"stopped");}
+                if(f[3]<=best) {
+                    best=f[3];normal=Vec3{f[0],f[1],f[2]};hit=true;GunSayMoving(i,"stopped");
+                    // Where it touched, for the contact sounds only: the three floats before the normal, as in PxLocationHit, believed only if they lie by this part where it stopped. Else the part's middle there.
+                    const Vec3 stopped{middle.x+dir.x*f[3],middle.y+dir.y*f[3],middle.z+dir.z*f[3]};
+                    const float reach=(box.capsule?box.radius+box.halfHeight:std::sqrt(box.half.x*box.half.x+box.half.y*box.half.y+box.half.z*box.half.z))+.05f;
+                    const Vec3 said{f[-3]+s.origin.x,f[-2]+s.origin.y,f[-1]+s.origin.z};
+                    const Vec3 off{said.x-stopped.x,said.y-stopped.y,said.z-stopped.z};
+                    hitExact=gunHitNormalAt>=12 && std::isfinite(said.x+said.y+said.z) && off.x*off.x+off.y*off.y+off.z*off.z<=reach*reach;
+                    hitAt=hitExact?said:stopped;
+                    hitMoving=i>=gunNearCount;
+                }
             }
         }
         if(!hit) {
             pos={pos.x+left.x,pos.y+left.y,pos.z+left.z};
             left={0,0,0};
             break;
+        }
+        {
+            const float toward=-(dir.x*normal.x+dir.y*normal.y+dir.z*normal.z);
+            m.contactAt=hitAt;m.contactNormal=normal;m.contactExact=hitExact;m.contactMoving=hitMoving;
+            m.contactSpeed=toward>0.f?dist*toward/moveDt:0.f;
+            m.contactMove=m.moves;m.contactEver=true;
         }
         const float go=best>kSkin?best-kSkin:0.f;
         pos={pos.x+dir.x*go,pos.y+dir.y*go,pos.z+dir.z*go};
@@ -859,6 +886,12 @@ bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
     }
     GunTether(m,pos,turn);
     *push={pos.x-target.x,pos.y-target.y,pos.z-target.z};
+    if(m.contactMove==m.moves) {
+        const Vec3 moved{pos.x-m.prev.x,pos.y-m.prev.y,pos.z-m.prev.z};
+        const float off=moved.x*m.contactNormal.x+moved.y*m.contactNormal.y+moved.z*m.contactNormal.z;
+        const Vec3 along{moved.x-m.contactNormal.x*off,moved.y-m.contactNormal.y*off,moved.z-m.contactNormal.z*off};
+        m.contactSlide=std::sqrt(along.x*along.x+along.y*along.y+along.z*along.z)/moveDt;
+    }
     m.prev=pos;
     return true;
 }
@@ -895,7 +928,7 @@ bool GunGuarded(const Vec3& at,const Quat& turn,const Vec3& center,Vec3* push,bo
 }
 // WHAT THE GUN'S BOXES TOUCH OF WHAT IS LOOSE: asked of PhysX itself, every shape of every moving actor near, the same test as against the world. There are few of those (31 aggregates of 274 actors measured,
 // against 16000 statics), so they are walked fresh each call and nothing is kept.
-struct GunTouch {uint32_t proxy,body;Vec3 away;float depth;};
+struct GunTouch {uint32_t proxy,body;Vec3 away;float depth;Vec3 part;};
 // What the walk of moving actors met, summed until the next [gunshape] line: every actor, those of the right kind, those within 4 m, those whose bounds touch a box.
 uint64_t gunWalkActors=0,gunWalkDynamic=0,gunWalkNear=0,gunWalkBounds=0;
 constexpr int kGunMostTouches=4;
@@ -1024,7 +1057,9 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
                 // The player's own stands beside the chest, so "bounds hold the chest" misses it, and the gun stopped at it.
                 const float wide=got.bounds.hi.x-got.bounds.lo.x,deep=got.bounds.hi.y-got.bounds.lo.y,tall=got.bounds.hi.z-got.bounds.lo.z;
                 // By its filter words as well, at any height: crouched, the same capsule is 0.80 m tall and both hands were pushed off the body.
-                const bool characterWords=got.type==GeomCapsule && got.query[2]==0x00002000u && got.sim[0]==1u && got.sim[2]==0x000041ceu;
+                // And an NPC's: 0.80 x 0.80 x 2.00 m round them, too wide for the test below, with the words of the player's standing capsule (2026-11-08).
+                const bool standingWords=got.type==GeomCapsule && got.query[2]==0x48000002u && got.sim[0]==2u;
+                const bool characterWords=standingWords || (got.type==GeomCapsule && got.query[2]==0x00002000u && got.sim[0]==1u && got.sim[2]==0x000041ceu);
                 const bool character=characterWords || (got.type==GeomCapsule && tall>1.f && wide<.6f && deep<.6f);
                 if(!character && (got.query[0]|got.query[1]|got.query[2]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]))++gunMovingCount;
                 else ++gunMovingOwnSkipped;
@@ -1112,7 +1147,7 @@ int GunTouchInner(Mover& m,const Vec3& at,const Quat& turn) {
             Vec3 direction{};
             float depth=0;
             if(!gunPenetration(&direction,&depth,geometry.bytes,&pose,s.geometry,&s.pose) || !(depth>0.f) || !std::isfinite(depth))continue;
-            gunTouches[gunTouchCount++]=GunTouch{l.proxy,l.body,direction,depth};
+            gunTouches[gunTouchCount++]=GunTouch{l.proxy,l.body,direction,depth,middle};
             if(gunTouchCount>=kGunMostTouches)return gunTouchCount;
         }
     }
@@ -1838,6 +1873,22 @@ void VRGunAnchor(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, 
 }
 static double gunTouchTotal = 0;
 static uint32_t gunTouchCalls = 0;
+// VRMoverContact(0 left hand, 1 right hand, 2 gun; what) -> the last surface a sweep stopped it at, for the contact sounds. Copies, read once a frame.
+// what 0: the point, world, w 1 where PhysX said, 0 the middle of the part that stopped. what 1: the surface's normal, w how many moves ago (0 this one, -1 never). what 2: x how fast it came at it, m/s, y 1 if what stopped it moves (an NPC, a heavy or kinematic thing), z how fast it went along the surface, m/s.
+void VRMoverContact(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vector4* out, int64_t) {
+    int32_t id = 0, what = 0;
+    RED4ext::GetParameter(stack, &id);
+    RED4ext::GetParameter(stack, &what);
+    stack->code++;
+    if (!out) return;
+    *out = RED4ext::Vector4{0, 0, 0, what == 1 ? -1.f : 0.f};
+    if (id < 0 || id > 2) return;
+    const Mover& m = movers[id];
+    if (!m.contactEver) return;
+    if (what == 0) *out = RED4ext::Vector4{m.contactAt.x, m.contactAt.y, m.contactAt.z, m.contactExact ? 1.f : 0.f};
+    else if (what == 1) *out = RED4ext::Vector4{m.contactNormal.x, m.contactNormal.y, m.contactNormal.z, float(m.moves - m.contactMove)};
+    else if (what == 2) *out = RED4ext::Vector4{m.contactSpeed, m.contactMoving ? 1.f : 0.f, m.contactSlide, 0};
+}
 void VRGunPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vector4* out, int64_t) {
     RED4ext::Vector4 at{}, turn{};
     RED4ext::GetParameter(stack, &at);
@@ -2084,6 +2135,15 @@ void VRGunTouchOf(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::V
     if (!out) return;
     *out = RED4ext::Vector4{0, 0, 0, 0};
     if (i >= 0 && i < gunTouchCount) *out = RED4ext::Vector4{float(gunTouches[i].proxy), float(gunTouches[i].body), 0, 1};
+}
+// VRGunTouchAt(i): the middle of the part that is in it, world, for the contact sounds.
+void VRGunTouchAt(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vector4* out, int64_t) {
+    int32_t i = 0;
+    RED4ext::GetParameter(stack, &i);
+    stack->code++;
+    if (!out) return;
+    *out = RED4ext::Vector4{0, 0, 0, 0};
+    if (i >= 0 && i < gunTouchCount) *out = RED4ext::Vector4{gunTouches[i].part.x, gunTouches[i].part.y, gunTouches[i].part.z, 1};
 }
 void VRGunTouchWay(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vector4* out, int64_t) {
     int32_t i = 0;

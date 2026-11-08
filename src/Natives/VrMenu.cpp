@@ -22,6 +22,7 @@
 
 #include "Natives/NativeFunctions.hpp"
 #include "Audio/PortSound.hpp"
+#include "Audio/WwiseEmitter.hpp"
 #include "Natives/VrMenu.hpp"
 #include "Natives/MenuSwipe.hpp"
 #include "Camera/CameraState.hpp"   // InBraindance
@@ -402,6 +403,14 @@ void VRHandContactMargin(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, flo
     if (out) *out = g_liveControls.xrContactMargin;
 }
 
+// VRContactVolume(0 objects, 1 weapon) -> Float, 0..1: the two touch sound sliders.
+void VRContactVolume(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, float* out, int64_t) {
+    int32_t which = 0;
+    RED4ext::GetParameter(stack, &which);
+    stack->code++;
+    if (out) *out = which == 1 ? g_liveControls.xrTouchWeaponVolume : g_liveControls.xrTouchObjectVolume;
+}
+
 std::atomic<float> g_xrGripForce[2]{};
 // VRGripForce(side) -> Float: how hard a grip is squeezed past closed, 0..1, side 0 left. Only Index controllers report it.
 void VRGripForce(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, float* out, int64_t) {
@@ -463,6 +472,36 @@ void VRMenuPlayWav(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out
     stack->code++;
     const bool played = cvr::sound::PlayOnce(file.c_str(), volume);
     if (out) *out = played;
+}
+
+// VRWwisePlay(event, at, gain, group, state) -> Bool: Audio/WwiseEmitter.hpp. False when Wwise did not start it.
+void VRWwisePlay(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    RED4ext::CString event, group, state;
+    RED4ext::Vector4 at{};
+    float gain = 1.0f;
+    RED4ext::GetParameter(stack, &event);
+    RED4ext::GetParameter(stack, &at);
+    RED4ext::GetParameter(stack, &gain);
+    RED4ext::GetParameter(stack, &group);
+    RED4ext::GetParameter(stack, &state);
+    stack->code++;
+    const bool played = std::isfinite(gain) && cvr::wwise::Play(event.c_str(), at.X, at.Y, at.Z, std::clamp(gain, 0.0f, 4.0f), group.c_str(), state.c_str());
+    if (out) *out = played;
+}
+
+// VRWwiseScrape(body 0 left hand, 1 right, 2 gun; event, at, gain) -> Bool: Audio/WwiseEmitter.hpp, each frame of a scrape; event "" ends it.
+void VRWwiseScrape(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    int32_t body = 0;
+    RED4ext::CString event;
+    RED4ext::Vector4 at{};
+    float gain = 1.0f;
+    RED4ext::GetParameter(stack, &body);
+    RED4ext::GetParameter(stack, &event);
+    RED4ext::GetParameter(stack, &at);
+    RED4ext::GetParameter(stack, &gain);
+    stack->code++;
+    const bool ok = std::isfinite(gain) && cvr::wwise::Scrape(body, event.c_str(), at.X, at.Y, at.Z, std::clamp(gain, 0.0f, 4.0f));
+    if (out) *out = ok;
 }
 
 // VRSoundChannel(channel, file, volume, lowpass, loopFrom, loopTo, crossfade, fade) -> Bool: what the named channel plays

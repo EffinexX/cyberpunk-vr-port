@@ -808,6 +808,11 @@ local function gunAt(side, x, y, z, out)
     return out
 end
 
+-- The first touches of a person this frame, for the contact sounds (K.contactPeople): model space. People are no business of the sweeps.
+local PERSON_TOUCHED = { n = 0 }
+-- And what each hand's solve is pressing on a person with now, for the scrape: kept as long as the contact is.
+local PERSON_PRESSED = { [0] = {}, [1] = {} }
+
 -- Translate a RIGID SET of capsules until none of them overlaps any obstacle, and return the translation.
 local function resolveRig(side, movers, segs)
     if movers.n == 0 or segs.n == 0 then return 0.0, 0.0, 0.0 end
@@ -898,6 +903,19 @@ local function resolveRig(side, movers, segs)
                     end
                 else
                     mem[key] = { ux, uy, uz }
+                    if s.label == 'npc' and PERSON_TOUCHED.n < 8 then
+                        local i = PERSON_TOUCHED.n + 1
+                        PERSON_TOUCHED.n = i
+                        local t = PERSON_TOUCHED[i] or {}
+                        PERSON_TOUCHED[i] = t
+                        t.side, t.gun, t.who = side, m.id > GUN_ID and m.id < NPC_ID, math.floor((s.id - NPC_ID) / 16)
+                        t.x, t.y, t.z, t.ux, t.uy, t.uz = qx + ux * s.r, qy + uy * s.r, qz + uz * s.r, ux, uy, uz
+                    end
+                end
+                if s.label == 'npc' then
+                    local t = PERSON_PRESSED[side]
+                    t.on, t.gun = true, m.id > GUN_ID and m.id < NPC_ID
+                    t.x, t.y, t.z, t.ux, t.uy, t.uz = qx + ux * s.r, qy + uy * s.r, qz + uz * s.r, ux, uy, uz
                 end
                 local depth = need - dist
                 if depth > 0.0 then
@@ -1730,6 +1748,7 @@ K.gunLoose = function(side, gx, gy, gz, qi, qj, qk, qr, handId)
                     a.x, a.y, rec and string.format('kind %.0f, mass %s, kinematic %s, %s', rec.kind, rec.massless and 'none' or string.format('%.1f', rec.mass), kin,
                     (rec.massless or rec.mass > SHOVE_MAX_MASS) and 'NOT moved by the gun, not stopping it either' or 'shoved') or 'no game body: neither shoved nor stopping the gun', w.w)) end)
             end
+            K.contactLoose(side, handId, i, a, w, rec)
             if rec and not rec.massless then
                 if not K.OVER_SAID then
                     K.OVER_SAID = true
@@ -1803,6 +1822,7 @@ K.handWorldOne = function(side, bx, by, bz, ii, ij, ik, ir)
         PX[side], PY[side], PZ[side] = x + mx, y + my, z + mz
     end
     if pushOn then K.gunLoose(side, ax + p.x, ay + p.y, az + p.z, qi, qj, qk, qr, side) end
+    K.contactHand(side)
     return true
 end
 
@@ -2125,6 +2145,8 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
     local wasTouching = gunTouching
     gunTouching = tx ~= 0.0 or ty ~= 0.0 or tz ~= 0.0
     if gunTouching and not wasTouching then K.pulse(side) end
+    K.GUN_HAND, K.GUN_HAND_GEN = side, gen
+    K.contactGun()
     FIRM[side] = gunTouching
     GO[side] = GO[side] or {}
     local out = GO[side]
@@ -3590,6 +3612,158 @@ K.pulse = function(side)
     if type(VRHapticEvent) == 'function' then pcall(VRHapticEvent, 20, side == 0 and 1 or 2) end
 end
 
+-- WHAT A TOUCH SOUNDS LIKE: contact_sounds.lua. Everything of the game it needs is given to it here, and all of it behind pcall: a sound must never stop the collision.
+do
+    local okC, CS = pcall(function() return require('contact_sounds') end)
+    K.CS = okC and CS or nil
+    if not okC then sayOnce('contact sounds did not load: ' .. tostring(CS)) end
+    if K.CS then
+        K.CS.setup({
+            vec = function(x, y, z) return Vector4.new(x, y, z, 1.0) end,
+            staticRay = function(a, b)
+                local sys = worldSystem()
+                if not sys then return nil end
+                return staticCast(sys, a, b)
+            end,
+            -- every preset: a person answers some and not others
+            dynamicRay = function(a, b)
+                local sys = worldSystem()
+                if not sys then return nil end
+                for i = 1, #WORLD_PRESETS do
+                    local ok, hit, tr = pcall(castRay, sys, a, b, WORLD_PRESETS[i], false, true)
+                    if ok and hit and tr then return tr end
+                end
+                return nil
+            end,
+            nameOf = function(m)
+                local ok, name = pcall(NameToString, m)
+                return ok and name or nil
+            end,
+            contact = function(id, what)
+                local ok, v = pcall(VRMoverContact, id, what)
+                return ok and v or nil
+            end,
+            now = os.clock,
+            play = function(event, entity)
+                return (pcall(function() Game.GetAudioSystem():Play(CName.new(event), entity:GetEntityID(), CName.new('')) end))
+            end,
+            wwise = function(event, x, y, z, gain, group, state)
+                if type(VRWwisePlay) ~= 'function' then return false end
+                local ok, played = pcall(VRWwisePlay, event, Vector4.new(x, y, z, 1.0), gain, group, state)
+                return ok and played == true
+            end,
+            -- with neither filter of the others, as a kinematic thing may answer neither
+            anyRay = function(a, b)
+                local sys = worldSystem()
+                if not sys then return nil end
+                for i = 1, #WORLD_PRESETS do
+                    local ok, hit, tr = pcall(castRay, sys, a, b, WORLD_PRESETS[i], false, false)
+                    if ok and hit and tr then return tr end
+                end
+                return nil
+            end,
+            scrape = function(body, event, x, y, z, gain)
+                if type(VRWwiseScrape) ~= 'function' then return false end
+                local ok, done = pcall(VRWwiseScrape, body, event, Vector4.new(x, y, z, 1.0), gain)
+                return ok and done == true
+            end,
+            personNear = function(x, y, z)
+                for i = 1, #npcList do
+                    local ok, e = pcall(function() return npcList[i]:GetWorldPosition() end)
+                    if ok and e and (e.x - x) * (e.x - x) + (e.y - y) * (e.y - y) < 0.64 and z > e.z - 0.2 and z < e.z + 2.2 then return true end
+                end
+                return false
+            end,
+            slider = function(which)
+                local ok, v = pcall(VRContactVolume, which)
+                if ok and type(v) == 'number' then return v end
+                return which == 1 and 0.03 or 0.5
+            end,
+            say = function(text) pcall(function() spdlog.info(text) end) end,
+            knockOf = function(weapon)
+                local ok, name = pcall(function() return TweakDBInterface.GetItemRecord(ItemID.GetTDBID(weapon:GetItemID())):ItemType():Type().value end)
+                return ok and K.CS.WEAPON_KNOCK[name] or nil
+            end,
+        })
+    end
+end
+K.contactGun = function()
+    if not K.CS or type(VRMoverContact) ~= 'function' then return end
+    pcall(function()
+        local pl = Game.GetPlayer()
+        if not pl then return end
+        local w = activeWeapon(pl)
+        K.CS.tick(2, w or pl, w)
+    end)
+end
+-- A loose thing the gun or a hand is in. They shove it and do not stop at it, so this is where it is known.
+K.contactLoose = function(side, handId, i, a, w, rec)
+    if not K.CS or type(VRGunTouchAt) ~= 'function' or not rec then return end
+    if handId and ((K.GUN_HAND == handId and K.GUN_HAND_GEN and gen - K.GUN_HAND_GEN <= 1) or HOLD[handId]) then return end
+    local okL, errL = pcall(function()
+        local at = VRGunTouchAt(i)
+        if not at or at.w < 0.5 then return end
+        local h = HV[side]
+        local speed = -(h[1] * w.x + h[2] * w.y + h[3] * w.z)
+        local pl = Game.GetPlayer()
+        if not pl then return end
+        local weapon = not handId and activeWeapon(pl) or nil
+        local okP, middle = pcall(VRBodyGetPos, rec.body)
+        local about = string.format('kind %.0f, %s', rec.kind, rec.massless and 'no mass' or string.format('%.1f kg', rec.mass))
+        K.CS.touch(handId or 2, a.x * 4096.0 + a.y, at, w, speed, weapon or pl, weapon, okP and middle or nil, about)
+    end)
+    if not okL then sayOnce('the sound of a loose thing failed: ' .. tostring(errL)) end
+end
+-- A person first touched. Melee weapons are not among these: a blow is the game's own hit, with its own sound.
+K.contactPeople = function()
+    local n = PERSON_TOUCHED.n
+    PERSON_TOUCHED.n = 0
+    if not K.CS then return end
+    local pressed = PERSON_PRESSED[0].on or PERSON_PRESSED[1].on
+    if n == 0 and not pressed then return end
+    local bx, by, bz, ii, ij, ik, ir = worldFrame()
+    if not bx then return end
+    local pl = Game.GetPlayer()
+    if not pl then return end
+    for i = 1, n do
+        local t = PERSON_TOUCHED[i]
+        local h = HV[t.side]
+        local ux, uy, uz = qrot(-ii, -ij, -ik, ir, t.ux, t.uy, t.uz)
+        local x, y, z = qrot(-ii, -ij, -ik, ir, t.x, t.y, t.z)
+        local speed = -(h[1] * ux + h[2] * uy + h[3] * uz)
+        local weapon = t.gun and activeWeapon(pl) or nil
+        K.CS.person(t.gun and 2 or t.side, t.who, { x = x + bx, y = y + by, z = z + bz }, { x = ux, y = uy, z = uz }, speed, weapon or pl, weapon)
+    end
+    -- and along them
+    for side = 0, 1 do
+        local t = PERSON_PRESSED[side]
+        if t.on then
+            t.on = false
+            local h = HV[side]
+            local ux, uy, uz = qrot(-ii, -ij, -ik, ir, t.ux, t.uy, t.uz)
+            local x, y, z = qrot(-ii, -ij, -ik, ir, t.x, t.y, t.z)
+            local off = h[1] * ux + h[2] * uy + h[3] * uz
+            local ax, ay, az = h[1] - ux * off, h[2] - uy * off, h[3] - uz * off
+            local holding = K.GUN_HAND == side and K.GUN_HAND_GEN and gen - K.GUN_HAND_GEN <= 1
+            if t.gun or not (holding or HOLD[side]) then
+                K.CS.personSlide(t.gun and 2 or side, x + bx, y + by, z + bz, math.sqrt(ax * ax + ay * ay + az * az))
+            end
+        end
+    end
+end
+K.contactHand = function(side)
+    if not K.CS or type(VRMoverContact) ~= 'function' then return end
+    -- the hand on the gun sounds as the gun; a hand holding something is not touching the world with its palm
+    if (K.GUN_HAND == side and K.GUN_HAND_GEN and gen - K.GUN_HAND_GEN <= 1) or HOLD[side] then
+        pcall(K.CS.scrapeEnd, side)
+        return
+    end
+    pcall(function()
+        local pl = Game.GetPlayer()
+        if pl then K.CS.tick(side, pl, nil) end
+    end)
+end
+
 -- WEIGHT SLOWS THE PLAYER, from 3 kg on, to half at 30. A plain modifier: it is not saved, and it is taken off again with the last thing let go.
 K.weightTick = function()
     local mass = 0.0
@@ -4177,6 +4351,7 @@ registerForEvent('onUpdate', function(dt)
         elseif f then
             PX[free], PY[free], PZ[free] = f.x, f.y, f.z    -- the reload owns it: leave it exactly where tracking says
         end
+        pcall(HC.K.contactPeople)
         HC.pf('body solve')
         -- 2b. AND THE WORLD, for the gun in the holder's hand. The holder only: a support hand follows the gun.
         if WORLD_ON and not SKIP[holder] and lastW then
@@ -4219,6 +4394,7 @@ registerForEvent('onUpdate', function(dt)
         end
         -- 4. AND THE WORLD.
         FIRM[0], FIRM[1] = false, false
+        pcall(HC.K.contactPeople)
         HC.pf('body solve')
         if WORLD_ON then
             local wx, wy, wz, wi, wj, wk, wr = worldFrame()

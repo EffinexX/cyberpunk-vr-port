@@ -165,6 +165,8 @@ struct LiveControlsUiState {
     int xrCarryPicture = 1;
     float xrCarryLead = 0.03f;
     float xrContactMargin = 0.01f;
+    float xrTouchObjectVolume = 0.5f;
+    float xrTouchWeaponVolume = 0.03f;
     int xrWheelAnywhere = 1;
     // Controller tilt that means full lock, degrees. 90 (default) = hands vertical, the 1:1 reading of
     // a real wheel; lower = the same wrist movement steers more. The deadzone is the tilt around

@@ -680,6 +680,8 @@ void PollLiveControls() {
     int xrCarryPicture = g_liveControls.xrCarryPicture;
     float xrCarryLead = g_liveControls.xrCarryLead;
     float xrContactMargin = g_liveControls.xrContactMargin;
+    float xrTouchObjectVolume = g_liveControls.xrTouchObjectVolume;
+    float xrTouchWeaponVolume = g_liveControls.xrTouchWeaponVolume;
     int xrWheelAnywhere = g_liveControls.xrWheelAnywhere;
     float xrWheelRadius = g_liveControls.xrWheelRadius > 0.0f ? g_liveControls.xrWheelRadius : 0.28f;
     float xrWheelSteerMaxDeg = cvr::anim::WheelFullLockDegrees(g_liveControls.xrWheelSteerMaxDeg);
@@ -1683,6 +1685,16 @@ void PollLiveControls() {
             xrContactMargin = value;
             continue;
         }
+        if (sscanf_s(line, "xr_touch_object_volume=%f", &value) == 1 ||
+            sscanf_s(line, "xr_touch_object_volume = %f", &value) == 1) {
+            xrTouchObjectVolume = value;
+            continue;
+        }
+        if (sscanf_s(line, "xr_touch_weapon_volume=%f", &value) == 1 ||
+            sscanf_s(line, "xr_touch_weapon_volume = %f", &value) == 1) {
+            xrTouchWeaponVolume = value;
+            continue;
+        }
         if (sscanf_s(line, "xr_finger_contact=%d", &intValue) == 1 ||
             sscanf_s(line, "xr_finger_contact = %d", &intValue) == 1) {
             xrFingerContact = intValue;
@@ -1892,6 +1904,8 @@ void PollLiveControls() {
     g_liveControls.xrCarryPicture = xrCarryPicture != 0 ? 1 : 0;
     g_liveControls.xrCarryLead = xrCarryLead < 0.0f ? 0.0f : (xrCarryLead > 0.1f ? 0.1f : xrCarryLead);
     g_liveControls.xrContactMargin = xrContactMargin < 0.0f ? 0.0f : (xrContactMargin > 0.05f ? 0.05f : xrContactMargin);
+    g_liveControls.xrTouchObjectVolume = xrTouchObjectVolume < 0.0f ? 0.0f : (xrTouchObjectVolume > 1.0f ? 1.0f : xrTouchObjectVolume);
+    g_liveControls.xrTouchWeaponVolume = xrTouchWeaponVolume < 0.0f ? 0.0f : (xrTouchWeaponVolume > 1.0f ? 1.0f : xrTouchWeaponVolume);
     g_liveControls.xrWheelAnywhere = xrWheelAnywhere != 0 ? 1 : 0;
     // Clamped, not trusted: these come from a text file. Below ~8 cm the grab is unreachable for a
     // hand you cannot see; above 60 cm every grip in a car is a grab.
@@ -2257,6 +2271,8 @@ LiveControlsUiState MakeLiveControlsUiState() {
     state.xrCarryPicture = g_liveControls.xrCarryPicture;
     state.xrCarryLead = g_liveControls.xrCarryLead;
     state.xrContactMargin = g_liveControls.xrContactMargin;
+    state.xrTouchObjectVolume = g_liveControls.xrTouchObjectVolume;
+    state.xrTouchWeaponVolume = g_liveControls.xrTouchWeaponVolume;
     state.xrWheelAnywhere = g_liveControls.xrWheelAnywhere;
     state.xrWheelRadius = g_liveControls.xrWheelRadius;
     state.xrWheelSteerMaxDeg = g_liveControls.xrWheelSteerMaxDeg;
@@ -2637,6 +2653,8 @@ void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_carry_picture=%d\n", state.xrCarryPicture != 0 ? 1 : 0);
     fprintf(file, "xr_carry_lead=%.3f\n", state.xrCarryLead);
     fprintf(file, "xr_contact_margin=%.3f\n", state.xrContactMargin);
+    fprintf(file, "xr_touch_object_volume=%.3f\n", state.xrTouchObjectVolume);
+    fprintf(file, "xr_touch_weapon_volume=%.3f\n", state.xrTouchWeaponVolume);
     fprintf(file, "xr_wheel_anywhere=%d\n", state.xrWheelAnywhere != 0 ? 1 : 0);
     fprintf(file, "xr_wheel_radius=%.3f\n", state.xrWheelRadius > 0.0f ? state.xrWheelRadius : 0.28f);
     fprintf(file, "xr_wheel_steer_max_deg=%.1f\n", cvr::anim::WheelFullLockDegrees(state.xrWheelSteerMaxDeg));
@@ -2807,6 +2825,8 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
     g_liveControls.xrCarryPicture = state->xrCarryPicture != 0 ? 1 : 0;
     g_liveControls.xrCarryLead = state->xrCarryLead < 0.0f ? 0.0f : (state->xrCarryLead > 0.1f ? 0.1f : state->xrCarryLead);
     g_liveControls.xrContactMargin = state->xrContactMargin < 0.0f ? 0.0f : (state->xrContactMargin > 0.05f ? 0.05f : state->xrContactMargin);
+    g_liveControls.xrTouchObjectVolume = state->xrTouchObjectVolume < 0.0f ? 0.0f : (state->xrTouchObjectVolume > 1.0f ? 1.0f : state->xrTouchObjectVolume);
+    g_liveControls.xrTouchWeaponVolume = state->xrTouchWeaponVolume < 0.0f ? 0.0f : (state->xrTouchWeaponVolume > 1.0f ? 1.0f : state->xrTouchWeaponVolume);
     g_liveControls.xrWheelAnywhere = state->xrWheelAnywhere != 0 ? 1 : 0;
     g_liveControls.xrWheelHorn = state->xrWheelHorn != 0 ? 1 : 0;
     g_liveControls.xrVehicleGunTrigger = state->xrVehicleGunTrigger != 0 ? 1 : 0;

@@ -300,6 +300,22 @@ void DrawVRHandsControls() {
             UI::SetTooltip("The game's collision is simpler and often smaller than what is drawn. More distance keeps\n"
                               "hands and fingers out of the mesh, and makes them stop a little before they touch.");
         }
+        float touchObjectValue = st.xrTouchObjectVolume * 100.0f;
+        if (UI::SliderFloat("Touch sounds: objects (%)", &touchObjectValue, 0.0f, 100.0f, "%.0f")) {
+            st.xrTouchObjectVolume = touchObjectValue * 0.01f;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("How loud a surface is when the gun or a hand meets it. Louder with a faster touch; 0 is silent.");
+        }
+        float touchWeaponValue = st.xrTouchWeaponVolume * 100.0f;
+        if (UI::SliderFloat("Touch sounds: weapon (%)", &touchWeaponValue, 0.0f, 100.0f, "%.0f")) {
+            st.xrTouchWeaponVolume = touchWeaponValue * 0.01f;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("How loud the weapon's own knock is on top of the surface. 0 is silent.");
+        }
         bool handsOnly = st.xrBodyHandsOnly != 0;
         if (UI::Checkbox("Hands only (hide the body)", &handsOnly)) {
             st.xrBodyHandsOnly = handsOnly ? 1 : 0;

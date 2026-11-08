@@ -45,6 +45,7 @@ void VRHandPush(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,in
 void VRHandTouches(RED4ext::IScriptable*,RED4ext::CStackFrame*,int32_t*,int64_t);
 void VRHandRaysOn(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRGunPush(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,int64_t);
+void VRMoverContact(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,int64_t);
 void VRGunAnchor(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRNpcGrip(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
 void VRCorpseHold(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
@@ -76,6 +77,10 @@ void VRGunProbeAt(RED4ext::IScriptable*,RED4ext::CStackFrame*,int32_t*,int64_t);
 void VRDebugFlush(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRFingerWanted(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
 void VRHandContactMargin(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
+void VRContactVolume(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
+void VRWwisePlay(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
+void VRWwiseScrape(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
+void VRGunTouchAt(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,int64_t);
 void VRGripForce(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
 void VRTraceInfo(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,int64_t);
 void VRTraceBody(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Handle<RED4ext::IScriptable>*,int64_t);

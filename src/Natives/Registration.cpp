@@ -242,6 +242,8 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     gunAnchor->flags=flags;gunAnchor->AddParam("Vector4","at");gunAnchor->SetReturnType("Bool");rtti->RegisterFunction(gunAnchor);
     auto gunPush=RED4ext::CGlobalFunction::Create("VRGunPush","VRGunPush",&VRGunPush);
     gunPush->flags=flags;gunPush->AddParam("Vector4","at");gunPush->AddParam("Vector4","turn");gunPush->SetReturnType("Vector4");rtti->RegisterFunction(gunPush);
+    auto moverContact=RED4ext::CGlobalFunction::Create("VRMoverContact","VRMoverContact",&VRMoverContact);
+    moverContact->flags=flags;moverContact->AddParam("Int32","id");moverContact->AddParam("Int32","what");moverContact->SetReturnType("Vector4");rtti->RegisterFunction(moverContact);
     auto overlapProbe=RED4ext::CGlobalFunction::Create("VROverlapProbe","VROverlapProbe",&VROverlapProbe);
     overlapProbe->flags=flags;overlapProbe->AddParam("Vector4","center");overlapProbe->AddParam("Float","radius");overlapProbe->AddParam("Bool","walk");
     overlapProbe->SetReturnType("Int32");rtti->RegisterFunction(overlapProbe);
@@ -251,6 +253,8 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     gunTouches->flags=flags;gunTouches->AddParam("Vector4","at");gunTouches->AddParam("Vector4","turn");gunTouches->SetReturnType("Int32");rtti->RegisterFunction(gunTouches);
     auto gunTouchOf=RED4ext::CGlobalFunction::Create("VRGunTouchOf","VRGunTouchOf",&VRGunTouchOf);
     gunTouchOf->flags=flags;gunTouchOf->AddParam("Int32","i");gunTouchOf->SetReturnType("Vector4");rtti->RegisterFunction(gunTouchOf);
+    auto gunTouchAt=RED4ext::CGlobalFunction::Create("VRGunTouchAt","VRGunTouchAt",&VRGunTouchAt);
+    gunTouchAt->flags=flags;gunTouchAt->AddParam("Int32","i");gunTouchAt->SetReturnType("Vector4");rtti->RegisterFunction(gunTouchAt);
     auto gunTouchWay=RED4ext::CGlobalFunction::Create("VRGunTouchWay","VRGunTouchWay",&VRGunTouchWay);
     gunTouchWay->flags=flags;gunTouchWay->AddParam("Int32","i");gunTouchWay->SetReturnType("Vector4");rtti->RegisterFunction(gunTouchWay);
     auto thingOutline=RED4ext::CGlobalFunction::Create("VRThingOutline","VRThingOutline",&VRThingOutline);
@@ -296,6 +300,8 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     auto fingerWanted=RED4ext::CGlobalFunction::Create("VRFingerWanted","VRFingerWanted",&VRFingerWanted);
     fingerWanted->flags=flags;fingerWanted->AddParam("Int32","side");fingerWanted->AddParam("Int32","digit");
     fingerWanted->SetReturnType("Float");rtti->RegisterFunction(fingerWanted);
+    auto contactVolume=RED4ext::CGlobalFunction::Create("VRContactVolume","VRContactVolume",&VRContactVolume);
+    contactVolume->flags=flags;contactVolume->AddParam("Int32","which");contactVolume->SetReturnType("Float");rtti->RegisterFunction(contactVolume);
     auto contactMargin=RED4ext::CGlobalFunction::Create("VRHandContactMargin","VRHandContactMargin",&VRHandContactMargin);
     contactMargin->flags=flags;contactMargin->SetReturnType("Float");rtti->RegisterFunction(contactMargin);
     auto gripForce=RED4ext::CGlobalFunction::Create("VRGripForce","VRGripForce",&VRGripForce);
@@ -321,6 +327,12 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     auto menuWav=RED4ext::CGlobalFunction::Create("VRMenuPlayWav","VRMenuPlayWav",&VRMenuPlayWav);
     menuWav->flags=flags;menuWav->AddParam("String","file");menuWav->AddParam("Float","volume");
     menuWav->SetReturnType("Bool");rtti->RegisterFunction(menuWav);
+    auto wwiseScrape=RED4ext::CGlobalFunction::Create("VRWwiseScrape","VRWwiseScrape",&VRWwiseScrape);
+    wwiseScrape->flags=flags;wwiseScrape->AddParam("Int32","body");wwiseScrape->AddParam("String","event");wwiseScrape->AddParam("Vector4","at");wwiseScrape->AddParam("Float","gain");
+    wwiseScrape->SetReturnType("Bool");rtti->RegisterFunction(wwiseScrape);
+    auto wwisePlay=RED4ext::CGlobalFunction::Create("VRWwisePlay","VRWwisePlay",&VRWwisePlay);
+    wwisePlay->flags=flags;wwisePlay->AddParam("String","event");wwisePlay->AddParam("Vector4","at");wwisePlay->AddParam("Float","gain");wwisePlay->AddParam("String","group");wwisePlay->AddParam("String","state");
+    wwisePlay->SetReturnType("Bool");rtti->RegisterFunction(wwisePlay);
     auto soundChannel=RED4ext::CGlobalFunction::Create("VRSoundChannel","VRSoundChannel",&VRSoundChannel);
     soundChannel->flags=flags;soundChannel->AddParam("String","channel");soundChannel->AddParam("String","file");
     soundChannel->AddParam("Float","volume");soundChannel->AddParam("Float","lowpass");soundChannel->AddParam("Float","loopFrom");soundChannel->AddParam("Float","loopTo");
