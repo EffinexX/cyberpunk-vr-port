@@ -192,6 +192,8 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     fingerContact->AddParam("Float","limit");fingerContact->AddParam("Bool","hold");fingerContact->SetReturnType("Bool");rtti->RegisterFunction(fingerContact);
     auto debugOn=RED4ext::CGlobalFunction::Create("VRDebugOn","VRDebugOn",&VRDebugOn);
     debugOn->flags=flags;debugOn->SetReturnType("Bool");rtti->RegisterFunction(debugOn);
+    auto gunRaysOn=RED4ext::CGlobalFunction::Create("VRGunRaysOn","VRGunRaysOn",&VRGunRaysOn);
+    gunRaysOn->flags=flags;gunRaysOn->SetReturnType("Bool");rtti->RegisterFunction(gunRaysOn);
     auto debugLine=RED4ext::CGlobalFunction::Create("VRDebugLine","VRDebugLine",&VRDebugLine);
     debugLine->flags=flags;debugLine->AddParam("Vector4","a");debugLine->AddParam("Vector4","b");debugLine->AddParam("Int32","color");
     debugLine->SetReturnType("Bool");rtti->RegisterFunction(debugLine);
@@ -218,10 +220,18 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     gunClear->flags=flags;gunClear->SetReturnType("Bool");rtti->RegisterFunction(gunClear);
     auto gunAdd=RED4ext::CGlobalFunction::Create("VRGunBoxAdd","VRGunBoxAdd",&VRGunBoxAdd);
     gunAdd->flags=flags;gunAdd->AddParam("Vector4","lo");gunAdd->AddParam("Vector4","hi");gunAdd->SetReturnType("Bool");rtti->RegisterFunction(gunAdd);
+    auto gunAddTurned=RED4ext::CGlobalFunction::Create("VRGunBoxAddTurned","VRGunBoxAddTurned",&VRGunBoxAddTurned);
+    gunAddTurned->flags=flags;gunAddTurned->AddParam("Vector4","mid");gunAddTurned->AddParam("Vector4","half");gunAddTurned->AddParam("Vector4","turn");
+    gunAddTurned->SetReturnType("Bool");rtti->RegisterFunction(gunAddTurned);
     auto gunAnchor=RED4ext::CGlobalFunction::Create("VRGunAnchor","VRGunAnchor",&VRGunAnchor);
     gunAnchor->flags=flags;gunAnchor->AddParam("Vector4","at");gunAnchor->SetReturnType("Bool");rtti->RegisterFunction(gunAnchor);
     auto gunPush=RED4ext::CGlobalFunction::Create("VRGunPush","VRGunPush",&VRGunPush);
     gunPush->flags=flags;gunPush->AddParam("Vector4","at");gunPush->AddParam("Vector4","turn");gunPush->SetReturnType("Vector4");rtti->RegisterFunction(gunPush);
+    auto overlapProbe=RED4ext::CGlobalFunction::Create("VROverlapProbe","VROverlapProbe",&VROverlapProbe);
+    overlapProbe->flags=flags;overlapProbe->AddParam("Vector4","center");overlapProbe->AddParam("Float","radius");overlapProbe->AddParam("Bool","walk");
+    overlapProbe->SetReturnType("Int32");rtti->RegisterFunction(overlapProbe);
+    auto gunProbe=RED4ext::CGlobalFunction::Create("VRGunProbeAt","VRGunProbeAt",&VRGunProbeAt);
+    gunProbe->flags=flags;gunProbe->AddParam("Vector4","at");gunProbe->AddParam("Bool","walk");gunProbe->SetReturnType("Int32");rtti->RegisterFunction(gunProbe);
     auto gunTouches=RED4ext::CGlobalFunction::Create("VRGunTouches","VRGunTouches",&VRGunTouches);
     gunTouches->flags=flags;gunTouches->AddParam("Vector4","at");gunTouches->AddParam("Vector4","turn");gunTouches->SetReturnType("Int32");rtti->RegisterFunction(gunTouches);
     auto gunTouchOf=RED4ext::CGlobalFunction::Create("VRGunTouchOf","VRGunTouchOf",&VRGunTouchOf);

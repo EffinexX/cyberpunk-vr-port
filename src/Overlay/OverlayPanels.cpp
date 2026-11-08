@@ -255,6 +255,15 @@ void DrawVRHandsControls() {
                               "Blue the hands, cyan the fingers, magenta people. From PhysX within 2 m: grey the world, yellow what moves.\n"
                               "Rays: green free, red up to what they hit. In a carried thing: orange the place taken, white the palm.");
         }
+        bool gunRays = st.xrGunRays != 0;
+        if (UI::Checkbox("Gun: backup rays from the wrist", &gunRays)) {
+            st.xrGunRays = gunRays ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Rays from the wrist to the gun's boxes catch what the boxes alone miss: heavy or kinematic things,\n"
+                              "and walls the boxes slipped past. Off to compare. Back on after a restart.");
+        }
         bool carryPicture = st.xrCarryPicture != 0;
         if (UI::Checkbox("Carried objects stick to the hand", &carryPicture)) {
             st.xrCarryPicture = carryPicture ? 1 : 0;

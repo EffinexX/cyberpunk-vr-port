@@ -37,6 +37,7 @@ void VRCarryLead(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
 void VRHeldPicture(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRGunBoxClear(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRGunBoxAdd(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
+void VRGunBoxAddTurned(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRGunPush(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,int64_t);
 void VRGunAnchor(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRNpcGrip(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
@@ -54,6 +55,7 @@ void VRBodyInfo(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,in
 void VRHeldPictureLetGo(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRFingerClosed(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
 void VRDebugOn(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
+void VRGunRaysOn(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRDebugLine(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRDebugRay(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRBodyPhysXPos(RED4ext::IScriptable*,RED4ext::CStackFrame*,RED4ext::Vector4*,int64_t);
@@ -63,6 +65,8 @@ void VRDebugProbeBody(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t)
 void VRDebugCapsule(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRDebugPoint(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRDebugWorld(RED4ext::IScriptable*,RED4ext::CStackFrame*,int32_t*,int64_t);
+void VROverlapProbe(RED4ext::IScriptable*,RED4ext::CStackFrame*,int32_t*,int64_t);
+void VRGunProbeAt(RED4ext::IScriptable*,RED4ext::CStackFrame*,int32_t*,int64_t);
 void VRDebugFlush(RED4ext::IScriptable*,RED4ext::CStackFrame*,bool*,int64_t);
 void VRFingerWanted(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);
 void VRHandContactMargin(RED4ext::IScriptable*,RED4ext::CStackFrame*,float*,int64_t);

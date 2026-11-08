@@ -356,6 +356,40 @@ local function slotName(c)
     return n
 end
 
+-- WHEN THE WEAPON IS LOOKED AT AGAIN. What a gun is made of -- its slots, the Silverhand's capsules, its outline and what is
+-- mounted on it -- changes when the game says so: a weapon drawn, an item put in a slot, a part put on or taken off. Those count
+-- up `n`; each reader keeps the count it last saw and looks again only when it moved, at the late looks after a draw (parts can
+-- arrive a moment after the weapon), or after SAFETY seconds in case an event was missed. Before 2026-11-07 the slot search ran
+-- every frame for every gun but the Silverhand (0.5-1.2 ms a frame) and the outline every 90 frames. Reloads are only counted,
+-- for the log: the capsules stay as they were taken (the user's call: a slide in a reload is not worth following).
+local WE = { n = 0, reloads = 0, readies = 0, seen = {}, retryAt = {}, said = 0, SAFETY = 10.0, LATE = { 0.3, 0.7, 1.5 } }
+WE.mark = function(why) WE.n = WE.n + 1; WE.why = why end
+WE.drawn = function()
+    local now = os.clock()
+    WE.n = WE.n + 1; WE.why = 'a new weapon'
+    for i = 1, #WE.LATE do WE.retryAt[i] = now + WE.LATE[i] end
+end
+WE.due = function(reader)
+    local now = os.clock()
+    local s = WE.seen[reader]
+    if not s then s = { n = -1, at = now, late = 0 }; WE.seen[reader] = s end
+    local why = nil
+    if s.n ~= WE.n then
+        s.n, s.late, why = WE.n, 0, WE.why or 'event'
+    else
+        local late = WE.retryAt[s.late + 1]
+        while late and late <= s.at do s.late = s.late + 1; late = WE.retryAt[s.late + 1] end
+        if late and now >= late then s.late = s.late + 1; why = 'a late look'
+        elseif now - s.at >= WE.SAFETY then why = 'the safety interval' end
+    end
+    if not why then return false end
+    s.at = now
+    if WE.said < 40 and why ~= 'the safety interval' then
+        WE.said = WE.said + 1
+        pcall(spdlog.info, string.format('[HandColl] weapon read again (%s) for the %s; reloads %d, ready %d', why, reader, WE.reloads, WE.readies))
+    end
+    return true
+end
 -- Reads the live slots into the flat arrays above, in MODEL space. Returns the count, 0 if there is no weapon.
 -- `full` false stops at the first slot that answers: the caller only asks whether the weapon does, and the
 -- arrays are read by the collision solve alone.
@@ -370,7 +404,7 @@ local function readWeapon(full)
     if not bx then return 0 end
 
     local key = tostring(w:GetEntityID().hash)
-    if key ~= slotEnt then slotComp, slotEnt = nil, key end
+    if key ~= slotEnt then slotComp, slotEnt = nil, key; WE.drawn() end
     if key ~= rigEnt then
         rigEnt = key
         rigFound, rigVia, rigOff = -1, '-', -1
@@ -400,6 +434,8 @@ local function readWeapon(full)
     -- part failed to resolve, WGN came out 0, and the log printed gun=0 -- which reads as "no weapon in hand" and
     -- sent me looking at GetActiveWeapon, which was innocent. The log now separates the two.
     if not slotComp then
+        -- a weapon without these slots (every one but the Silverhand) is not searched again each frame
+        if WE.noSlots == key and not WE.due('slot search') then return 0 end
         local cs = Game.VREntityComponents(w)
         for i = 1, #cs do
             if string.find(tostring(cs[i]:GetClassName()), "SlotComponent") then
@@ -407,29 +443,46 @@ local function readWeapon(full)
                 if o and found then slotComp = cs[i] break end
             end
         end
-        if not slotComp then return 0 end
+        if not slotComp then WE.noSlots = key return 0 end
     end
 
-    local n = 0
-    for i = 1, #WCAPS do
-        local c = WCAPS[i]
-        local o, found, tr = pcall(slotTransform, slotComp, slotName(c))
-        if o and found and tr then
-            local okP, wp = pcall(slotPosition, tr)
-            if not okP then wp = nil end
-            local q = tr.Orientation
-            if wp and q and not full then n = 1 break end
-            if wp and q then
-                -- authored in the bone's frame: rotate into the world, then convert into model space
-                local ox, oy, oz = qrot(q.i, q.j, q.k, q.r, c.cx, c.cy, c.cz)
-                local axw, ayw, azw = qrot(q.i, q.j, q.k, q.r, c.ax, c.ay, c.az)
-                local mx, my, mz = qrot(ii, ij, ik, ir, wp.x + ox - bx, wp.y + oy - by, wp.z + oz - bz)
-                local dx, dy, dz = qrot(ii, ij, ik, ir, axw, ayw, azw)
-                n = n + 1
-                WGX[n], WGY[n], WGZ[n] = mx, my, mz
-                WGDX[n], WGDY[n], WGDZ[n] = dx * c.half, dy * c.half, dz * c.half
+    -- THE CAPSULES ARE TAKEN ONCE, in the weapon's own frame, and carried with it from then on: read from the slots again only at a
+    -- new weapon, an event, the late looks and the safety interval (WE). Before, every slot was asked every frame.
+    local okE, ep = pcall(worldPos, w)
+    local okR, eq = pcall(worldRot, w)
+    if not (okE and ep and okR and eq) then return 0 end
+    if WE.capsFor ~= key or WE.due('capsules') then
+        WE.capsFor, WE.capN, WE.cap = key, 0, WE.cap or {}
+        local ci, cj, ck, cr = -eq.i, -eq.j, -eq.k, eq.r
+        for i = 1, #WCAPS do
+            local c = WCAPS[i]
+            local o, found, tr = pcall(slotTransform, slotComp, slotName(c))
+            if o and found and tr then
+                local okP, wp = pcall(slotPosition, tr)
+                local q = tr.Orientation
+                if okP and wp and q then
+                    -- authored in the bone's frame: rotate into the world, then into the weapon's frame
+                    local ox, oy, oz = qrot(q.i, q.j, q.k, q.r, c.cx, c.cy, c.cz)
+                    local axw, ayw, azw = qrot(q.i, q.j, q.k, q.r, c.ax, c.ay, c.az)
+                    local lx, ly, lz = qrot(ci, cj, ck, cr, wp.x + ox - ep.x, wp.y + oy - ep.y, wp.z + oz - ep.z)
+                    local dx, dy, dz = qrot(ci, cj, ck, cr, axw, ayw, azw)
+                    local k = WE.capN + 1
+                    WE.capN = k
+                    local e = WE.cap[k] or {}
+                    WE.cap[k] = e
+                    e[1], e[2], e[3], e[4], e[5], e[6] = lx, ly, lz, dx * c.half, dy * c.half, dz * c.half
+                end
             end
         end
+    end
+    local n = WE.capN or 0
+    if not full then return n > 0 and 1 or 0 end
+    for k = 1, n do
+        local e = WE.cap[k]
+        local wx, wy, wz = qrot(eq.i, eq.j, eq.k, eq.r, e[1], e[2], e[3])
+        local ax, ay, az = qrot(eq.i, eq.j, eq.k, eq.r, e[4], e[5], e[6])
+        WGX[k], WGY[k], WGZ[k] = qrot(ii, ij, ik, ir, ep.x + wx - bx, ep.y + wy - by, ep.z + wz - bz)
+        WGDX[k], WGDY[k], WGDZ[k] = qrot(ii, ij, ik, ir, ax, ay, az)
     end
     WGN = n
     return n
@@ -1337,6 +1390,15 @@ local K = {}
 do
     local ok, t = pcall(function() return require('weapon_shapes') end)
     K.WEAPON_SHAPES = ok and t or {}
+    -- HAND-MADE BOXES, drawn in Blender (tools/weapon_blend), used before the generated ones; turned boxes allowed.
+    ok, t = pcall(function() return require('weapon_custom_boxes') end)
+    K.WEAPON_CUSTOM = ok and type(t) == 'table' and t or {}
+    K.WEAPON_CUSTOM.weapons = K.WEAPON_CUSTOM.weapons or {}
+    K.WEAPON_CUSTOM.attachments = K.WEAPON_CUSTOM.attachments or {}
+end
+-- Every part of the gun's shape is { cx, cy, cz, hx, hy, hz, qi, qj, qk, qr }; the generated ones are { minX, maxX, minY, maxY, minZ, maxZ }.
+K.turnedOf = function(s)
+    return { (s[1] + s[2]) * 0.5, (s[3] + s[4]) * 0.5, (s[5] + s[6]) * 0.5, (s[2] - s[1]) * 0.5, (s[4] - s[3]) * 0.5, (s[6] - s[5]) * 0.5, 0.0, 0.0, 0.0, 1.0 }
 end
 K.OPEN_SPEED, K.OPEN_RANGE, K.OPEN_LIMIT = 1.0, 0.14, 0.3     -- m/s, m, how far fingers close at what the palm sees
 K.DEAD_RANGE, K.DEAD_NEAR, K.DEAD_AGAIN, K.DEAD_WAIT, K.FORCED = 2.5, 1.2, 4.0, 0.8, {}   -- m, m round the hand, s before asked again, s the closed hand waits for it to appear
@@ -1444,7 +1506,7 @@ local function weaponBoxOf(w)
     local cs = Game.VREntityComponents(w)
     local base, family = nil, nil
     local reach, up, wide = 0.0, 0.0, 0.0
-    local mounted = ''
+    local mounted, muzzleKey, scopeKey = '', nil, nil
     for i = 1, #cs do
         local name = NameToString(cs[i]:GetName()):lower()
         local fam = name:match('^(w_[%w_]-__[%w_]-)__')
@@ -1456,8 +1518,10 @@ local function weaponBoxOf(w)
             if not okE or on then
                 mounted = mounted .. ' ' .. key
                 if key:find('power', 1, true) then
+                    if att[4] > reach then muzzleKey = key end
                     reach = math.max(reach, att[4])
                 else
+                    if att[6] > up then scopeKey = key end
                     up = math.max(up, att[6])
                     wide = math.max(wide, att[2], -att[1])
                 end
@@ -1465,24 +1529,69 @@ local function weaponBoxOf(w)
         end
     end
     if not base then return nil end
-    -- THE GUN'S SHAPE: its own boxes, and what is mounted on it as more of them. A muzzle goes on from the front of the foremost box, a scope stands on top of the middle.
+    -- THE GUN'S SHAPE: its own boxes, and what is mounted on it as more of them. Boxes drawn by hand (weapon_custom_boxes) come first,
+    -- the generated ones otherwise. A muzzle goes on at the drawn mount, or else from the front of the foremost box, at its middle; a
+    -- muzzle drawn by hand is its boxes there, any other a 5 cm square as far as it reaches. A scope goes on at the drawn scope mount the
+    -- same way (its drawn boxes, else its mesh's outline); with no drawn mount it stands on top of the middle as before.
+    local custom = K.WEAPON_CUSTOM.weapons[family]
+    local parts = {}
     do
         local shapes = K.WEAPON_SHAPES[family] or { base }
-        local parts = {}
         local front = shapes[1]
         for i = 1, #shapes do
-            parts[i] = shapes[i]
             if shapes[i][4] > front[4] then front = shapes[i] end
         end
-        if reach > 0.0 then
-            local cx, cz = (front[1] + front[2]) * 0.5, (front[5] + front[6]) * 0.5
-            parts[#parts + 1] = { cx - 0.025, cx + 0.025, front[4], front[4] + reach, cz - 0.025, cz + 0.025 }
+        if custom then
+            for i = 1, #custom.boxes do parts[i] = custom.boxes[i] end
+        else
+            for i = 1, #shapes do parts[i] = K.turnedOf(shapes[i]) end
         end
-        if up > 0.0 then
+        local mx, my, mz = (front[1] + front[2]) * 0.5, front[4], (front[5] + front[6]) * 0.5
+        if custom and custom.muzzle then mx, my, mz = custom.muzzle[1], custom.muzzle[2], custom.muzzle[3] end
+        if reach > 0.0 then
+            local drawn = muzzleKey and K.WEAPON_CUSTOM.attachments[muzzleKey]
+            if drawn then
+                for i = 1, #drawn.boxes do
+                    local d = drawn.boxes[i]
+                    parts[#parts + 1] = { d[1] + mx, d[2] + my, d[3] + mz, d[4], d[5], d[6], d[7], d[8], d[9], d[10] }
+                end
+            else
+                parts[#parts + 1] = { mx, my + reach * 0.5, mz, 0.025, reach * 0.5, 0.025, 0.0, 0.0, 0.0, 1.0 }
+            end
+        end
+        if up > 0.0 and custom and custom.scope then
+            -- at the drawn scope mount: the scope's drawn boxes, else its mesh's outline from the mount
+            local sx, sy, sz = custom.scope[1], custom.scope[2], custom.scope[3]
+            local drawn = scopeKey and K.WEAPON_CUSTOM.attachments[scopeKey]
+            local a = scopeKey and WEAPON_ATTACHMENTS[scopeKey]
+            if drawn then
+                for i = 1, #drawn.boxes do
+                    local d = drawn.boxes[i]
+                    parts[#parts + 1] = { d[1] + sx, d[2] + sy, d[3] + sz, d[4], d[5], d[6], d[7], d[8], d[9], d[10] }
+                end
+            elseif a then
+                parts[#parts + 1] = K.turnedOf({ a[1] + sx, a[2] + sx, a[3] + sy, a[4] + sy, a[5] + sz, a[6] + sz })
+            end
+        elseif up > 0.0 then
             local mid, half = (base[3] + base[4]) * 0.5, math.max(wide, 0.02)
-            parts[#parts + 1] = { -half, half, mid - 0.08, mid + 0.08, base[6], base[6] + up }
+            parts[#parts + 1] = K.turnedOf({ -half, half, mid - 0.08, mid + 0.08, base[6], base[6] + up })
         end
         K.GUN_PARTS, K.GUN_KEY = parts, family .. mounted
+    end
+    -- the outline round it all, for the rays: of the drawn boxes' corners when there are drawn ones
+    if custom then
+        local box = { 1e9, -1e9, 1e9, -1e9, 1e9, -1e9 }
+        for i = 1, #parts do
+            local s = parts[i]
+            for c = 0, 7 do
+                local x, y, z = qrot(s[7], s[8], s[9], s[10], (c % 2 == 0) and -s[4] or s[4], (c % 4 < 2) and -s[5] or s[5], (c < 4) and -s[6] or s[6])
+                x, y, z = x + s[1], y + s[2], z + s[3]
+                box[1], box[2] = math.min(box[1], x), math.max(box[2], x)
+                box[3], box[4] = math.min(box[3], y), math.max(box[4], y)
+                box[5], box[6] = math.min(box[5], z), math.max(box[6], z)
+            end
+        end
+        return box, family, mounted .. ' (drawn)'
     end
     local box = { base[1], base[2], base[3], base[4] + reach, base[5], base[6] + up }
     box[1], box[2] = math.min(box[1], -wide), math.max(box[2], wide)
@@ -1498,14 +1607,13 @@ local function weaponRanged(w)
         rangedKey, rangedAnswer, weaponBox = key, false, WEAPON_BOX_DEFAULT
         K.GUN_PARTS, K.GUN_KEY = nil, nil
         rangedWait, boxFound, boxTries = 0, false, 0
+        WE.drawn()
         for i = 1, GUN_SIDES do GDEPTH[i] = false end
         GO[0], GO[1] = nil, nil
     end
     if rangedAnswer and boxFound then
-        -- what is mounted can change while it is out
-        rangedWait = rangedWait - 1
-        if rangedWait <= 0 then
-            rangedWait = 90
+        -- what is mounted can change while it is out: looked at again when the game says a part went on or off (WE)
+        if WE.due('outline') then
             local ok, box = pcall(weaponBoxOf, w)
             if ok and box then weaponBox = box end
         end
@@ -1595,6 +1703,21 @@ K.gunLoose = function(side, gx, gy, gz, qi, qj, qk, qr)
         local okW, w = pcall(VRGunTouchWay, i)
         if okA and okW and a and w and a.w > 0.5 then
             local rec = K.recOf(a.x, a.y)
+            -- THE GUN PROBE (2026-11-08, logs only): each body the boxes are in, once -- its kind, mass, and whether it is kinematic
+            local P = K.PROBE
+            local pk = a.x * 4096.0 + a.y
+            if P and not P.touched[pk] and P.touchSaid < 40 then
+                P.touched[pk] = true
+                P.touchSaid = P.touchSaid + 1
+                local kin = '?'
+                if rec and type(VRBodyIsKinematic) == 'function' then
+                    local okK, k = pcall(VRBodyIsKinematic, rec.body)
+                    if okK then kin = tostring(k) end
+                end
+                pcall(function() spdlog.info(string.format('[HandColl] probe: the gun\'s boxes are in body %.0f/%.0f: %s, %.2f m deep',
+                    a.x, a.y, rec and string.format('kind %.0f, mass %s, kinematic %s, %s', rec.kind, rec.massless and 'none' or string.format('%.1f', rec.mass), kin,
+                    (rec.massless or rec.mass > SHOVE_MAX_MASS) and 'NOT moved by the gun, not stopping it either' or 'shoved') or 'no game body: neither shoved nor stopping the gun', w.w)) end)
+            end
             if rec and not rec.massless then
                 if not K.OVER_SAID then
                     K.OVER_SAID = true
@@ -1632,6 +1755,37 @@ K.gunPlane = function(side, tr, ax, ay, az, ex, ey, ez, how, now)
     if #list >= 4 then table.remove(list, 1) end
     list[#list + 1] = { x = px, y = py, z = pz, nx = nx, ny = ny, nz = nz, till = now + K.GUN_WALL_LIFE }
     worldNote(side, 'gun at ' .. how, tr.material)
+end
+-- THE GUN PROBE (2026-11-08, logs only). Where a static ray stopped the gun: inside one of its boxes as drawn now (so the boxes should
+-- have met it), or outside all of them (the ray crossed something the gun itself is not in: between the wrist and the gun, or beside
+-- it). How far: + outside, - inside, cm. And the plugin says whether the surface is in its near list, and every few seconds what is there.
+K.PROBE = { said = 0, walks = 0, walkAt = 0.0, touched = {}, touchSaid = 0 }
+K.probeStatic = function(trS, ei, ej, ek, er, ox, oy, oz, bx, by, bz, ii, ij, ik, ir, sx, sy, sz, ex, ey, ez, target)
+    local P = K.PROBE
+    if P.said >= 60 then return end
+    P.said = P.said + 1
+    local wx, wy, wz = trS.position.x, trS.position.y, trS.position.z
+    -- world -> model -> the gun's frame
+    local mx, my, mz = qrot(ii, ij, ik, ir, wx - bx, wy - by, wz - bz)
+    local gx, gy, gz = qrot(-ei, -ej, -ek, er, mx - ox, my - oy, mz - oz)
+    local best, which = 1e9, 0
+    local parts = K.GUN_PARTS or {}
+    for i = 1, #parts do
+        local s = parts[i]
+        local lx, ly, lz = qrot(-s[7], -s[8], -s[9], s[10], gx - s[1], gy - s[2], gz - s[3])
+        local over = math.max(math.abs(lx) - s[4], math.abs(ly) - s[5], math.abs(lz) - s[6])
+        if over < best then best, which = over, i end
+    end
+    local hx, hy, hz = wx - sx, wy - sy, wz - sz
+    local lx, ly, lz = ex - sx, ey - sy, ez - sz
+    local along = math.sqrt(hx * hx + hy * hy + hz * hz) / math.max(1e-6, math.sqrt(lx * lx + ly * ly + lz * lz))
+    local now = os.clock()
+    -- the walk of every scene cost 2.5 ms a time (2026-11-08): off once it had said why; the near list check stays
+    local walk = false and P.walks < 25 and now >= P.walkAt
+    if walk then P.walks, P.walkAt = P.walks + 1, now + 3.0 end
+    pcall(function() spdlog.info(string.format('[HandColl] probe: static ray %d to point %d stopped the gun %.0f%% of the way; nearest box %d, %+.1f cm %s it%s',
+        P.said, target, along * 100.0, which, best * 100.0, best > 0.0 and 'outside' or 'inside', walk and '; walking the scenes' or '')) end)
+    if type(VRGunProbeAt) == 'function' then pcall(VRGunProbeAt, Vector4.new(wx, wy, wz, 1.0), walk) end
 end
 K.gunWalls = function(side, sys, ei, ej, ek, er, ox, oy, oz, fromX, fromY, fromZ, bx, by, bz, ii, ij, ik, ir)
     local list = K.GUN_TARGETS
@@ -1677,15 +1831,23 @@ K.gunWalls = function(side, sys, ei, ej, ek, er, ox, oy, oz, fromX, fromY, fromZ
                 local own = rec and rec.massless and hx * hx + hy * hy < 0.2025
                 if not loose and not own then
                     K.gunPlane(side, tr, sx, sy, sz, ex, ey, ez, 'dynamic', now)
-                    if K.GUN_WALL_SAID < 12 then
+                    if K.GUN_WALL_SAID < 40 then
                         K.GUN_WALL_SAID = K.GUN_WALL_SAID + 1
-                        local said = string.format('[HandColl] a ray stopped the gun at something moving: kind %s, mass %s', rec and tostring(rec.kind) or 'none', rec and (rec.massless and 'none' or tostring(rec.mass)) or 'none')
+                        local kin = '?'
+                        if rec and type(VRBodyIsKinematic) == 'function' then
+                            local okK, k = pcall(VRBodyIsKinematic, rec.body)
+                            if okK then kin = tostring(k) end
+                        end
+                        local said = string.format('[HandColl] a ray stopped the gun at something moving: kind %s, mass %s, kinematic %s, proxy %s; the hit %.2f m from the player\'s axis, %.2f m up',
+                            rec and tostring(rec.kind) or 'none', rec and (rec.massless and 'none' or tostring(rec.mass)) or 'none', kin, rec and string.format('%.0f/%.0f', rec.proxy, rec.index) or '-',
+                            math.sqrt(hx * hx + hy * hy), select(3, qrot(ii, ij, ik, ir, tr.position.x - bx, tr.position.y - by, tr.position.z - bz)))
                         pcall(function() spdlog.info(said) end)
                     end
                 end
             end
             local okS, hitS, trS = pcall(castRay, sys, a, e, WORLD_PRESETS[worldPreset], true, false)
             if okS and hitS and trS then
+                pcall(K.probeStatic, trS, ei, ej, ek, er, ox, oy, oz, bx, by, bz, ii, ij, ik, ir, sx, sy, sz, ex, ey, ez, K.GUN_WALL_TURN)
                 K.gunPlane(side, trS, sx, sy, sz, ex, ey, ez, 'static', now)
                 K.GUN_STATIC_RAYS = (K.GUN_STATIC_RAYS or 0) + 1
                 if K.GUN_STATIC_RAYS == 1 or K.GUN_STATIC_RAYS % 200 == 0 then
@@ -1770,18 +1932,23 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
     local pushX, pushY, pushZ = 0.0, 0.0, 0.0
     local targets = nil
     if type(VRGunPush) == 'function' then
-        local parts, key = K.GUN_PARTS or { b }, K.GUN_KEY or 'default'
+        local parts, key = K.GUN_PARTS or { K.turnedOf(b) }, K.GUN_KEY or 'default'
         if K.GUN_SENT ~= key then
             K.GUN_SENT = key
             pcall(VRGunBoxClear)
             K.GUN_TARGETS = {}
             for i = 1, #parts do
                 local s = parts[i]
-                pcall(VRGunBoxAdd, Vector4.new(s[1], s[3], s[5], 1.0), Vector4.new(s[2], s[4], s[6], 1.0))
-                local cx, cy, cz = (s[1] + s[2]) * 0.5, (s[3] + s[4]) * 0.5, (s[5] + s[6]) * 0.5
+                if type(VRGunBoxAddTurned) == 'function' then
+                    pcall(VRGunBoxAddTurned, Vector4.new(s[1], s[2], s[3], 1.0), Vector4.new(s[4], s[5], s[6], 0.0), Vector4.new(s[7], s[8], s[9], s[10]))
+                else
+                    pcall(VRGunBoxAdd, Vector4.new(s[1] - s[4], s[2] - s[5], s[3] - s[6], 1.0), Vector4.new(s[1] + s[4], s[2] + s[5], s[3] + s[6], 1.0))
+                end
+                -- the rays aim at each box's middle and the middle of its front face
+                local fx, fy, fz = qrot(s[7], s[8], s[9], s[10], 0.0, s[5], 0.0)
                 local list = K.GUN_TARGETS
-                if #list < GUN_SIDES then list[#list + 1] = { cx, cy, cz } end
-                if #list < GUN_SIDES then list[#list + 1] = { cx, s[4], cz } end
+                if #list < GUN_SIDES then list[#list + 1] = { s[1], s[2], s[3] } end
+                if #list < GUN_SIDES then list[#list + 1] = { s[1] + fx, s[2] + fy, s[3] + fz } end
             end
             for i = 1, GUN_SIDES do GDEPTH[i] = false end
         end
@@ -1813,7 +1980,18 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
         end
     end
     local sides = targets and #targets or GUN_SIDES
-    for _ = 1, (targets and K.GUN_SWEPT) and 0 or ((targets or not gunTouching) and WEAPON_RAYS or GUN_SIDES) do
+    -- THE BACKUP RAYS CAN BE SWITCHED OFF in the overlay (VRGunRaysOn), to feel what they do: the boxes alone then.
+    local raysOn = true
+    if type(VRGunRaysOn) == 'function' then
+        local okR, on = pcall(VRGunRaysOn)
+        raysOn = not okR or on ~= false
+    end
+    if not raysOn and K.GUN_RAYS_WERE ~= false then
+        for i = 1, GUN_SIDES do GDEPTH[i] = false end
+        K.GUN_PLANES = {}
+    end
+    K.GUN_RAYS_WERE = raysOn
+    for _ = 1, not raysOn and 0 or (targets and K.GUN_SWEPT) and 0 or ((targets or not gunTouching) and WEAPON_RAYS or GUN_SIDES) do
         gunTurn = gunTurn % sides + 1
         local vx, vy, vz
         if targets then
@@ -1863,7 +2041,7 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
             if need > 0.0 then tx, ty, tz = tx + gx * need, ty + gy * need, tz + gz * need end
         end
     end
-    if targets then
+    if targets and raysOn then
         local okW, wx, wy, wz = pcall(K.gunWalls, side, sys, ei, ej, ek, er, rx + x + tx, ry + y + ty, rz + z + tz, fromX, fromY, fromZ, bx, by, bz, ii, ij, ik, ir)
         if okW then tx, ty, tz = tx + wx, ty + wy, tz + wz
         else sayOnce('the gun\'s rays failed: ' .. tostring(wx)) end
@@ -3748,6 +3926,15 @@ end
 return { worldStop = worldStop, pf = K.pf, pfBegin = K.pfBegin, weaponStop = weaponStop, handsPush = handsPush, weaponRanged = weaponRanged,
     freeStop = freeStop, fingerContact = fingerContact, friction = friction, trackHands = trackHands, carry = carry, carryHand = carryHand, debugDraw = debugDraw, stateKey = nil }
 end)()
+
+-- WHAT MAKES THE WEAPON WORTH LOOKING AT AGAIN (WE above). Reloads and ready states are only counted.
+registerForEvent('onInit', function()
+    pcall(ObserveAfter, 'PlayerPuppet', 'OnItemAddedToSlot', function() WE.mark('an item put in a slot') end)
+    pcall(ObserveAfter, 'PlayerPuppet', 'OnPartAddedToSlotEvent', function() WE.mark('a part put on') end)
+    pcall(ObserveAfter, 'PlayerPuppet', 'OnPartRemovedFromSlotEvent', function() WE.mark('a part taken off') end)
+    pcall(ObserveAfter, 'ReloadEvents', 'OnEnter', function() WE.reloads = WE.reloads + 1 end)
+    pcall(ObserveAfter, 'ReadyEvents', 'OnEnter', function() WE.readies = WE.readies + 1 end)
+end)
 
 registerForEvent('onUpdate', function(dt)
     dbgAcc = dbgAcc + (dt or 0.016)
