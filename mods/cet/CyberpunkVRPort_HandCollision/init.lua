@@ -1414,6 +1414,15 @@ do
     K.WEAPON_CUSTOM.weapons = K.WEAPON_CUSTOM.weapons or {}
     K.WEAPON_CUSTOM.attachments = K.WEAPON_CUSTOM.attachments or {}
 end
+-- MELEE (2026-11-08): only the boxes drawn by hand, as there are no generated ones; the blade runs along +Z, not +Y. The world stops it, in a stroke too (the user's
+-- decision: it does not go through a wall). A person does not, their capsules being left out of what stops a weapon, and a person at a wall is met before the wall is. K.MELEE_ON is apart from weaponRanged, which also says whether people are solved against.
+K.MELEE_KINDS = { w_baton = true, w_blade_long = true, w_blade_short = true, w_club_1h = true, w_club_2h = true, w_fists = true, w_katana = true, w_knife = true, w_shovel = true, w_sledge_hammer = true }
+K.MELEE_ALIAS = { w_blade_long__crowbar = 'w_club_1h__crowbar', sextoy_a_dildo_c = 'w_club_1h__dildo' }    -- the crowbar's components are named so; its meshes are not
+K.NO_OUTLINE = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+K.meleeFamily = function(family)
+    local kind = (family .. '__'):match('^(w_[%w_]-)__')
+    return kind ~= nil and K.MELEE_KINDS[kind] == true
+end
 -- Every part of the gun's shape is { cx, cy, cz, hx, hy, hz, qi, qj, qk, qr }; the generated ones are { minX, maxX, minY, maxY, minZ, maxZ }.
 K.turnedOf = function(s)
     return { (s[1] + s[2]) * 0.5, (s[3] + s[4]) * 0.5, (s[5] + s[6]) * 0.5, (s[2] - s[1]) * 0.5, (s[4] - s[3]) * 0.5, (s[6] - s[5]) * 0.5, 0.0, 0.0, 0.0, 1.0 }
@@ -1530,10 +1539,11 @@ local function weaponBoxOf(w)
     local score, best = {}, 0
     for i = 1, #cs do
         local name = NameToString(cs[i]:GetName()):lower()
-        local fam = name:match('^(w_[%w_]-__[%w_]-)__')
-        if fam and WEAPON_BOXES[fam] then
+        local fam = name:match('^(w_[%w_]-__[%w_]-)__') or name:match('^(w_shovel)__')
+        fam = K.MELEE_ALIAS[fam or name] or fam
+        if fam and (WEAPON_BOXES[fam] or K.WEAPON_CUSTOM.weapons[fam]) then
             score[fam] = (score[fam] or 0) + ((name:find('__base', 1, true) and not name:find('_rail', 1, true)) and 100 or 1)
-            if score[fam] > best then best, base, family = score[fam], WEAPON_BOXES[fam], fam end
+            if score[fam] > best then best, base, family = score[fam], WEAPON_BOXES[fam] or K.NO_OUTLINE, fam end
         end
         local key = name:match('^(w_att_+%a+_%a+_%d+)') or name:match('^(w_att_+%a+_%d+)')
         local att = key and WEAPON_ATTACHMENTS[key]
@@ -1630,18 +1640,19 @@ local function weaponRanged(w)
     if key ~= rangedKey then
         rangedKey, rangedAnswer, weaponBox = key, false, WEAPON_BOX_DEFAULT
         K.GUN_PARTS, K.GUN_KEY = nil, nil
+        K.MELEE_ON, K.MELEE_TRIES = false, 0
         rangedWait, boxFound, boxTries = 0, false, 0
         WE.drawn()
         for i = 1, GUN_SIDES do GDEPTH[i] = false end
         GO[0], GO[1] = nil, nil
     end
-    if rangedAnswer and boxFound then
+    if (rangedAnswer or K.MELEE_ON) and boxFound then
         -- what is mounted can change while it is out: looked at again when the game says a part went on or off (WE)
         if WE.due('outline') then
             local ok, box = pcall(weaponBoxOf, w)
             if ok and box then weaponBox = box end
         end
-        return true
+        return rangedAnswer
     end
     if rangedWait > 0 then
         rangedWait = rangedWait - 1
@@ -1656,6 +1667,14 @@ local function weaponRanged(w)
         if boxFound or boxTries >= 10 then
             boxFound = true
             pcall(function() spdlog.info('[HandColl] gun outline: ' .. tostring(ok and family or 'default') .. tostring(ok and mounted or '')) end)
+        end
+    elseif (K.MELEE_TRIES or 0) < 10 then
+        -- a weapon just drawn says no to IsRanged whatever it is, so only a melee family counts here; ten tries, as for a gun's parts
+        K.MELEE_TRIES = (K.MELEE_TRIES or 0) + 1
+        local ok, box, family = pcall(weaponBoxOf, w)
+        if ok and box and family and K.meleeFamily(family) then
+            weaponBox, boxFound, K.MELEE_ON = box, true, true
+            pcall(function() spdlog.info('[HandColl] melee outline: ' .. tostring(family)) end)
         end
     end
     return rangedAnswer
@@ -1978,7 +1997,7 @@ end
 
 local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
     local okR, ranged = pcall(weaponRanged, w)
-    if not okR or not ranged then return end
+    if not okR or not (ranged or K.MELEE_ON) then return end
     local ox, oy, oz = bone(WORLD_ORIGIN)
     if not ox then return end
 
@@ -2039,8 +2058,9 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
                 else
                     pcall(VRGunBoxAdd, Vector4.new(s[1] - s[4], s[2] - s[5], s[3] - s[6], 1.0), Vector4.new(s[1] + s[4], s[2] + s[5], s[3] + s[6], 1.0))
                 end
-                -- the rays aim at each box's middle and the middle of its front face
-                local fx, fy, fz = qrot(s[7], s[8], s[9], s[10], 0.0, s[5], 0.0)
+                -- the rays aim at each box's middle and the middle of its front face (a blade's front is along +Z)
+                local melee = K.MELEE_ON and not ranged
+                local fx, fy, fz = qrot(s[7], s[8], s[9], s[10], 0.0, melee and 0.0 or s[5], melee and s[6] or 0.0)
                 local list = K.GUN_TARGETS
                 if #list < GUN_SIDES then list[#list + 1] = { s[1], s[2], s[3] } end
                 if #list < GUN_SIDES then list[#list + 1] = { s[1] + fx, s[2] + fy, s[3] + fz } end
@@ -4109,6 +4129,80 @@ K.npcTick = function(side, edge, bx, by, bz, ii, ij, ik, ir)
     K.pulse(side)
 end
 
+-- A BLOW MOVES WHAT IT STRUCK (2026-11-08). On top of the game's own hit and damage (the script notes each landed one: VRMeleeLastHit*): the part nearest the blow goes the way the blade went and comes back, by the grip of
+-- src/Anim/NpcArmGrip.cpp, in the slot of the hand that holds the weapon, which cannot be holding anybody. From where the part stood when struck: its slot read later already has this in it. One at a time. What has no such rig (a mech) is only hit.
+K.HIT_RISE, K.HIT_FALL, K.HIT_LEAST, K.HIT_MOST, K.HIT_PER = 0.07, 0.28, 0.06, 0.20, 0.03   -- s out, s back, m, m, m for each m/s of the stroke
+K.HIT_GIVE = { [0] = 1.0, [1] = 1.0, [2] = 0.6, [3] = 0.6, [4] = 0.6, [5] = 0.7 }   -- by part: a head or a trunk does not go as far as a hand
+K.meleeHitBegin = function(pl, side)
+    if type(VRNpcGrip) ~= 'function' or K.NPC_GRIP[side] or K.HIT then return end
+    local npc = pl:VRMeleeLastHitTarget()
+    if not npc or npc:IsDead() then return end
+    local at, way = pl:VRMeleeLastHitPoint(), pl:VRMeleeLastHitWay()
+    local comp
+    local cs = Game.VREntityComponents(npc)
+    for i = 1, #cs do
+        if NameToString(cs[i]:GetName()) == 'Item_Attachment_Slot' then comp = cs[i] break end
+    end
+    if not comp then sayOnce('a blow: this one has no slots to move') return end
+    local best, bestD, bestWp = nil, 1e9, nil
+    for _, P in ipairs(K.NPC_PARTS) do
+        for _, slot in ipairs(P.slots) do
+            local o, found, tr = pcall(slotTransform, comp, CName.new(slot))
+            if o and found and tr then
+                local okP, wp = pcall(slotPosition, tr)
+                if okP and wp then
+                    local d = math.sqrt((wp.x - at.x) ^ 2 + (wp.y - at.y) ^ 2 + (wp.z - at.z) ^ 2) / P.reach
+                    if d < bestD then best, bestD = P, d end
+                end
+            end
+        end
+    end
+    if not best then return end
+    local o, found, tr = pcall(slotTransform, comp, CName.new(best.ref))
+    if not (o and found and tr) then return end
+    bestWp = slotPosition(tr)
+    local e, q = worldPos(npc), worldRot(npc)
+    local mx, my, mz = qrot(-q.i, -q.j, -q.k, q.r, bestWp.x - e.x, bestWp.y - e.y, bestWp.z - e.z)
+    local wx, wy, wz = qrot(-q.i, -q.j, -q.k, q.r, way.x, way.y, way.z)
+    local far = math.max(K.HIT_LEAST, math.min(K.HIT_MOST, way.w * K.HIT_PER)) * K.HIT_GIVE[best.part]
+    local answer = VRNpcGrip(npc, side, best.part, Vector4.new(mx, my, mz, 1.0), Vector4.new(0.0, 0.0, 0.0, 1.0))
+    K.HIT_SAID = (K.HIT_SAID or 0) + 1
+    if K.HIT_SAID <= 12 then
+        local said = string.format('[HandColl] a blow on the %s, %.2f m/s, moved %.2f m: %s', best.name, way.w, far, tostring(answer))
+        pcall(function() spdlog.info(said) end)
+    end
+    if answer and answer >= 0.0 then
+        K.HIT = { npc = npc, side = side, part = best.part, x = mx, y = my, z = mz, wx = wx * far, wy = wy * far, wz = wz * far, age = 0.0 }
+    end
+end
+K.meleeHitEnd = function()
+    local H = K.HIT
+    K.HIT = nil
+    if H then pcall(VRNpcGrip, H.npc, H.side, H.part, Vector4.new(0.0, 0.0, 0.0, 0.0), Vector4.new(0.0, 0.0, 0.0, 1.0)) end
+end
+K.meleeHitTick = function(dt, holder)
+    if K.MELEE_ON and holder ~= nil then
+        local pl = Game.GetPlayer()
+        local serial = pl and pl:VRMeleeLastHitSerial()
+        if serial and serial ~= K.HIT_SERIAL then
+            local seen = K.HIT_SERIAL ~= nil
+            K.HIT_SERIAL = serial
+            if seen then
+                local ok, err = pcall(K.meleeHitBegin, pl, holder)
+                if not ok then sayOnce('a blow failed: ' .. tostring(err)) end
+            end
+        end
+    end
+    local H = K.HIT
+    if not H then return end
+    H.age = H.age + dt
+    local okD, dead = pcall(function() return H.npc:IsDead() end)
+    if H.age >= K.HIT_RISE + K.HIT_FALL or not okD or dead then K.meleeHitEnd() return end
+    local k = H.age < K.HIT_RISE and H.age / K.HIT_RISE or 1.0 - (H.age - K.HIT_RISE) / K.HIT_FALL
+    local ok, answer = pcall(VRNpcGrip, H.npc, H.side, H.part, Vector4.new(H.x + H.wx * k, H.y + H.wy * k, H.z + H.wz * k, 1.0), Vector4.new(0.0, 0.0, 0.0, 1.0))
+    if not ok or not answer or answer < 0.0 then K.HIT = nil end
+end
+
 local function carry(allowed, holder, dt, bx, by, bz, ii, ij, ik, ir)
     K.pf('before carrying')
     settleTick(dt)
@@ -4313,6 +4407,10 @@ registerForEvent('onUpdate', function(dt)
     HC.pf('reading')
     if npcOn then npcPlace(dt or 0.016) end
     HC.pf('people list')
+    do
+        local okH, errH = pcall(HC.K.meleeHitTick, dt or 0.016, holder)
+        if not okH and not HC.K.HIT_ERR then HC.K.HIT_ERR = true; pcall(function() spdlog.info('[HandColl] a blow, each frame, failed: ' .. tostring(errH)) end) end
+    end
 
     do
         local wx, wy, wz, wi, wj, wk, wr = worldFrame()

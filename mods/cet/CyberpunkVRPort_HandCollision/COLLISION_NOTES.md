@@ -115,6 +115,17 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 7. Mesh JSONs: `E:\cyberpunk_vr_port\tools\extract\_meshj`, appearances `_appj`. Vertices are `PT_Short4N` positions in
    stream 0, quantized by the header's scale/offset; indices are `IBCT_IndexUShort` at `indexBufferOffset + teOffset`.
    Skinned weapon meshes are in bind pose in the weapon frame. A magazine mesh is **not** in the weapon frame.
+8. **Melee, 29 families** (2026-11-08): `E:\cyberpunk_vr_port\blender\melee_boxes.blend`, read back into the same `weapon_custom_boxes.lua`
+   (86 weapons then). Meshes and apps in `tools\extract\_melee_flat` (`mesh`, `app`). In that frame **the blade runs along +Z**, the origin at
+   the grip. No mounts. Variants share a family, so one set of boxes covers them (6 katanas, machete/borg/axe). The crowbar's components are
+   `w_blade_long__crowbar__...` though its meshes are `w_club_1h__crowbar` (`K.MELEE_ALIAS`); the shovel's are `w_shovel__grip...`, with one
+   `__` only. Cane (`i1_001_ma_slot__fingers_cane`, placed by its `.app`: quarter turn, +0.055 Y, +0.6 Z) and dildo (`sextoy_a_dildo_c`; family named `w_club_1h__dildo` in the `.blend`, its component has no `w_` name: `K.MELEE_ALIAS`) were added afterwards. **Open:** parts of a mech and shields stop the blade (moving shapes in the native list, not the character capsules), so it hardly reaches the body. `w_knife__tw3` is named in an appearance, but its mesh is in no archive. Shovel's mesh starts at +0.18 m on Z: check in game.
+   **Behaviour (user's decision, 2026-11-08):** the boxes appear and work in game. Freeing the blade by its tip's speed (2 m/s, 0.35 s) was tried and
+   switched off far too often (a turn of the wrist is enough), so it is gone: the world always stops a melee weapon, in a stroke too. People do not
+   (their capsules and query-only shapes are left out natively); whether a mech does is not known.
+   **A blow moves what it struck:** `VRMeleeSweepHit` notes each landed hit (`VRMeleeLastHit*`), `K.meleeHitTick` moves the part nearest it along the
+   blade's way and back (0.07 s out, 0.28 s back, 6-20 cm by speed) through `VRNpcGrip`, in the holding hand's slot, from where the part stood when
+   struck: a slot read later already has the offset in it. On top of the game's damage. Humans' rig only. **Not yet tested in game.**
 
 ## Testing without the game
 
@@ -123,6 +134,21 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 - For logic, run the functions in Python with `lupa` (`pip install --user lupa`): cut the function out of `init.lua`,
   mock `Game`, `Vector4`, `spdlog` and the natives, and call it.
 - Disassembly: `pefile` + `capstone` on the game's DLLs (no `-I` flag for Python, the packages are in user site).
+
+## Finding a regression: reading the logs
+
+Learned from the "small things no longer move" fault (2026-11-08, fixed in `c5bd5b04`).
+
+- **Logs of the last session**, under `<game>\red4ext\plugins\cyberpunkvrport\` (game: `E:\SteamLibrary\steamapps\common\Cyberpunk 2077`):
+  `log\cyberpunkvrport.log` holds the native `[gunshape]` / `[world]` lines and covers one session. `lua\CyberpunkVRPort_HandCollision\CyberpunkVRPort_HandCollision.log`
+  holds the `[HandColl]` lines and spans several sessions, so filter by time.
+- **Count over the whole log before stating a pattern.** A first look at a few lines suggested "nothing is ever shoved"; over the whole log 25 of 36 lines had shoved > 0.
+- **`bounds` in "stopped a hand or the gun" are one shape's**, not the actor's: a 18 cm shape can belong to something large.
+- **`[HandColl] probe: the gun's boxes are in body ...` only names what is already shoved.** What stops the gun never gets that far, so a probe full of `kinematic 0` says nothing about the bodies that stop it.
+- **Two views of "kinematic":** the PhysX flag (`GunStopsAt`) and the game's `VRBodyIsKinematic`. PhysX `getMass` is 0 for kinematic; the game's `GetMass` is not (`BodyGameMass`).
+- **Proxy kinds** (`ProxyKind`, `TraceMoves` in `HandBody.cpp`): 1 physical system, 3 destruction, 10 aggregate (loose props, also the 127 kg counter), 12 ragdoll. `bodyWake` never wakes kind 1. Kinds 1, 2 and 3 near the player had no game mass.
+- **Resting state is not permanent:** a body `bodyWake` turned dynamic goes back to kinematic after `K.SETTLE_FOR` of lying still (`rec.checked` is cleared, so it can be woken again). Whatever decides "obstacle or shoved" must hold for both states.
+- **Any new rule on which bodies stop the gun also applies to the hands:** they share `GunTouchActor`. Test both.
 
 ## Diagnostics left in
 
@@ -167,6 +193,7 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 - Magazines have no box of their own (inside the grip they are covered; in the hand the hand capsule covers them).
 - Limits: 12 parts per body (`kGunMostBoxes`), 1024 tests per call (`kGunMostTests`), 14 ray targets (`GUN_SIDES`).
 - The world lists cost 0.6-1.2 ms/frame even with no gun out. A grid index of the statics would cut the rebuilds.
+- Carried-body lag, the gun from the side (its turn is not swept) and what could leave Lua: analysed 2026-11-08 in `docs/hand-physics-lag-weaponstop-threading-20261108.md`, nothing of it built yet.
 
 ## How the user works
 

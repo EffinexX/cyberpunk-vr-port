@@ -154,8 +154,30 @@ public func VRMeleeSweepHit(weapon: wref<WeaponObject>, bladeStart: Vector4, bla
     i += 1;
   }
   // Deduplicate within a deliberate stroke; native damage/bonuses stay intact.
-  return this.VRCyberwareOrdinaryContact(weapon, bestEnemy, contact, bestPos, passive);
+  let landed = this.VRCyberwareOrdinaryContact(weapon, bestEnemy, contact, bestPos, passive);
+  if landed > 0 && IsDefined(bestEnemy) {
+    // for the body's own reaction (HandCollision, K.meleeHitTick), on top of the game's hit: who, where, which way the blade went, w how fast the stroke was
+    let way = bladeEnd - previousEnd;
+    if Vector4.Length(way) < 0.001 { way = bestPos - this.GetWorldPosition(); };
+    way = Vector4.Normalize(way);
+    let swing = this.vrCyberwareSwings[1];
+    way.W = IsDefined(swing) ? swing.peakSpeed : 3.00;
+    this.vrMeleeHitTarget = bestEnemy;
+    this.vrMeleeHitPoint = contact;
+    this.vrMeleeHitWay = way;
+    this.vrMeleeHitSerial += 1;
+  };
+  return landed;
 }
+
+@addField(PlayerPuppet) private let vrMeleeHitTarget: wref<GameObject>;
+@addField(PlayerPuppet) private let vrMeleeHitPoint: Vector4;
+@addField(PlayerPuppet) private let vrMeleeHitWay: Vector4;
+@addField(PlayerPuppet) private let vrMeleeHitSerial: Int32;
+@addMethod(PlayerPuppet) public func VRMeleeLastHitTarget() -> wref<GameObject> { return this.vrMeleeHitTarget; }
+@addMethod(PlayerPuppet) public func VRMeleeLastHitPoint() -> Vector4 { return this.vrMeleeHitPoint; }
+@addMethod(PlayerPuppet) public func VRMeleeLastHitWay() -> Vector4 { return this.vrMeleeHitWay; }
+@addMethod(PlayerPuppet) public func VRMeleeLastHitSerial() -> Int32 { return this.vrMeleeHitSerial; }
 
 // SWING WHOOSH (VR). In the flat game the whoosh rides on the attack ANIMATION's audio events,
 // resolved through the weapon's cooked audio metadata (audioMeleeSettings: normalWhoosh /
