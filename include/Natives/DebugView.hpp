@@ -19,6 +19,8 @@ bool ActorWorld(uint32_t proxy,uint32_t body,float* xyz);
 // physics::ProxyType of a proxy, 0 if there is none.
 int ProxyKind(uint32_t proxy);
 int ProxyBodies(uint32_t proxy);
+// What the game says a body weighs (HandBody.cpp); unlike PhysX it also knows it for a kinematic body. 0 if it has no mass or is no thing that moves. Game thread.
+float BodyGameMass(uint32_t proxy,uint32_t body);
 // Lifts PhysX's ceiling on how fast a body may turn, which this body was held to. False if it is not a body of the PhysX this was read from. `was` gets the old ceiling.
 bool RaiseSpin(uint32_t proxy,uint32_t body,float most,float* was);
 }

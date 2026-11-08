@@ -11,7 +11,7 @@ pacing the game to 45 real fps). That PC is **CPU-bound**: every millisecond on 
 |---|---|---|
 | World lists | `src/Natives/DebugView.cpp`, `VRWorldCenter` | Once a frame, round the chest (2.8 m): the **static near list** (built a slice of 1500 statics per frame, rebuilt after 1 m of movement or 2 s) and the **moving things** (gathered every frame). |
 | Movers | `DebugView.cpp`, `struct Mover`, `GunMove` | The gun (`movers[2]`) and each hand (`movers[0..1]`). Parts are boxes or capsules in the body's frame. Each frame the body is **swept** from where it was left to where the solve wants it, stopped and slid along what it hits (PhysX `PxGeometryQuery::sweep`), pushed out of what it is in (`computePenetration`), and **tethered**: nothing may lie between it and its anchor (gun: the wrist; hand: the chest, ignoring the first 12 cm). |
-| Moving obstacles | `GunTouchActor`, `GunStopsAt` | A moving actor that is **kinematic or heavier than 30 kg** is an obstacle like a wall. Lighter ones are **shoved** (Lua `bodyPush`) from the touches after the move. **Query-only shapes are skipped** (see the NPC hull below). The moving actor whose bounds hold the chest is skipped (the player's own capsule, a seat). |
+| Moving obstacles | `GunTouchActor`, `GunStopsAt`, `GunKinematicIsLoose` | A moving actor that is **kinematic or heavier than 30 kg** is an obstacle like a wall, except a kinematic prop (kind 10) of at most 30 kg game mass and 1.2 m longest side. Lighter ones and those props are **shoved** (Lua `bodyPush`, which wakes a kinematic one) from the touches after the move. **Query-only shapes are skipped** (see the NPC hull below). The moving actor whose bounds hold the chest is skipped (the player's own capsule, a seat). |
 | Gun shape | `weapon_shapes.lua` (generated), `weapon_custom_boxes.lua` (hand-drawn, wins) | Boxes in the weapon frame: origin at the grip, +Y along the barrel, +Z up, metres. Turned boxes allowed. |
 | Attachments | `weapon_custom_boxes.lua` `attachments`, `weapon_attachments.lua` | Drawn once per attachment in **its mount's frame**; put on at the weapon's `muzzle` / `scope` mount. One mount per slot per weapon, never per attachment (user's decision). |
 | Hand shape | `init.lua` `K.handWorldOne` | The body asset's hand capsule (`capsules.lua`, r 0.031) plus a finger capsule (centre 0.115 along X, r 0.016, half 0.03) that ends ~1 cm short of the fingertips, so touch screens still work. |
@@ -50,6 +50,8 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 
 - **Palms have big round colliders.** After touching a palm the log named one round static kind: a sphere 2.15 m across, flags 11, query word2 `00100000`, sim words zero.
   Exactly that kind (sphere + those words) is left out of the near list. Identified from one test run by shape and timing, not by material: if something else stops being solid, look here first.
+
+- **Small things stopped moving under the gun** since `4aadac60` (reported 2026-11-08): kinematic actors became obstacles and never reached `bodyPush`/`bodyWake`, which is what made them dynamic; a thing that was woken also goes back to kinematic once it lies still. PhysX `getMass` is 0 for kinematic, so `GunKinematicIsLoose` asks the game's mass (`BodyGameMass`, decision kept per actor). Confirmed in game 2026-11-08 (user: small things move again). Of the 60 logged kinematic bodies near, 52 were kind 10 at 0.09-19.75 kg and 0.10-0.90 m, all shoved, so light kinematic props are common; the rest were kinds 1, 2, 3 without a game mass and stayed obstacles. No kind 10 body over the 30 kg or 1.2 m limits was among those 60, so the log does not show those limits at work. The per-shape `bounds` in the "stopped a hand or the gun" lines say nothing about the size of the actor.
 
 ## PhysX facts (PhysX 3.4.2, `PhysX3_x64.dll` of the game)
 
@@ -125,6 +127,7 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 
 - `[gunshape] ...` every 10 s while a gun is out: boxes, near shapes, ms per call, rescans, moving things that stop/are shoved.
 - `[gunshape] a static/moving thing stopped/pushed out a hand or the gun: geometry, flags, bounds, filter words` once per kind of shape.
+- `[gunshape] a kinematic body near: kind, game mass, longest side, proxy: shoved/stops`, once per actor, 60 lines a session.
 - `[world] round the chest: near shapes, moving, own capsules skipped, ms a frame, hands calls/ms` every 10 s.
 - `[hand-probe]` when a hand is pushed > 10 cm, the push reverses from the last frame, or the chest tether fires.
 - `[HandColl] probe: static ray ...` / `[gun-probe]` only while the gun's backup rays are on (the scene walk is disabled: it cost 2.5 ms).

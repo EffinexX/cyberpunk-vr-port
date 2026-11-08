@@ -525,6 +525,10 @@ NearShape gunMoving[kGunMostMoving];
 LooseShape gunLoose[kGunMostMoving];
 int gunMovingCount=0,gunLooseCount=0;
 bool gunLooseFresh=false;
+// What was decided about a kinematic actor, kept: asking the game for a mass is the slow part. The ids guard against the pointer being reused.
+struct KinematicSeen {uint32_t proxy,body;bool loose;};
+std::unordered_map<void*,KinematicSeen> gunKinematicSeen;
+int gunKinematicSaid=0;
 inline int GunObstacleCount();
 inline const NearShape& GunObstacle(int i);
 float gunRadius=.5f;
@@ -560,7 +564,7 @@ void GunSayMoving(int i,const char* how) {
         s.bounds.hi.x-s.bounds.lo.x,s.bounds.hi.y-s.bounds.lo.y,s.bounds.hi.z-s.bounds.lo.z,s.query[0],s.query[1],s.query[2],s.query[3],s.sim[0],s.sim[1],s.sim[2],s.sim[3]);
 }
 inline const NearShape& GunObstacle(int i) {return i<gunNearCount?gunNear[i]:gunMoving[i-gunNearCount];}
-void GunForget() {gunNearCount=gunNextCount=0;gunReady=false;gunNextFull=false;gunScene=-1;gunStart=0;for(Mover& m:movers)m.prevOn=false;gunMovingCount=gunLooseCount=0;gunLooseFresh=false;}
+void GunForget() {gunNearCount=gunNextCount=0;gunReady=false;gunNextFull=false;gunScene=-1;gunStart=0;for(Mover& m:movers)m.prevOn=false;gunMovingCount=gunLooseCount=0;gunLooseFresh=false;gunKinematicSeen.clear();}
 bool GunProveShape(void* shape) {
     if(gunProved)return gunProved>0;
     const uintptr_t dll=reinterpret_cast<uintptr_t>(GetModuleHandleA("PhysX3_x64.dll"));
@@ -936,7 +940,8 @@ constexpr float kGunMovingSlack=.5f;  // m round the gun's reach: how far it can
 void** gunBodyTable=nullptr;
 int gunBodyProved=0;
 uint64_t gunMovingStops=0,gunMovingShoved=0,gunMovingOwnSkipped=0;
-bool GunStopsAt(void* actor) {
+bool GunStopsAt(void* actor,bool& kinematic) {
+    kinematic=false;
     void** table=*reinterpret_cast<void***>(actor);
     if(gunBodyProved==0) {
         const uintptr_t dll=reinterpret_cast<uintptr_t>(GetModuleHandleA("PhysX3_x64.dll"));
@@ -952,7 +957,28 @@ bool GunStopsAt(void* actor) {
     uint8_t flags=0;
     Slot<void*(*)(void*,uint8_t*)>(actor,kBodyGetFlags)(actor,&flags);
     const float mass=Slot<float(*)(void*)>(actor,kBodyGetMass)(actor);
-    return (flags&1)!=0 || mass>kGunHeavy;
+    kinematic=(flags&1)!=0;
+    return kinematic || mass>kGunHeavy;
+}
+// A SMALL THING AT REST CAN BE KINEMATIC, and HandCollision's bodyWake makes it dynamic on the first shove (a thing it woke goes back to kinematic once it lies still).
+// As an obstacle it never got that first shove, and stopped the gun for good. PhysX gives a kinematic body no mass, so the game is asked. Only props (kind 10, what bodyWake
+// can wake and what the log shows as light props) and only small ones: a ragdoll's limbs, a door, a thing without a mass stay obstacles.
+constexpr int kProxyProp=10;
+constexpr float kGunShovedMost=1.2f;  // m, the longest side of a kinematic thing the gun may shove
+bool GunKinematicIsLoose(void* actor,uint32_t proxy,uint32_t body,const Bounds& whole) {
+    const auto known=gunKinematicSeen.find(actor);
+    if(known!=gunKinematicSeen.end() && known->second.proxy==proxy && known->second.body==body)return known->second.loose;
+    const int kind=proxy?ProxyKind(proxy):0;
+    const float mass=kind==kProxyProp?BodyGameMass(proxy,body):0.f;
+    const float longest=std::fmax(std::fmax(whole.hi.x-whole.lo.x,whole.hi.y-whole.lo.y),whole.hi.z-whole.lo.z);
+    const bool loose=kind==kProxyProp && mass>.01f && mass<=kGunHeavy && longest<=kGunShovedMost;
+    if(gunKinematicSeen.size()>=2048)gunKinematicSeen.clear();
+    gunKinematicSeen[actor]=KinematicSeen{proxy,body,loose};
+    if(gunKinematicSaid<60) {
+        ++gunKinematicSaid;
+        Log("[gunshape] a kinematic body near: kind %d, game mass %.2f kg, longest side %.2f m, proxy %u/%u: %s\n",kind,mass,longest,proxy,body,loose?"shoved":"stops");
+    }
+    return loose;
 }
 void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
     ++gunWalkActors;
@@ -979,9 +1005,11 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
         const Vec3 a{collectAvoid.x-origin.x,collectAvoid.y-origin.y,collectAvoid.z-origin.z};
         if(a.x>=whole.lo.x && a.x<=whole.hi.x && a.y>=whole.lo.y && a.y<=whole.hi.y && a.z>=whole.lo.z && a.z<=whole.hi.z)return;
     }
-    const bool stop=GunStopsAt(actor);
     const char* a=static_cast<const char*>(actor);
     const uint32_t proxy=*reinterpret_cast<const uint32_t*>(a+0x10),body=*reinterpret_cast<const uint16_t*>(a+0x14);
+    bool kinematic=false;
+    bool stop=GunStopsAt(actor,kinematic);
+    if(stop && kinematic && GunKinematicIsLoose(actor,proxy,body,whole))stop=false;
     void* shapes[kGunActorShapes]{};
     const uint32_t n=Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(actor,kActorGetShapes)(actor,shapes,kGunActorShapes,0);
     for(uint32_t i=0;i<n && i<kGunActorShapes;++i) {

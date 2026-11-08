@@ -1226,6 +1226,17 @@ void VRBodyInfo(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RE
     *aOut = RED4ext::Vector4{float(kind), float(proxy), float(body), mass};
 }
 
+float cvr::debugview::BodyGameMass(uint32_t proxy, uint32_t body) {
+    if (!TraceMoves(uint8_t(cvr::debugview::ProxyKind(proxy)))) return 0.0f;
+    static RED4ext::IScriptable* s_scratch = nullptr;
+    if (!s_scratch) s_scratch = NewBody(proxy, body);
+    if (!s_scratch) return 0.0f;
+    auto* raw = reinterpret_cast<uint8_t*>(s_scratch);
+    *reinterpret_cast<uint32_t*>(raw + 0x40) = proxy;
+    *reinterpret_cast<uint32_t*>(raw + 0x44) = body;
+    return MassOf(s_scratch, proxy, body);
+}
+
 // VRBodyOf(proxy, body) -> the body, for the VRBody* natives.
 void VRBodyOf(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Handle<RED4ext::IScriptable>* aOut, int64_t a4) {
     RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
