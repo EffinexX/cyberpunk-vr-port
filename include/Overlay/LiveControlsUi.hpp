@@ -160,7 +160,8 @@ struct LiveControlsUiState {
     int xrFingerContact = 1;
     int xrPropGrab = 1;
     int xrDebugView = 0;
-    int xrGunRays = 1;
+    int xrGunRays = 0;
+    int xrHandRays = 0;
     int xrCarryPicture = 1;
     float xrCarryLead = 0.03f;
     float xrContactMargin = 0.01f;

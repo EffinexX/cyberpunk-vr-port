@@ -262,7 +262,16 @@ void DrawVRHandsControls() {
         }
         if (UI::IsItemHovered()) {
             UI::SetTooltip("Rays from the wrist to the gun's boxes catch what the boxes alone miss: heavy or kinematic things,\n"
-                              "and walls the boxes slipped past. Off to compare. Back on after a restart.");
+                              "and walls the boxes slipped past. On to compare. Off after a restart.");
+        }
+        bool handRays = st.xrHandRays != 0;
+        if (UI::Checkbox("Hands: old world rays instead of their shapes", &handRays)) {
+            st.xrHandRays = handRays ? 1 : 0;
+            SetLiveControlsUiState(&st, 1);
+        }
+        if (UI::IsItemHovered()) {
+            UI::SetTooltip("Off: each hand is stopped by the world with its own shape, like the gun's boxes.\n"
+                              "On: the rays from the chest as before, to compare. Off after a restart.");
         }
         bool carryPicture = st.xrCarryPicture != 0;
         if (UI::Checkbox("Carried objects stick to the hand", &carryPicture)) {

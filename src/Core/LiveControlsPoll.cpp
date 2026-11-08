@@ -2253,6 +2253,7 @@ LiveControlsUiState MakeLiveControlsUiState() {
     state.xrPropGrab = g_liveControls.xrPropGrab;
     state.xrDebugView = g_liveControls.xrDebugView;
     state.xrGunRays = g_liveControls.xrGunRays;
+    state.xrHandRays = g_liveControls.xrHandRays;
     state.xrCarryPicture = g_liveControls.xrCarryPicture;
     state.xrCarryLead = g_liveControls.xrCarryLead;
     state.xrContactMargin = g_liveControls.xrContactMargin;
@@ -2802,6 +2803,7 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
     g_liveControls.xrPropGrab = state->xrPropGrab != 0 ? 1 : 0;
     g_liveControls.xrDebugView = state->xrDebugView != 0 ? 1 : 0;
     g_liveControls.xrGunRays = state->xrGunRays != 0 ? 1 : 0;
+    g_liveControls.xrHandRays = state->xrHandRays != 0 ? 1 : 0;
     g_liveControls.xrCarryPicture = state->xrCarryPicture != 0 ? 1 : 0;
     g_liveControls.xrCarryLead = state->xrCarryLead < 0.0f ? 0.0f : (state->xrCarryLead > 0.1f ? 0.1f : state->xrCarryLead);
     g_liveControls.xrContactMargin = state->xrContactMargin < 0.0f ? 0.0f : (state->xrContactMargin > 0.05f ? 0.05f : state->xrContactMargin);

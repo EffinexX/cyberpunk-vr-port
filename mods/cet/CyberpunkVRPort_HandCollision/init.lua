@@ -1694,9 +1694,15 @@ K.recOf = function(proxy, index)
 end
 
 -- LOOSE THINGS AND THE GUN'S BOXES, by PhysX: what each box is inside of, and pushed the way out of it, at the hand's own speed, or at least enough to be felt.
-K.gunLoose = function(side, gx, gy, gz, qi, qj, qk, qr)
-    if type(VRGunTouches) ~= 'function' then return end
-    local ok, n = pcall(VRGunTouches, Vector4.new(gx, gy, gz, 1.0), Vector4.new(qi, qj, qk, qr))
+K.gunLoose = function(side, gx, gy, gz, qi, qj, qk, qr, handId)
+    local ok, n
+    if handId then
+        if type(VRHandTouches) ~= 'function' then return end
+        ok, n = pcall(VRHandTouches, handId, Vector4.new(gx, gy, gz, 1.0), Vector4.new(qi, qj, qk, qr))
+    else
+        if type(VRGunTouches) ~= 'function' then return end
+        ok, n = pcall(VRGunTouches, Vector4.new(gx, gy, gz, 1.0), Vector4.new(qi, qj, qk, qr))
+    end
     if not ok or not n or n <= 0 then return end
     for i = 0, n - 1 do
         local okA, a = pcall(VRGunTouchOf, i)
@@ -1732,6 +1738,66 @@ K.gunLoose = function(side, gx, gy, gz, qi, qj, qk, qr)
             end
         end
     end
+end
+
+-- THE HANDS BY THEIR SHAPES (2026-11-08). The plugin keeps one list of the world round the chest for both hands and the gun
+-- (VRWorldCenter, once a frame), and moves each free hand like the gun's boxes: from where it was left, stopped and slid along what is
+-- in the way, never past what lies between it and the chest. The shape is the hand capsule of the body asset and one along the fingers,
+-- a little short of their tips, so a fingertip still goes a little into a touch screen. Light things are shoved, as by the gun. The
+-- overlay's "Hands: old world rays" puts the rays from the chest back, to compare; and they stand in while the world is not known yet.
+K.HAND_SENT, K.HAND_FINGER_AT, K.HAND_FINGER_R, K.HAND_FINGER_HALF = {}, 0.115, 0.016, 0.03
+K.worldNow = function(bx, by, bz, ii, ij, ik, ir)
+    if K.WC_GEN == gen then return K.WC_OK end
+    K.WC_GEN, K.WC_OK = gen, false
+    if type(VRWorldCenter) ~= 'function' or type(VRHandPush) ~= 'function' then return false end
+    if type(VRHandRaysOn) == 'function' then
+        local okR, on = pcall(VRHandRaysOn)
+        if okR and on == true then return false end
+    end
+    local ox, oy, oz = bone(WORLD_ORIGIN)
+    if not ox then return false end
+    local cx, cy, cz = qrot(-ii, -ij, -ik, ir, ox, oy, oz)
+    cx, cy, cz = cx + bx, cy + by, cz + bz
+    local ok, ready = pcall(VRWorldCenter, Vector4.new(cx, cy, cz, 1.0))
+    K.WC_X, K.WC_Y, K.WC_Z = cx, cy, cz
+    K.WC_OK = ok and ready == true
+    if K.WC_OK and not K.WC_SAID then
+        K.WC_SAID = true
+        pcall(function() spdlog.info('[HandColl] the hands are stopped by their own shapes now, the rays are off') end)
+    end
+    return K.WC_OK
+end
+-- what the rays found for a hand, forgotten: called from onUpdate, which cannot see WORLD_HIT
+K.handClear = function(side)
+    for slot = side * 6, side * 6 + 5 do WORLD_HIT[slot] = false end
+end
+K.handWorldOne = function(side, bx, by, bz, ii, ij, ik, ir)
+    local h = HAND[side]
+    if not h or not PX[side] or SKIP[side] then return false end
+    local _, _, _, hi, hj, hk, hr = bone(h.index)
+    if not hi then return false end
+    if not K.HAND_SENT[side] then
+        local okC = pcall(VRMoverClear, side)
+        local dir = h.cx >= 0.0 and 1.0 or -1.0
+        local none = Vector4.new(0.0, 0.0, 0.0, 1.0)
+        pcall(VRMoverCapsule, side, Vector4.new(h.cx, h.cy, h.cz, 1.0), h.r, h.half, none)
+        pcall(VRMoverCapsule, side, Vector4.new(dir * K.HAND_FINGER_AT, h.cy, h.cz, 1.0), K.HAND_FINGER_R, K.HAND_FINGER_HALF, none)
+        K.HAND_SENT[side] = okC
+    end
+    -- what the rays found is not asked any more
+    for slot = side * 6, side * 6 + 5 do WORLD_HIT[slot] = false end
+    local x, y, z = PX[side], PY[side], PZ[side]
+    local ax, ay, az = qrot(-ii, -ij, -ik, ir, x, y, z)
+    ax, ay, az = ax + bx, ay + by, az + bz
+    local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, hi, hj, hk, hr)
+    local ok, p = pcall(VRHandPush, side, Vector4.new(ax, ay, az, 1.0), Vector4.new(qi, qj, qk, qr), Vector4.new(K.WC_X, K.WC_Y, K.WC_Z, 1.0))
+    if not ok or not p or p.w < 0.5 then return false end
+    if p.x ~= 0.0 or p.y ~= 0.0 or p.z ~= 0.0 then
+        local mx, my, mz = qrot(ii, ij, ik, ir, p.x, p.y, p.z)
+        PX[side], PY[side], PZ[side] = x + mx, y + my, z + mz
+    end
+    if pushOn then K.gunLoose(side, ax + p.x, ay + p.y, az + p.z, qi, qj, qk, qr, side) end
+    return true
 end
 
 -- WHAT A HAND ASKS, THE GUN ASKS TOO. A hand goes by the game's own rays, and they see all there is. The gun's sweeps know the static actors alone: what stands in the world as a kinematic body, or too heavy to shove, or
@@ -1890,11 +1956,14 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
     local ox, oy, oz = bone(WORLD_ORIGIN)
     if not ox then return end
 
-    -- the arm, one line a frame; what the dynamic rays saw before the gun was drawn is not asked again here
-    for line = 1, 3 do WORLD_HIT[worldSlot(side, line, true)] = false end
-    worldTurn = (worldTurn + 1) % 3
-    worldRay(side, worldTurn + 1, false, ox, oy, oz, bx, by, bz, -ii, -ij, -ik, ir)
-    worldClamp(side, ox, oy, oz, true, WEAPON_MAX)
+    -- the arm, one line a frame; what the dynamic rays saw before the gun was drawn is not asked again here. Not while the hands go
+    -- by their shapes: the holder's hand has been moved by its own just before.
+    if not K.HANDS_NATIVE then
+        for line = 1, 3 do WORLD_HIT[worldSlot(side, line, true)] = false end
+        worldTurn = (worldTurn + 1) % 3
+        worldRay(side, worldTurn + 1, false, ox, oy, oz, bx, by, bz, -ii, -ij, -ik, ir)
+        worldClamp(side, ox, oy, oz, true, WEAPON_MAX)
+    end
 
     local h = HAND[side]
     if not h then return end
@@ -3923,7 +3992,7 @@ local function carry(allowed, holder, dt, bx, by, bz, ii, ij, ik, ir)
     K.pf('carrying')
 end
 
-return { worldStop = worldStop, pf = K.pf, pfBegin = K.pfBegin, weaponStop = weaponStop, handsPush = handsPush, weaponRanged = weaponRanged,
+return { K = K, worldStop = worldStop, pf = K.pf, pfBegin = K.pfBegin, weaponStop = weaponStop, handsPush = handsPush, weaponRanged = weaponRanged,
     freeStop = freeStop, fingerContact = fingerContact, friction = friction, trackHands = trackHands, carry = carry, carryHand = carryHand, debugDraw = debugDraw, stateKey = nil }
 end)()
 
@@ -4107,9 +4176,13 @@ registerForEvent('onUpdate', function(dt)
         if WORLD_ON and not SKIP[holder] and lastW then
             local wx, wy, wz, wi, wj, wk, wr = worldFrame()
             if wx then
+                HC.K.HANDS_NATIVE = HC.K.worldNow(wx, wy, wz, wi, wj, wk, wr)
+                if HC.K.HANDS_NATIVE then HC.K.handWorldOne(holder, wx, wy, wz, wi, wj, wk, wr) end
                 HC.weaponStop(holder, lastW, wx, wy, wz, wi, wj, wk, wr)
                 HC.pf('gun rest')
-                if not SKIP[free] and f then HC.freeStop(free, wx, wy, wz, wi, wj, wk, wr) end
+                if not SKIP[free] and f then
+                    if not (HC.K.HANDS_NATIVE and HC.K.handWorldOne(free, wx, wy, wz, wi, wj, wk, wr)) then HC.freeStop(free, wx, wy, wz, wi, wj, wk, wr) end
+                end
                 HC.pf('free hand')
             end
         end
@@ -4143,7 +4216,20 @@ registerForEvent('onUpdate', function(dt)
         HC.pf('body solve')
         if WORLD_ON then
             local wx, wy, wz, wi, wj, wk, wr = worldFrame()
-            if wx then HC.worldStop(wx, wy, wz, wi, wj, wk, wr) end
+            if wx then
+                HC.K.HANDS_NATIVE = HC.K.worldNow(wx, wy, wz, wi, wj, wk, wr)
+                if HC.K.HANDS_NATIVE then
+                    for side = 0, 1 do
+                        if SKIP[side] then
+                            HC.K.handClear(side)
+                        else
+                            HC.K.handWorldOne(side, wx, wy, wz, wi, wj, wk, wr)
+                        end
+                    end
+                else
+                    HC.worldStop(wx, wy, wz, wi, wj, wk, wr)
+                end
+            end
         end
         HC.pf('world rays')
         HC.friction(0, true)

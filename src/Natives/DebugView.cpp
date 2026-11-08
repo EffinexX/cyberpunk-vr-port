@@ -494,19 +494,28 @@ bool RaiseSpinInner(int32_t proxy,int32_t body,float most,float* was) {
 constexpr int kGunNear=2048,kGunSlice=1500,kGunMostBoxes=12,kGunActorShapes=64,kGunMostTests=1024,kGunPasses=3;
 constexpr uint32_t kGunActorMostShapes=8192;
 uint32_t gunShapesMost=0,gunTethered=0,gunGaveUp=0;
-Vec3 gunAnchor{};
-bool gunAnchorOn=false;
 constexpr uintptr_t kShapeGetSimFilterRva=0x66a80,kShapeGetQueryFilterRva=0x66ae0,kShapeGetFlagsRva=0x67200;
 constexpr int kShapeGetHeightField=16,kShapeGetSimFilter=21,kShapeGetQueryFilter=23,kShapeGetFlags=34;
 struct Bounds {Vec3 lo,hi;};
 struct NearShape {alignas(8) uint8_t geometry[64];Transform pose;Bounds bounds;Vec3 origin;uint32_t query[4];uint32_t sim[4];uint8_t flags;int type;};
 // A box may be turned in the gun's frame (drawn by hand in Blender, tools/weapon_blend): q, identity for the generated ones.
-struct GunBox {Vec3 center,half;Quat q{0,0,0,1};};
+struct GunBox {Vec3 center,half;Quat q{0,0,0,1};bool capsule=false;float radius=0,halfHeight=0;};
+// A part's geometry for PhysX: a box, or a capsule along its local X (half then holds the capsule's box, for the cull).
+struct PartGeom {alignas(8) uint8_t bytes[32];};
+inline void PartGeometry(const GunBox& b,PartGeom& g) {
+    std::memset(g.bytes,0,sizeof g.bytes);
+    if(b.capsule) {const CapsuleGeometry c{GeomCapsule,b.radius,b.halfHeight};std::memcpy(g.bytes,&c,sizeof c);}
+    else {const BoxGeometry x{GeomBox,b.half};std::memcpy(g.bytes,&x,sizeof x);}
+}
+// A BODY THAT IS STOPPED BY THE WORLD (2026-11-08): the gun, and each hand. Its parts in its own frame, where it was left last call,
+// and what it must stay on this side of (the gun: the wrist; a hand: the chest).
+struct Mover {GunBox parts[kGunMostBoxes];int count=0;Vec3 prev{};bool prevOn=false;Vec3 anchor{};bool anchorOn=false;float anchorSkip=0;uint64_t lastCall=0;Vec3 lastAt{};
+    uint32_t tethered=0,gaveUp=0;Vec3 lastPush{};uint64_t saidAt=0;float tetherAt=0;int lastHitPart=-1;};
+Mover movers[3];   // 0 the left hand, 1 the right, 2 the gun
+Mover& gunMover=movers[2];
 NearShape gunNear[kGunNear],gunNext[kGunNear];
 int gunNearCount=0,gunNextCount=0;
 bool gunReady=false,gunNextFull=false;
-GunBox gunBoxes[kGunMostBoxes];
-int gunBoxCount=0;
 // MOVING THINGS NEAR THE GUN, gathered each call before it moves (GunCollectInner): what stops it -- kinematic, or heavier than
 // kGunHeavy -- is tested with the world's shapes; what it shoves is kept, with whose it is, for the touches after the move.
 // Copies, from this call's fresh lists from PhysX; never kept past it.
@@ -532,8 +541,6 @@ using SweepFn=bool(*)(const Vec3*,float,const void*,const void*,const void*,cons
 struct SweepHit {uint8_t bytes[128];};
 int gunHitNormalAt=-1;
 SweepFn gunSweep=nullptr;
-Vec3 gunPrev{};
-bool gunPrevOn=false;
 bool gunSweepBad=false;
 PenetrationFn gunPenetration=nullptr;
 BoundsFn gunBounds=nullptr;
@@ -554,7 +561,7 @@ void GunSayMoving(int i,const char* how) {
         s.bounds.hi.x-s.bounds.lo.x,s.bounds.hi.y-s.bounds.lo.y,s.bounds.hi.z-s.bounds.lo.z,s.query[0],s.query[1],s.query[2],s.query[3],s.sim[0],s.sim[1],s.sim[2],s.sim[3]);
 }
 inline const NearShape& GunObstacle(int i) {return i<gunNearCount?gunNear[i]:gunMoving[i-gunNearCount];}
-void GunForget() {gunNearCount=gunNextCount=0;gunReady=false;gunNextFull=false;gunScene=-1;gunStart=0;gunPrevOn=false;gunMovingCount=gunLooseCount=0;gunLooseFresh=false;}
+void GunForget() {gunNearCount=gunNextCount=0;gunReady=false;gunNextFull=false;gunScene=-1;gunStart=0;for(Mover& m:movers)m.prevOn=false;gunMovingCount=gunLooseCount=0;gunLooseFresh=false;}
 bool GunProveShape(void* shape) {
     if(gunProved)return gunProved>0;
     const uintptr_t dll=reinterpret_cast<uintptr_t>(GetModuleHandleA("PhysX3_x64.dll"));
@@ -637,6 +644,15 @@ void GunAddActor(void* actor,const Vec3& center,float radius,const Vec3& origin)
 // began, or 2 s after the last was done, for what was streamed in since. Built every call before (2026-11-07): 0.55 ms a call for a
 // list that hardly changed. A jump of the gun or a pause still throws it away at once (VRGunPush).
 constexpr float kGunRescanMove=1.f;
+// WHAT THE LISTS REACH: round the gun, its reach and 1.5 m; round the chest (VRWorldCenter), kWorldReach -- an arm and a rifle, and the
+// same 1.5 m to spare. What the player stands in -- the moving actor whose bounds hold the chest, the player's own capsule, a seat -- is
+// no obstacle to a hand or the gun.
+constexpr float kWorldReach=2.8f;
+float scanReach=1.8f,collectReach=.8f;
+Vec3 worldCenter{};
+uint64_t worldCenterTick=0;
+Vec3 collectAvoid{};
+bool collectAvoidOn=false;
 constexpr uint64_t kGunRescanMs=2000;
 Vec3 gunCycleFrom{};
 uint64_t gunCycleDone=0;
@@ -652,7 +668,7 @@ void GunScanSlice(const Vec3& center) {
     if(proved<0 || gunProved<0 || !ReadScenes())return;
     ++gunSlices;
     if(gunScene<0) {gunScene=0;gunStart=0;gunNextCount=0;gunNextFull=false;gunCycleFrom=center;gunScanAsked=0;gunScanScenes=0;}
-    const float radius=gunRadius+1.5f;
+    const float radius=scanReach;
     while(gunScene<sceneCount && !sceneOwners[gunScene]) {++gunScene;gunStart=0;}
     if(gunScene<sceneCount) {
         void* scene=scenes[gunScene];
@@ -678,20 +694,20 @@ void GunScanSlice(const Vec3& center) {
     }
 }
 // How far the gun has to go to be out of everything near it, in the world.
-bool GunQueryInner(const Vec3& at,const Quat& turn,Vec3* push) {
+bool GunQueryInner(Mover& m,const Vec3& at,const Quat& turn,Vec3* push) {
     *push={0,0,0};
     int tests=0;
     const Transform gun{turn,at};
     for(int pass=0;pass<kGunPasses;++pass) {
         bool moved=false;
-        for(int b=0;b<gunBoxCount;++b) {
-            const GunBox& box=gunBoxes[b];
+        for(int b=0;b<m.count;++b) {
+            const GunBox& box=m.parts[b];
             const Vec3 middle=Apply(gun,box.center);
             // the box's own world bounds
             const Quat boxTurn=Multiply(turn,box.q);
             const Vec3 ax=Rotate(boxTurn,{box.half.x,0,0}),ay=Rotate(boxTurn,{0,box.half.y,0}),az=Rotate(boxTurn,{0,0,box.half.z});
             const Vec3 extent{std::fabs(ax.x)+std::fabs(ay.x)+std::fabs(az.x),std::fabs(ax.y)+std::fabs(ay.y)+std::fabs(az.y),std::fabs(ax.z)+std::fabs(ay.z)+std::fabs(az.z)};
-            const BoxGeometry geometry{GeomBox,box.half};
+            PartGeom geometry;PartGeometry(box,geometry);
             for(int i=0;i<GunObstacleCount();++i) {
                 const NearShape& s=GunObstacle(i);
                 const Vec3 p{middle.x+push->x-s.origin.x,middle.y+push->y-s.origin.y,middle.z+push->z-s.origin.z};
@@ -701,7 +717,7 @@ bool GunQueryInner(const Vec3& at,const Quat& turn,Vec3* push) {
                 const Transform pose{boxTurn,p};
                 Vec3 direction{};
                 float depth=0;
-                if(!gunPenetration(&direction,&depth,&geometry,&pose,s.geometry,&s.pose) || !(depth>0.f) || !std::isfinite(depth))continue;
+                if(!gunPenetration(&direction,&depth,geometry.bytes,&pose,s.geometry,&s.pose) || !(depth>0.f) || !std::isfinite(depth))continue;
                 push->x+=direction.x*depth;push->y+=direction.y*depth;push->z+=direction.z*depth;
                 moved=true;
                 GunSayMoving(i,"pushed out");
@@ -718,16 +734,16 @@ bool GunQueryInner(const Vec3& at,const Quat& turn,Vec3* push) {
 }
 // THE WRIST'S SIDE OF THE WALL. Each box's middle has nothing between it and the wrist that holds it, or it has got behind that: by a turn pushed out at the far side of a thin wall, or by the hand going too far from
 // where the gun stopped. It comes back to the near side, and the next sweep starts from there.
-void GunTether(Vec3& pos,const Quat& turn) {
-    if(!gunAnchorOn || !gunSweep || gunHitNormalAt<0)return;
+void GunTether(Mover& m,Vec3& pos,const Quat& turn) {
+    if(!m.anchorOn || !gunSweep || gunHitNormalAt<0)return;
     constexpr float kThin=.003f,kBack=.012f;
     constexpr uint16_t kFlags=1|2|4|16|128|256;
     const BoxGeometry thin{GeomBox,{kThin,kThin,kThin}};
     const Quat none{0,0,0,1};
     int tests=0;
-    for(int b=0;b<gunBoxCount && tests<kGunMostTests;++b) {
-        const Vec3 middle=Apply(Transform{turn,pos},gunBoxes[b].center);
-        const Vec3 way{middle.x-gunAnchor.x,middle.y-gunAnchor.y,middle.z-gunAnchor.z};
+    for(int b=0;b<m.count && tests<kGunMostTests;++b) {
+        const Vec3 middle=Apply(Transform{turn,pos},m.parts[b].center);
+        const Vec3 way{middle.x-m.anchor.x,middle.y-m.anchor.y,middle.z-m.anchor.z};
         const float length=std::sqrt(way.x*way.x+way.y*way.y+way.z*way.z);
         if(length<.03f)continue;
         const Vec3 dir{way.x/length,way.y/length,way.z/length};
@@ -735,7 +751,7 @@ void GunTether(Vec3& pos,const Quat& turn) {
         bool hit=false;
         for(int i=0;i<GunObstacleCount() && tests<kGunMostTests;++i) {
             const NearShape& s=GunObstacle(i);
-            const Vec3 p{gunAnchor.x-s.origin.x,gunAnchor.y-s.origin.y,gunAnchor.z-s.origin.z};
+            const Vec3 p{m.anchor.x-s.origin.x,m.anchor.y-s.origin.y,m.anchor.z-s.origin.z};
             const Vec3 q{p.x+way.x,p.y+way.y,p.z+way.z};
             if((p.x<q.x?p.x:q.x)-kThin>s.bounds.hi.x || (p.x>q.x?p.x:q.x)+kThin<s.bounds.lo.x || (p.y<q.y?p.y:q.y)-kThin>s.bounds.hi.y || (p.y>q.y?p.y:q.y)+kThin<s.bounds.lo.y ||
                (p.z<q.z?p.z:q.z)-kThin>s.bounds.hi.z || (p.z>q.z?p.z:q.z)+kThin<s.bounds.lo.z)continue;
@@ -744,12 +760,14 @@ void GunTether(Vec3& pos,const Quat& turn) {
             SweepHit h{};
             if(!gunSweep(&dir,best,&thin,&pose,s.geometry,&s.pose,&h,&kFlags,0.f))continue;
             const float* f=reinterpret_cast<const float*>(h.bytes+gunHitNormalAt);
-            if(f[3]>=0.f && f[3]<=best && std::isfinite(f[3])) {best=f[3];hit=true;}
+            if(f[3]>=m.anchorSkip && f[3]<=best && std::isfinite(f[3])) {best=f[3];hit=true;}
         }
         if(hit) {
             const float back=length-best+kBack;
             pos={pos.x-dir.x*back,pos.y-dir.y*back,pos.z-dir.z*back};
             ++gunTethered;
+            ++m.tethered;
+            m.tetherAt=best;
         }
     }
 }
@@ -757,21 +775,21 @@ void GunTether(Vec3& pos,const Quat& turn) {
 // that is the far side of a crate once the hand has gone down far enough. This never crosses a surface, as a game's character controller does not. What it turned into this frame is still pushed out,
 // which is a small thing; and when the hand has gone further from it than an arm should, the gun comes, on the wrist's side of what is there. At .6 m it came straight through: a rifle held out at a wall reaches that
 // before the wrist has got to the wall, and then only the hand stopped.
-bool GunMove(const Vec3& target,const Quat& turn,Vec3* push) {
+bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
     constexpr float kSkin=.002f,kGiveUp=1.f;
     constexpr uint16_t kFlags=1|2|4|16|128|256;   // position, normal, distance, assume no overlap at the start, both sides of a mesh, precise
     *push={0,0,0};
-    if(!gunPrevOn || !gunSweep || gunSweepBad) {
-        GunQueryInner(target,turn,push);
-        gunPrev={target.x+push->x,target.y+push->y,target.z+push->z};
-        GunTether(gunPrev,turn);
-        *push={gunPrev.x-target.x,gunPrev.y-target.y,gunPrev.z-target.z};
-        gunPrevOn=true;
+    if(!m.prevOn || !gunSweep || gunSweepBad) {
+        GunQueryInner(m,target,turn,push);
+        m.prev={target.x+push->x,target.y+push->y,target.z+push->z};
+        GunTether(m,m.prev,turn);
+        *push={m.prev.x-target.x,m.prev.y-target.y,m.prev.z-target.z};
+        m.prevOn=true;
         return true;
     }
-    Vec3 pos=gunPrev;
+    Vec3 pos=m.prev;
     Vec3 fix{};
-    GunQueryInner(pos,turn,&fix);
+    GunQueryInner(m,pos,turn,&fix);
     pos={pos.x+fix.x,pos.y+fix.y,pos.z+fix.z};
     Vec3 left{target.x-pos.x,target.y-pos.y,target.z-pos.z};
     int tests=0;
@@ -783,13 +801,13 @@ bool GunMove(const Vec3& target,const Quat& turn,Vec3* push) {
         Vec3 normal{};
         bool hit=false;
         const Transform gun{turn,pos};
-        for(int b=0;b<gunBoxCount && tests<kGunMostTests;++b) {
-            const GunBox& box=gunBoxes[b];
+        for(int b=0;b<m.count && tests<kGunMostTests;++b) {
+            const GunBox& box=m.parts[b];
             const Vec3 middle=Apply(gun,box.center);
             const Quat boxTurn=Multiply(turn,box.q);
             const Vec3 ax=Rotate(boxTurn,{box.half.x,0,0}),ay=Rotate(boxTurn,{0,box.half.y,0}),az=Rotate(boxTurn,{0,0,box.half.z});
             const Vec3 extent{std::fabs(ax.x)+std::fabs(ay.x)+std::fabs(az.x),std::fabs(ax.y)+std::fabs(ay.y)+std::fabs(az.y),std::fabs(ax.z)+std::fabs(ay.z)+std::fabs(az.z)};
-            const BoxGeometry geometry{GeomBox,box.half};
+            PartGeom geometry;PartGeometry(box,geometry);
             for(int i=0;i<GunObstacleCount() && tests<kGunMostTests;++i) {
                 const NearShape& s=GunObstacle(i);
                 const Vec3 p{middle.x-s.origin.x,middle.y-s.origin.y,middle.z-s.origin.z};
@@ -799,7 +817,7 @@ bool GunMove(const Vec3& target,const Quat& turn,Vec3* push) {
                 ++tests;
                 const Transform pose{boxTurn,p};
                 SweepHit h{};
-                if(!gunSweep(&dir,best,&geometry,&pose,s.geometry,&s.pose,&h,&kFlags,0.f))continue;
+                if(!gunSweep(&dir,best,geometry.bytes,&pose,s.geometry,&s.pose,&h,&kFlags,0.f))continue;
                 if(gunHitNormalAt<0) {
                     for(int at=16;at<=64 && gunHitNormalAt<0;at+=4) {
                         const float* f=reinterpret_cast<const float*>(h.bytes+at);
@@ -809,7 +827,7 @@ bool GunMove(const Vec3& target,const Quat& turn,Vec3* push) {
                     Log("[gunshape] a sweep's normal is at +%d\n",gunHitNormalAt);
                     if(gunHitNormalAt<0) {
                         gunSweepBad=true;
-                        return GunQueryInner(target,turn,push);
+                        return GunQueryInner(m,target,turn,push);
                     }
                 }
                 const float* f=reinterpret_cast<const float*>(h.bytes+gunHitNormalAt);
@@ -831,11 +849,12 @@ bool GunMove(const Vec3& target,const Quat& turn,Vec3* push) {
     }
     if((pos.x-target.x)*(pos.x-target.x)+(pos.y-target.y)*(pos.y-target.y)+(pos.z-target.z)*(pos.z-target.z)>kGiveUp*kGiveUp) {
         ++gunGaveUp;
+        ++m.gaveUp;
         pos=target;
     }
-    GunTether(pos,turn);
+    GunTether(m,pos,turn);
     *push={pos.x-target.x,pos.y-target.y,pos.z-target.z};
-    gunPrev=pos;
+    m.prev=pos;
     return true;
 }
 // WHERE A CALL'S TIME GOES: the slice of the near list against the move itself, summed until the next [gunshape] line.
@@ -846,17 +865,22 @@ inline double MsSince(const LARGE_INTEGER& t0) {
 }
 void GunCollectInner(const Vec3& at);
 double gunCollectMs=0;
-bool GunGuarded(const Vec3& at,const Quat& turn,const Vec3& center,Vec3* push) {
+bool GunGuarded(const Vec3& at,const Quat& turn,const Vec3& center,Vec3* push,bool worldGiven) {
     __try {
         LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
-        GunScanSlice(center);
+        if(!worldGiven) {
+            scanReach=gunRadius+1.5f;
+            collectReach=gunRadius+.5f;   // kGunMovingSlack, defined further on
+            collectAvoidOn=false;
+            GunScanSlice(center);
+        }
         gunScanMs+=MsSince(t0);
         if(!gunReady)return false;
         QueryPerformanceCounter(&t0);
-        GunCollectInner(center);
+        if(!worldGiven)GunCollectInner(center);
         gunCollectMs+=MsSince(t0);
         QueryPerformanceCounter(&t0);
-        const bool moved=GunMove(at,turn,push);
+        const bool moved=GunMove(gunMover,at,turn,push);
         gunMoveMs+=MsSince(t0);
         return moved;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -947,9 +971,13 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
     const float dx=c.x<whole.lo.x?whole.lo.x-c.x:(c.x>whole.hi.x?c.x-whole.hi.x:0.f);
     const float dy=c.y<whole.lo.y?whole.lo.y-c.y:(c.y>whole.hi.y?c.y-whole.hi.y:0.f);
     const float dz=c.z<whole.lo.z?whole.lo.z-c.z:(c.z>whole.hi.z?c.z-whole.hi.z:0.f);
-    const float reach=gunRadius+kGunMovingSlack;
+    const float reach=collectReach;
     if(!(dx*dx+dy*dy+dz*dz<=reach*reach))return;
     ++gunWalkBounds;
+    if(collectAvoidOn) {
+        const Vec3 a{collectAvoid.x-origin.x,collectAvoid.y-origin.y,collectAvoid.z-origin.z};
+        if(a.x>=whole.lo.x && a.x<=whole.hi.x && a.y>=whole.lo.y && a.y<=whole.hi.y && a.z>=whole.lo.z && a.z<=whole.hi.z)return;
+    }
     const bool stop=GunStopsAt(actor);
     const char* a=static_cast<const char*>(actor);
     const uint32_t proxy=*reinterpret_cast<const uint32_t*>(a+0x10),body=*reinterpret_cast<const uint16_t*>(a+0x14);
@@ -995,7 +1023,7 @@ inline void GunTouchConsider(void* actor,const Transform& gun,const Vec3& origin
 void GunCollectInner(const Vec3& at) {
     gunMovingCount=gunLooseCount=0;
     gunLooseFresh=false;
-    if(gunBoxCount==0 || gunProved<=0 || !ReadScenes())return;
+    if(gunMover.count==0 || gunProved<=0 || !ReadScenes())return;
     const Transform gun{Quat{0,0,0,1},at};
     const uint64_t now=GetTickCount64();
     const float jx=at.x-touchBuiltAt.x,jy=at.y-touchBuiltAt.y,jz=at.z-touchBuiltAt.z;
@@ -1019,18 +1047,17 @@ void GunCollectInner(const Vec3& at) {
     gunLooseFresh=true;
 }
 // WHAT THE GUN'S BOXES ARE IN, OF WHAT IT SHOVES, where it was put: from the shapes gathered this call before the move. One touch a body.
-int GunTouchInner(const Vec3& at,const Quat& turn) {
+int GunTouchInner(Mover& m,const Vec3& at,const Quat& turn) {
     gunTouchCount=0;
     if(!gunLooseFresh || !gunPenetration)return 0;
-    gunLooseFresh=false;
     const Transform gun{turn,at};
-    for(int b=0;b<gunBoxCount;++b) {
-        const GunBox& box=gunBoxes[b];
+    for(int b=0;b<m.count;++b) {
+        const GunBox& box=m.parts[b];
         const Quat boxTurn=Multiply(turn,box.q);
         const Vec3 middle=Apply(gun,box.center);
         const Vec3 ax=Rotate(boxTurn,{box.half.x,0,0}),ay=Rotate(boxTurn,{0,box.half.y,0}),az=Rotate(boxTurn,{0,0,box.half.z});
         const Vec3 extent{std::fabs(ax.x)+std::fabs(ay.x)+std::fabs(az.x),std::fabs(ax.y)+std::fabs(ay.y)+std::fabs(az.y),std::fabs(ax.z)+std::fabs(ay.z)+std::fabs(az.z)};
-        const BoxGeometry geometry{GeomBox,box.half};
+        PartGeom geometry;PartGeometry(box,geometry);
         for(int i=0;i<gunLooseCount;++i) {
             const LooseShape& l=gunLoose[i];
             const NearShape& s=l.s;
@@ -1043,7 +1070,7 @@ int GunTouchInner(const Vec3& at,const Quat& turn) {
             const Transform pose{boxTurn,p};
             Vec3 direction{};
             float depth=0;
-            if(!gunPenetration(&direction,&depth,&geometry,&pose,s.geometry,&s.pose) || !(depth>0.f) || !std::isfinite(depth))continue;
+            if(!gunPenetration(&direction,&depth,geometry.bytes,&pose,s.geometry,&s.pose) || !(depth>0.f) || !std::isfinite(depth))continue;
             gunTouches[gunTouchCount++]=GunTouch{l.proxy,l.body,direction,depth};
             if(gunTouchCount>=kGunMostTouches)return gunTouchCount;
         }
@@ -1164,7 +1191,7 @@ int ProxyBodiesGuarded(uint32_t proxy) {
     __except(EXCEPTION_EXECUTE_HANDLER) {return 0;}
 }
 int GunTouchGuarded(const Vec3& at,const Quat& turn) {
-    __try {return GunTouchInner(at,turn);}
+    __try {return GunTouchInner(gunMover,at,turn);}
     __except(EXCEPTION_EXECUTE_HANDLER) {gunTouchCount=0;return 0;}
 }
 int PickConeGuarded(const Vec3& from,const Vec3& a,const Vec3& b,float cone,float range,uint32_t kp,uint32_t kb,NearBody* out,int capacity) {
@@ -1714,9 +1741,9 @@ void VRBodyPhysXPos(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext:
 // THE GUN'S SHAPE, boxes in its own frame, and how far it must go to be out of the world's. W 1 with an answer, 0 while there is none yet (the near list takes a few frames).
 void VRGunBoxClear(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
     stack->code++;
-    gunBoxCount = 0;
+    gunMover.count = 0;
     gunRadius = .3f;
-    gunPrevOn = false;
+    gunMover.prevOn = false;
     gunTouchCount = 0;
     if (out) *out = true;
 }
@@ -1726,8 +1753,8 @@ void VRGunBoxAdd(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, 
     RED4ext::GetParameter(stack, &hi);
     stack->code++;
     bool added = false;
-    if (gunBoxCount < kGunMostBoxes && hi.X > lo.X && hi.Y > lo.Y && hi.Z > lo.Z) {
-        GunBox& b = gunBoxes[gunBoxCount++];
+    if (gunMover.count < kGunMostBoxes && hi.X > lo.X && hi.Y > lo.Y && hi.Z > lo.Z) {
+        GunBox& b = gunMover.parts[gunMover.count++];
         b.center = {(lo.X + hi.X) * .5f, (lo.Y + hi.Y) * .5f, (lo.Z + hi.Z) * .5f};
         b.half = {(hi.X - lo.X) * .5f, (hi.Y - lo.Y) * .5f, (hi.Z - lo.Z) * .5f};
         b.q = {0, 0, 0, 1};
@@ -1747,8 +1774,8 @@ void VRGunBoxAddTurned(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool*
     stack->code++;
     bool added = false;
     const float size = std::sqrt(turn.X * turn.X + turn.Y * turn.Y + turn.Z * turn.Z + turn.W * turn.W);
-    if (gunBoxCount < kGunMostBoxes && half.X > 0 && half.Y > 0 && half.Z > 0 && size > .5f && std::isfinite(size)) {
-        GunBox& b = gunBoxes[gunBoxCount++];
+    if (gunMover.count < kGunMostBoxes && half.X > 0 && half.Y > 0 && half.Z > 0 && size > .5f && std::isfinite(size)) {
+        GunBox& b = gunMover.parts[gunMover.count++];
         b.center = {mid.X, mid.Y, mid.Z};
         b.half = {half.X, half.Y, half.Z};
         b.q = {turn.X / size, turn.Y / size, turn.Z / size, turn.W / size};
@@ -1764,8 +1791,8 @@ void VRGunAnchor(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, 
     RED4ext::Vector4 at{};
     RED4ext::GetParameter(stack, &at);
     stack->code++;
-    gunAnchor = Vec3{at.X, at.Y, at.Z};
-    gunAnchorOn = std::isfinite(at.X + at.Y + at.Z);
+    gunMover.anchor = Vec3{at.X, at.Y, at.Z};
+    gunMover.anchorOn = std::isfinite(at.X + at.Y + at.Z);
     if (out) *out = true;
 }
 static double gunTouchTotal = 0;
@@ -1777,19 +1804,23 @@ void VRGunPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vect
     stack->code++;
     if (!out) return;
     *out = RED4ext::Vector4{0, 0, 0, 0};
-    if (gunBoxCount == 0 || proved < 0 || gunProved < 0) return;
+    if (gunMover.count == 0 || proved < 0 || gunProved < 0) return;
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
     const Vec3 center{at.X, at.Y, at.Z};
     const uint64_t now = GetTickCount64();
     const float dx = center.x - gunLastCenter.x, dy = center.y - gunLastCenter.y, dz = center.z - gunLastCenter.z;
-    if (!gunLastCall || now - gunLastCall > 500 || dx * dx + dy * dy + dz * dz > 1.f) GunForget();
+    const bool worldGiven = worldCenterTick && now - worldCenterTick < 150;
+    if (!gunLastCall || now - gunLastCall > 500 || dx * dx + dy * dy + dz * dz > 1.f) {
+        if (worldGiven) gunMover.prevOn = false;
+        else GunForget();
+    }
     gunLastCall = now;
     gunLastCenter = center;
     Vec3 push{};
-    const bool ok = GunGuarded(center, Quat{turn.X, turn.Y, turn.Z, turn.W}, center, &push);
+    const bool ok = GunGuarded(center, Quat{turn.X, turn.Y, turn.Z, turn.W}, center, &push, worldGiven);
     // w 2: moved by sweeps, so it cannot have gone through anything and no ray is needed
-    if (ok) *out = RED4ext::Vector4{push.x, push.y, push.z, gunPrevOn && gunSweep && !gunSweepBad ? 2.f : 1.f};
+    if (ok) *out = RED4ext::Vector4{push.x, push.y, push.z, gunMover.prevOn && gunSweep && !gunSweepBad ? 2.f : 1.f};
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     static double total = 0, most = 0;
@@ -1800,7 +1831,7 @@ void VRGunPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vect
     most = ms > most ? ms : most;
     ++calls;
     if (now - saidAt > 10000) {
-        Log("[gunshape] %d boxes, %d shapes near, %u calls, %.3f ms mean, %.3f most; loose things %.3f ms mean; brought back to the wrist's side %u, the hand too far from it %u\n", gunBoxCount, gunNearCount, calls, total / calls, most, gunTouchCalls ? gunTouchTotal / gunTouchCalls : 0.0, gunTethered, gunGaveUp);
+        Log("[gunshape] %d boxes, %d shapes near, %u calls, %.3f ms mean, %.3f most; loose things %.3f ms mean; brought back to the wrist's side %u, the hand too far from it %u\n", gunMover.count, gunNearCount, calls, total / calls, most, gunTouchCalls ? gunTouchTotal / gunTouchCalls : 0.0, gunTethered, gunGaveUp);
         Log("[gunshape] a call: near list slice %.3f ms, move %.3f ms; loose walk a call: %.0f actors, %.0f moving, %.0f within 4 m, %.1f near a box\n", gunScanMs / calls, gunMoveMs / calls,
             gunTouchCalls ? double(gunWalkActors) / gunTouchCalls : 0.0, gunTouchCalls ? double(gunWalkDynamic) / gunTouchCalls : 0.0,
             gunTouchCalls ? double(gunWalkNear) / gunTouchCalls : 0.0, gunTouchCalls ? double(gunWalkBounds) / gunTouchCalls : 0.0);
@@ -1824,10 +1855,169 @@ void VRGunPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vect
         const Vec3 saved = drawOffset;
         drawOffset = {0, 0, 0};
         const Transform gun{q, {center.x + push.x, center.y + push.y, center.z + push.z}};
-        for (int b = 0; b < gunBoxCount; ++b)
-            BoxLines(Transform{Multiply(q, gunBoxes[b].q), Apply(gun, gunBoxes[b].center)}, gunBoxes[b].half, (push.x != 0 || push.y != 0 || push.z != 0) ? Red : Orange);
+        for (int b = 0; b < gunMover.count; ++b)
+            BoxLines(Transform{Multiply(q, gunMover.parts[b].q), Apply(gun, gunMover.parts[b].center)}, gunMover.parts[b].half, (push.x != 0 || push.y != 0 || push.z != 0) ? Red : Orange);
         drawOffset = saved;
     }
+}
+
+uint32_t handCalls=0;
+double handMs=0;
+// VRWorldCenter(the chest, world) -> whether the world near it is known yet. Once a frame, before the gun and the hands: the near list
+// round the chest a slice at a time, and the moving things round it gathered. A jump of the chest or a pause throws both away.
+bool WorldGuarded(const Vec3& chest) {
+    __try {
+        LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
+        scanReach=kWorldReach;
+        collectReach=kWorldReach;
+        collectAvoid=chest;
+        collectAvoidOn=true;
+        GunScanSlice(chest);
+        gunScanMs+=MsSince(t0);
+        if(!gunReady)return false;
+        QueryPerformanceCounter(&t0);
+        GunCollectInner(chest);
+        gunCollectMs+=MsSince(t0);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        GunForget();
+        return false;
+    }
+}
+void VRWorldCenter(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    RED4ext::Vector4 at{};
+    RED4ext::GetParameter(stack, &at);
+    stack->code++;
+    if (out) *out = false;
+    if (proved < 0 || gunProved < 0) return;
+    const Vec3 chest{at.X, at.Y, at.Z};
+    const uint64_t now = GetTickCount64();
+    const float dx = chest.x - worldCenter.x, dy = chest.y - worldCenter.y, dz = chest.z - worldCenter.z;
+    if (!worldCenterTick || now - worldCenterTick > 500 || dx * dx + dy * dy + dz * dz > 1.f) GunForget();
+    worldCenterTick = now;
+    worldCenter = chest;
+    LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
+    const bool ready = WorldGuarded(chest);
+    static double worldMs = 0;
+    static uint32_t worldCalls = 0;
+    static uint64_t worldSaid = 0;
+    worldMs += MsSince(t0);
+    ++worldCalls;
+    if (now - worldSaid > 10000) {
+        Log("[world] round the chest: %d near shapes, %d moving that stop, %d loose; %.3f ms a frame for both lists; hands %u calls, %.3f ms mean\n",
+            gunNearCount, gunMovingCount, gunLooseCount, worldMs / worldCalls, handCalls, handCalls ? handMs / handCalls : 0.0);
+        worldSaid = now;
+        worldMs = 0;
+        worldCalls = 0;
+        handCalls = 0;
+        handMs = 0;
+    }
+    if (out) *out = ready;
+}
+// VRMoverClear(hand 0 left, 1 right); VRMoverCapsule(hand, middle, radius, half height, turn): a hand's shape, capsules along their X,
+// in the hand bone's frame (the wrist at its origin).
+void VRMoverClear(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    int32_t id = 0;
+    RED4ext::GetParameter(stack, &id);
+    stack->code++;
+    if (id >= 0 && id <= 1) {movers[id].count = 0;movers[id].prevOn = false;}
+    if (out) *out = id >= 0 && id <= 1;
+}
+void VRMoverCapsule(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    int32_t id = 0;
+    RED4ext::Vector4 mid{}, turn{};
+    float radius = 0, halfHeight = 0;
+    RED4ext::GetParameter(stack, &id);
+    RED4ext::GetParameter(stack, &mid);
+    RED4ext::GetParameter(stack, &radius);
+    RED4ext::GetParameter(stack, &halfHeight);
+    RED4ext::GetParameter(stack, &turn);
+    stack->code++;
+    bool added = false;
+    const float size = std::sqrt(turn.X * turn.X + turn.Y * turn.Y + turn.Z * turn.Z + turn.W * turn.W);
+    if (id >= 0 && id <= 1 && movers[id].count < kGunMostBoxes && radius > 0 && halfHeight >= 0 && size > .5f && std::isfinite(size)) {
+        GunBox& b = movers[id].parts[movers[id].count++];
+        b.center = {mid.X, mid.Y, mid.Z};
+        b.q = {turn.X / size, turn.Y / size, turn.Z / size, turn.W / size};
+        b.capsule = true;
+        b.radius = radius;
+        b.halfHeight = halfHeight;
+        b.half = {halfHeight + radius, radius, radius};
+        added = true;
+    }
+    if (out) *out = added;
+}
+// VRHandPush(hand, wrist where the solve wants it, the hand's turn, the chest; all world) -> how far the hand must go to be out of the world,
+// stopped and slid along it from where it was last call. W 2 by sweeps, 1 pushed out only, 0 no answer (the world not known yet).
+void VRHandPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vector4* out, int64_t) {
+    int32_t id = 0;
+    RED4ext::Vector4 at{}, turn{}, anchor{};
+    RED4ext::GetParameter(stack, &id);
+    RED4ext::GetParameter(stack, &at);
+    RED4ext::GetParameter(stack, &turn);
+    RED4ext::GetParameter(stack, &anchor);
+    stack->code++;
+    if (!out) return;
+    *out = RED4ext::Vector4{0, 0, 0, 0};
+    if (id < 0 || id > 1 || !gunReady || proved < 0 || gunProved < 0) return;
+    Mover& m = movers[id];
+    if (m.count == 0) return;
+    LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
+    const Vec3 target{at.X, at.Y, at.Z};
+    const uint64_t now = GetTickCount64();
+    const float dx = target.x - m.lastAt.x, dy = target.y - m.lastAt.y, dz = target.z - m.lastAt.z;
+    if (!m.lastCall || now - m.lastCall > 500 || dx * dx + dy * dy + dz * dz > 1.f) m.prevOn = false;
+    m.lastCall = now;
+    m.lastAt = target;
+    m.anchor = {anchor.X, anchor.Y, anchor.Z};
+    m.anchorOn = true;
+    m.anchorSkip = .12f;   // what the chest is in: a seat, a low beam (WORLD_INSIDE in HandCollision)
+    Vec3 push{};
+    bool ok = false;
+    __try {ok = GunMove(m, target, Quat{turn.X, turn.Y, turn.Z, turn.W}, &push);}
+    __except (EXCEPTION_EXECUTE_HANDLER) {GunForget();ok = false;}
+    if (ok) *out = RED4ext::Vector4{push.x, push.y, push.z, m.prevOn && gunSweep && !gunSweepBad ? 2.f : 1.f};
+    // THE HAND PROBE (2026-11-08): arms that moved by themselves once an arm was out past 40 cm. Said when a hand is pushed more than
+    // 10 cm, or the other way than the frame before, at most every 200 ms a hand and 80 times a session.
+    if (ok) {
+        static int said = 0;
+        const float size = std::sqrt(push.x * push.x + push.y * push.y + push.z * push.z);
+        const float last = std::sqrt(m.lastPush.x * m.lastPush.x + m.lastPush.y * m.lastPush.y + m.lastPush.z * m.lastPush.z);
+        const bool flipped = size > .02f && last > .02f && (push.x * m.lastPush.x + push.y * m.lastPush.y + push.z * m.lastPush.z) < -.5f * size * last;
+        if ((size > .10f || flipped || m.tethered) && said < 80 && now - m.saidAt > 200) {
+            ++said;
+            m.saidAt = now;
+            const float cx = target.x - m.anchor.x, cy = target.y - m.anchor.y, cz = target.z - m.anchor.z;
+            Log("[hand-probe] %s hand pushed %.3f m (%.2f %.2f %.2f)%s; the wrist %.2f m from the chest; tethered %u (hit %.2f m from the chest), gave up %u; swept %d; %d near shapes, %d moving\n",
+                id == 0 ? "left" : "right", size, push.x, push.y, push.z, flipped ? ", TURNED ROUND from the last frame" : "", std::sqrt(cx * cx + cy * cy + cz * cz),
+                m.tethered, m.tetherAt, m.gaveUp, m.prevOn ? 1 : 0, gunNearCount, gunMovingCount);
+        }
+        m.tethered = 0;
+        m.gaveUp = 0;
+        m.lastPush = push;
+    }
+    handMs += MsSince(t0);
+    ++handCalls;
+}
+// VRHandTouches(hand, wrist, turn) -> how many loose bodies the hand is in; read with VRGunTouchOf / VRGunTouchWay as the gun's.
+int HandTouchGuarded(int id,const Vec3& at,const Quat& turn) {
+    __try {return GunTouchInner(movers[id],at,turn);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {gunTouchCount=0;return 0;}
+}
+void VRHandTouches(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, int32_t* out, int64_t) {
+    int32_t id = 0;
+    RED4ext::Vector4 at{}, turn{};
+    RED4ext::GetParameter(stack, &id);
+    RED4ext::GetParameter(stack, &at);
+    RED4ext::GetParameter(stack, &turn);
+    stack->code++;
+    int n = 0;
+    if (id >= 0 && id <= 1 && movers[id].count > 0) n = HandTouchGuarded(id, Vec3{at.X, at.Y, at.Z}, Quat{turn.X, turn.Y, turn.Z, turn.W});
+    if (out) *out = n;
+}
+void VRHandRaysOn(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
+    stack->code++;
+    if (out) *out = g_liveControls.xrHandRays != 0;
 }
 
 // VRGunTouches(at, turn) -> how many loose bodies the gun's boxes are in now; VRGunTouchOf(i) proxy, body; VRGunTouchWay(i) the way out of it, world, and how deep.
