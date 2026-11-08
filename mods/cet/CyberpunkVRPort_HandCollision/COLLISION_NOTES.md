@@ -70,7 +70,7 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 | Rays only for the gun (wrist to box middles/fronts) | Lines miss edges and rails; they only say "free until here". Kept only as a compare switch. |
 | One outline box per weapon | Mostly air (a pistol is an L in a rectangle). Generated multi-box shapes, then hand-drawn ones. |
 | An offset per attachment | Rejected by the user: attachments go exactly on the weapon's mount; only the mount is moved. |
-| WolvenKit CLI for mesh export | WolvenKit 9.1 CLI needs .NET 10 (not installed). Meshes are decoded straight from the serialized `.mesh.json` render buffers instead (`tools/weapon_blend/make_weapon_blend.py`). |
+| WolvenKit CLI for mesh export | WolvenKit 9.1 CLI needs .NET 10. Meshes are decoded straight from the serialized `.mesh.json` render buffers instead (`tools/weapon_blend/make_weapon_blend.py`). Since 2026-11-08 the CLI runs with the local runtime: `E:\cyberpunk_vr_port\tools\wk.sh` (sets `DOTNET_ROOT` to `tools\dotnet10`); used for listing archives and extracting `.app` files. |
 | A collider component on the weapon in WolvenKit | The game has no held-weapon collider (of 943 firearm meshes one has physics, a magazine box), and the mod would not read it. |
 
 ## The Blender workflow for gun boxes
@@ -84,7 +84,20 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
    writes `{cx, cy, cz, hx, hy, hz, qi, qj, qk, qr}` boxes. It computes world matrices itself: `matrix_world` is stale for
    objects in hidden collections when Blender runs headless.
 4. Close Blender before a script changes the `.blend`, or the open session overwrites it on the next save.
-5. Mesh JSONs: `E:\cyberpunk_vr_port\tools\extract\_meshj`, appearances `_appj`. Vertices are `PT_Short4N` positions in
+5. **The other 56 firearms** are in `E:\cyberpunk_vr_port\blender\weapons_boxes.blend` (2026-11-08), built with
+   `--ref-attachments mods/cet/CyberpunkVRPort_HandCollision/weapon_custom_boxes.lua` and the appearances in `_appj_all`: the
+   attachments there are locked references (`attachment_ref`, not read back), so the attachments drawn in `nue_boxes.blend` stay.
+   Read both files back in turn; tested on a copy: 57 weapons, Nue and all 30 attachments unchanged. Only the first weapon is shown;
+   the text block `attachments_on_weapon.py` hangs the attachments on the weapon whose collection is active. Starting boxes are the
+   generated ones and miss borrowed parts (e.g. the Sidewinder's stock).
+6. **Appearances:** every firearm `.app` was extracted with the WolvenKit CLI (`archive -l -r`, `extract -r '\\weapons\\firearms\\.*\.app$'`,
+   `convert serialize`) to `_apps_all` / `_appj_all` (311 files). The weapon's own `<family>.app` default is the whole weapon (body,
+   receiver, stock, mags); the part apps (`__base1_01`, `__rcv1_01`) hold one part each and are named unevenly (`__base1`, `__base_01`,
+   `kang_tao`, `submachinegun`), so `__base1_01.app` alone wrongly made receivers optional. **Some weapons borrow parts** with no
+   offset (skinned, same frame): Sidewinder = Copperhead receiver + stock, Igla/Palica/Testera = Satara receiver, Ashura = Nekomata
+   receiver. They are loaded as `<mesh>@<weapon>`. No own app: Lerus Teaseher, Techtronika Uragan (all their meshes are shown; their
+   frames look odd, check them). Tamayura's appearance is inside the Nue's app (`tamayura_default`).
+7. Mesh JSONs: `E:\cyberpunk_vr_port\tools\extract\_meshj`, appearances `_appj`. Vertices are `PT_Short4N` positions in
    stream 0, quantized by the header's scale/offset; indices are `IBCT_IndexUShort` at `indexBufferOffset + teOffset`.
    Skinned weapon meshes are in bind pose in the weapon frame. A magazine mesh is **not** in the weapon frame.
 
@@ -110,6 +123,11 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 - **Arms moving by themselves** once a hand was out past ~40 cm, seen once before a save load, not reproduced. Suspects:
   the chest tether hitting a surface ~40 cm ahead, or two overlapping meshes pushing a hand back and forth. `[hand-probe]`
   is there to catch it.
+- **Weapons with borrowed parts got another weapon's boxes** (fixed 2026-11-08, found from the `.app` component order, not yet tested in
+  game): `weaponBoxOf` took the family from the last component with a known weapon's name; Igla and Testera end on Satara parts, Unity on
+  Liberty's rail, some Sidewinder and Umbra skins on Copperhead and Masamune parts. Now the family with the highest score wins (body part
+  `__base` without `_rail` 100, anything else 1). Simulated on the component names of 452 appearances of the whole-weapon apps, also in
+  reverse order. "First `__base` wins" was not enough: the Tactician holds an Ashura `__base` piece, Umbra's neon skins a Masamune one.
 - The finger capsule is straight: a fist stops a few cm early against a flat wall.
 - Magazines have no box of their own (inside the grip they are covered; in the hand the hand capsule covers them).
 - Limits: 12 parts per body (`kGunMostBoxes`), 1024 tests per call (`kGunMostTests`), 14 ray targets (`GUN_SIDES`).

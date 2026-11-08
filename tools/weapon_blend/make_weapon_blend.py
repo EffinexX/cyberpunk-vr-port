@@ -1,8 +1,14 @@
 """Builds -- or adds to -- a .blend to draw weapon collision boxes by hand, from the game's own meshes. Run inside Blender:
 
     blender -b --python tools/weapon_blend/make_weapon_blend.py -- <dir of serialized .mesh.json> <dir of .app.json> <out .blend> <family> [<family> ...]
+        [--ref-attachments <weapon_custom_boxes.lua>]
 
 e.g. family w_handgun__tsunami_nue. Read back with read_weapon_blend.py.
+
+--ref-attachments: for a second .blend with more weapons. The attachments are shown with the boxes already drawn (in that .lua) and
+locked, as vrp_kind "attachment_ref", which read_weapon_blend.py does not write: they stay as drawn in the first .blend.
+Of the weapons made, only the first is shown; switch the others on in the Outliner. The text block attachments_on_weapon.py
+(Scripting tab, Run Script) hangs the attachments on the weapon whose collection is active.
 
 AN EXISTING FILE IS ADDED TO, NEVER REDONE: boxes, mounts and attachments already in it are kept as they are; what is missing is added,
 and parts are sorted into shown and optional (below) again.
@@ -32,6 +38,13 @@ import sys
 import bpy
 
 argv = sys.argv[sys.argv.index("--") + 1:]
+# --ref-attachments <weapon_custom_boxes.lua>: the attachments are only shown, with the boxes already drawn there, and are not read
+# back (vrp_kind "attachment_ref"), so a second .blend for more weapons cannot overwrite the attachments drawn in the first.
+REF_ATTACH = None
+if "--ref-attachments" in argv:
+    i = argv.index("--ref-attachments")
+    REF_ATTACH = os.path.abspath(argv[i + 1])
+    del argv[i:i + 2]
 SRC, APPS, OUT, FAMILIES = argv[0], argv[1], os.path.abspath(argv[2]), [f.lower() for f in argv[3:]]
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DATA = os.path.join(REPO, "mods", "cet", "CyberpunkVRPort_HandCollision")
@@ -63,26 +76,68 @@ def read_lua_table(path):
     return out
 
 
+_APP_DEFAULTS = None
+
+
+def app_defaults():
+    """{app file stem: meshes of its default appearance}, for every .app.json in APPS (read once)."""
+    global _APP_DEFAULTS
+    if _APP_DEFAULTS is None:
+        _APP_DEFAULTS = {}
+        for path in glob.glob(os.path.join(APPS, "*.app.json")):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    root = json.load(f)["Data"]["RootChunk"]
+            except (ValueError, KeyError):
+                continue
+            names = set()
+            for ap in root.get("appearances") or []:
+                d = ap.get("Data", ap) or {}
+                n = str(d.get("name", {}).get("$value", ""))
+                if n != "default" and not n.endswith("_default"):
+                    continue
+                for c in d.get("components") or []:
+                    m = c.get("mesh")
+                    if isinstance(m, dict):
+                        p = str(m.get("DepotPath", {}).get("$value", "")).replace("\\", "/")
+                        if p:
+                            names.add(p.split("/")[-1].split(".")[0].lower())
+            _APP_DEFAULTS[os.path.basename(path)[:-len(".app.json")].lower()] = names
+    return _APP_DEFAULTS
+
+
 def default_meshes(family):
-    """The meshes of the weapon's default appearance, by name; None when the appearance file is not there."""
-    path = os.path.join(APPS, family + "__base1_01.app.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, encoding="utf-8") as f:
-        a = json.load(f)
-    for ap in a["Data"]["RootChunk"].get("appearances", []):
-        d = ap.get("Data", ap)
-        if d.get("name", {}).get("$value") != "default":
-            continue
-        names = set()
-        for c in d.get("components", []):
-            m = c.get("mesh")
-            if isinstance(m, dict):
-                p = str(m.get("DepotPath", {}).get("$value", "")).replace("\\", "/")
-                if p:
-                    names.add(p.split("/")[-1].split(".")[0].lower())
-        return names
-    return None
+    """The meshes of the weapon's default appearance, by name; None when no appearance holds the weapon.
+
+    The weapon's own app (<family>.app: body, receiver, stock, mags) is the one the game puts together; the part apps
+    (__base1_01, __rcv1_01, ...) each hold only their part, and their names vary (__base1, __base_01, kang_tao, submachinegun).
+    So: the weapon's own app; else the other whole-weapon apps holding its meshes; else every app whose default holds them."""
+    return default_sets(family)[0]
+
+
+def default_sets(family):
+    """(its own meshes in the default appearance or None, the meshes of other weapons it borrows there).
+
+    Some weapons are built on another's parts: the Sidewinder carries the Copperhead's receiver and stock, Igla, Palica and Testera
+    the Satara's receiver, the Ashura the Nekomata's. They are skinned meshes with no offset, so they sit in the weapon's frame."""
+    apps = app_defaults()
+    mine = lambda names: {n for n in names if n.startswith(family + "__")}
+    if mine(apps.get(family, ())):
+        pick = [family]
+    else:
+        holders = [stem for stem, names in apps.items() if mine(names)]
+        # its own apps first (another weapon's app may borrow a part: Unity's holds Liberty's), whole-weapon apps before part apps
+        own = [s for s in holders if s.startswith(family)]
+        whole = lambda stems: [s for s in stems if s.count("__") == 1]
+        pick = whole(own) or own or whole(holders) or holders
+    if not pick:
+        return None, set()
+    every = set().union(*(apps[s] for s in pick))
+    borrowed = set()
+    # only from the weapon's own apps: when it is found in another weapon's (Tamayura in the Nue's), that weapon's parts are not its
+    if any(s.startswith(family) for s in pick):
+        borrowed = {n for n in every if re.match(r"w_[a-z_]+__[a-z0-9_]+__", n) and not n.startswith(family + "__")}
+    return mine(every), borrowed
 
 
 def mesh_of(path):
@@ -183,6 +238,59 @@ def mount_empty(name, coll, guess, display):
     return ob, "kept (moved by hand)"
 
 
+def read_custom_attachments(path):
+    """weapon_custom_boxes.lua -> {attachment: [[cx, cy, cz, hx, hy, hz, qi, qj, qk, qr], ...]}."""
+    out, section, name = {}, False, None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("attachments = {"):
+                section = True
+                continue
+            if not section:
+                continue
+            m = re.match(r"([a-z0-9_]+) = \{$", s)
+            if m and m.group(1) != "boxes":
+                name = m.group(1)
+                out.setdefault(name, [])
+                continue
+            m = re.match(r"\{([-0-9., ]+)\},$", s)
+            if m and name:
+                out[name].append([float(x) for x in m.group(1).split(",")])
+    return out
+
+
+def layer_collection(lc, name):
+    if lc.collection.name == name:
+        return lc
+    for child in lc.children:
+        found = layer_collection(child, name)
+        if found:
+            return found
+    return None
+
+
+PREVIEW_TEXT = '''"""Hang the attachments on the weapon whose collection is active in the Outliner (click the collection, then Run Script).
+
+Only a preview: the attachments go on exactly at that weapon's muzzle / scope empties. Move those empties, not the attachments."""
+import bpy
+coll = bpy.context.view_layer.active_layer_collection.collection
+name = coll.name.split("/")[0]
+muzzle, scope = bpy.data.objects.get(name + "/muzzle"), bpy.data.objects.get(name + "/scope")
+if not (muzzle and scope):
+    raise SystemExit("Click a weapon's collection first (it has <weapon>/muzzle and <weapon>/scope).")
+n = 0
+for c in bpy.data.collections:
+    if c.get("vrp_kind") in ("attachment", "attachment_ref"):
+        root = bpy.data.objects.get(c.name + "/mount")
+        if root:
+            root.parent = muzzle if c.get("vrp_slot") == "muzzle" else scope
+            root.matrix_parent_inverse.identity()
+            n += 1
+print("attachments on", name, n)
+'''
+
+
 def material(name, rgba):
     m = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     m.diffuse_color = rgba
@@ -210,15 +318,35 @@ if atts is None:
     scene.collection.children.link(atts)
 
 first_mounts = None
+made = []
 for family in FAMILIES:
     coll = bpy.data.collections.get(family)
     if coll is None:
         coll = bpy.data.collections.new(family)
         scene.collection.children.link(coll)
+        made.append(family)
     coll["vrp_kind"] = "weapon"
     optional = child_collection(coll, family + "/optional", hidden=True)
-    shown = default_meshes(family)
+    shown, borrowed = default_sets(family)
     body, extra = [], []
+    # what it borrows from another weapon: its own object (the other weapon may be in the file too), always shown
+    tag = "@" + family.split("_")[-1][:8]
+    for name in sorted(borrowed):
+        if SKIP.search(name):
+            continue
+        path = os.path.join(SRC, name + ".mesh.json")
+        oname = (name + tag)[:63]
+        ob = bpy.data.objects.get(oname)
+        if ob is None and os.path.exists(path):
+            verts, faces = mesh_of(path)
+            if verts:
+                ob = mesh_object(oname, verts, faces, coll, grey)
+                ob["vrp_borrowed_from"] = name
+        if ob is not None:
+            is_optional = bool(OPTIONAL_ALWAYS.search(name))
+            link(ob, optional if is_optional else coll)
+            ob.data.materials[0] = pale if is_optional else grey
+            (extra if is_optional else body).append(oname)
     for path in files:
         name = os.path.basename(path).split(".")[0].lower()
         if not name.startswith(family + "__") or SKIP.search(name):
@@ -271,12 +399,13 @@ if first_mounts:
         if m:
             groups.setdefault(("scope", m.group(1)), []).append((name, path))
     kinds = {"muzzle": child_collection(atts, "muzzles"), "scope": child_collection(atts, "scopes")}
+    drawn = read_custom_attachments(REF_ATTACH) if REF_ATTACH else None
     for (slot, key), parts in sorted(groups.items()):
         if bpy.data.collections.get(key) is not None:
             continue
         ac = bpy.data.collections.new(key)
         kinds[slot].children.link(ac)
-        ac["vrp_kind"] = "attachment"
+        ac["vrp_kind"] = "attachment_ref" if drawn is not None else "attachment"
         ac["vrp_slot"] = slot
         root = bpy.data.objects.new(key + "/mount", None)
         root.empty_display_type = "PLAIN_AXES"
@@ -297,7 +426,16 @@ if first_mounts:
                     for i in range(3):
                         lo[i], hi[i] = min(lo[i], v[i]), max(hi[i], v[i])
         a = attach.get(key)
-        if slot == "muzzle":
+        if drawn is not None:
+            # shown as drawn in the other .blend, locked: this file does not write attachments
+            for i, b in enumerate(drawn.get(key, [])):
+                ob = box_object("box_%02d" % (i + 1), tuple(b[0:3]), tuple(b[3:6]), ac, parent=root)
+                ob.rotation_quaternion = (b[9], b[6], b[7], b[8])
+                ob.color = (0.3, 0.6, 1.0, 1.0)
+                ob.hide_select = True
+            if key not in drawn:
+                print("attachment", key, "has no drawn boxes in", REF_ATTACH)
+        elif slot == "muzzle":
             # today's box: 5 cm across, from the mount as far as the mesh reaches
             reach = a[3] if a else hi[1]
             box_object("box_01", (0.0, reach / 2, 0.0), (0.025, reach / 2, 0.025), ac, parent=root)
@@ -305,6 +443,14 @@ if first_mounts:
             box_object("box_01", tuple((lo[i] + hi[i]) / 2 for i in range(3)), tuple((hi[i] - lo[i]) / 2 for i in range(3)), ac, parent=root)
         ac.hide_viewport = key not in ("w_att__power_03", "w_att__scope_short_04")
         print("attachment", slot, key, len(parts), "meshes")
+
+# many weapons share the one frame: of the weapons made now only the first is shown, the others are switched on in the Outliner (eye)
+for family in made[1:]:
+    lc = layer_collection(bpy.context.view_layer.layer_collection, family)
+    if lc:
+        lc.hide_viewport = True
+text = bpy.data.texts.get("attachments_on_weapon.py") or bpy.data.texts.new("attachments_on_weapon.py")
+text.from_string(PREVIEW_TEXT)
 
 for screen in bpy.data.screens:
     for area in screen.areas:

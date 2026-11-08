@@ -1507,10 +1507,16 @@ local function weaponBoxOf(w)
     local base, family = nil, nil
     local reach, up, wide = 0.0, 0.0, 0.0
     local mounted, muzzleKey, scopeKey = '', nil, nil
+    -- Some weapons are built on another's parts (Igla and Testera on the Satara's receiver, Unity with Liberty's rail, a Masamune piece on
+    -- Umbra's neon skins), so the name that counts most is the weapon's: a body part weighs 100, any other 1, in any component order.
+    local score, best = {}, 0
     for i = 1, #cs do
         local name = NameToString(cs[i]:GetName()):lower()
         local fam = name:match('^(w_[%w_]-__[%w_]-)__')
-        if fam and WEAPON_BOXES[fam] then base, family = WEAPON_BOXES[fam], fam end
+        if fam and WEAPON_BOXES[fam] then
+            score[fam] = (score[fam] or 0) + ((name:find('__base', 1, true) and not name:find('_rail', 1, true)) and 100 or 1)
+            if score[fam] > best then best, base, family = score[fam], WEAPON_BOXES[fam], fam end
+        end
         local key = name:match('^(w_att_+%a+_%a+_%d+)') or name:match('^(w_att_+%a+_%d+)')
         local att = key and WEAPON_ATTACHMENTS[key]
         if att then
