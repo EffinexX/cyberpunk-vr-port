@@ -22,6 +22,8 @@
 #include "Natives/DebugView.hpp"
 #include "Natives/NativeFunctions.hpp"
 #include "Core/LiveControls.hpp"
+#include "Physics/ProxySolver.hpp"
+#include "Natives/PhysicsRuntime.hpp"
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/Scripting/Natives/Generated/Vector4.hpp>
 #include <Windows.h>
@@ -31,6 +33,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
 extern void Log(const char* fmt, ...);
 
@@ -83,15 +90,20 @@ constexpr int kTrianglesGetNbVertices=5,kTrianglesGetVertices=6,kTrianglesGetNbT
 template<class F> F Slot(void* object,int slot){return reinterpret_cast<F>((*reinterpret_cast<void***>(object))[slot]);}
 
 constexpr int kMaxScenes=32,kMaxHits=256,kMaxTriangles=1500,kMaxActors=40000,kMaxActorShapes=16;
-void* actorBuffer[kMaxActors];
-void* aggregateBuffer[kMaxActors];
+// ONE SET PER THREAD THAT WALKS PHYSX: the script's thread, the simulate detour, the worker (Natives/PhysicsRuntime.cpp). Each reads the scene list and the actor lists into its own.
+struct ScanBuffers {void* actors[kMaxActors];void* aggregates[kMaxActors];void* sceneList[kMaxScenes];void* owners[kMaxScenes];int count=0;};
+ScanBuffers scriptBuffers,simulateBuffers,workerBuffers;
+thread_local ScanBuffers* threadBuffers=nullptr;
+inline ScanBuffers& Buffers() {return threadBuffers?*threadBuffers:scriptBuffers;}
+#define actorBuffer (Buffers().actors)
+#define aggregateBuffer (Buffers().aggregates)
 int geometryCount[8];
 int shapeSamples=0;
 int sceneSaid[kMaxScenes];
 int sceneLast[kMaxScenes];
-void* scenes[kMaxScenes];
-void* sceneOwners[kMaxScenes];   // the game's object for each, when it is proved to be
-int sceneCount=0;
+#define scenes (Buffers().sceneList)
+#define sceneOwners (Buffers().owners)   // the game's object for each, when it is proved to be
+#define sceneCount (Buffers().count)
 int proved=0;      // 0 not yet, 1 yes, -1 no
 OverlapHit hitBuffer[kMaxHits];
 OverlapCallback callback;
@@ -510,10 +522,11 @@ inline void PartGeometry(const GunBox& b,PartGeom& g) {
 // A BODY THAT IS STOPPED BY THE WORLD (2026-11-08): the gun, and each hand. Its parts in its own frame, where it was left last call,
 // and what it must stay on this side of (the gun: the wrist; a hand: the chest).
 struct Mover {GunBox parts[kGunMostBoxes];int count=0;Vec3 prev{};bool prevOn=false;Vec3 anchor{};bool anchorOn=false;float anchorSkip=0;uint64_t lastCall=0;Vec3 lastAt{};
+    cvr::physics::State proxy{};Quat solvedTurn{0,0,0,1};uint64_t askedAt=0;
     uint32_t tethered=0,gaveUp=0;Vec3 lastPush{};uint64_t saidAt=0;float tetherAt=0;int lastHitPart=-1;
     // The last surface a sweep stopped it at, for the contact sounds (VRMoverContact): world point, the surface's normal, how fast it came at it, in which move.
     Vec3 contactAt{},contactNormal{};float contactSpeed=0,contactSlide=0;bool contactExact=false,contactEver=false,contactMoving=false;uint64_t moves=0,contactMove=0;int64_t lastMoveAt=0;};
-Mover movers[3];   // 0 the left hand, 1 the right, 2 the gun
+Mover movers[5];   // 0 the left hand, 1 the right, 2 the gun, 3 and 4 carried bodies
 Mover& gunMover=movers[2];
 NearShape gunNear[kGunNear],gunNext[kGunNear];
 int gunNearCount=0,gunNextCount=0;
@@ -523,9 +536,13 @@ bool gunReady=false,gunNextFull=false;
 // Copies, from this call's fresh lists from PhysX; never kept past it.
 constexpr int kGunMostMoving=256;
 struct LooseShape {NearShape s;uint32_t proxy,body;};
-NearShape gunMoving[kGunMostMoving];
-LooseShape gunLoose[kGunMostMoving];
-int gunMovingCount=0,gunLooseCount=0;
+// WHAT SOLVES READ IS PUBLISHED, under worldLock: solves hold it shared (the animation thread as well as the script's), publishing holds it exclusive for a copy.
+SRWLOCK worldLock=SRWLOCK_INIT;
+NearShape gunMoving[kGunMostMoving],gunMovingBack[kGunMostMoving];
+LooseShape gunLoose[kGunMostMoving],gunLooseBack[kGunMostMoving];
+int gunMovingCount=0,gunLooseCount=0,gunMovingBackCount=0,gunLooseBackCount=0;
+std::atomic<bool> forgetAsked{false};
+struct SrwExclusive {SRWLOCK& l;explicit SrwExclusive(SRWLOCK& a):l(a){AcquireSRWLockExclusive(&l);}~SrwExclusive(){ReleaseSRWLockExclusive(&l);}};
 bool gunLooseFresh=false;
 // What was decided about a kinematic actor, kept: asking the game for a mass is the slow part. The ids guard against the pointer being reused.
 struct KinematicSeen {uint32_t proxy,body;bool loose;};
@@ -566,7 +583,16 @@ void GunSayMoving(int i,const char* how) {
         s.bounds.hi.x-s.bounds.lo.x,s.bounds.hi.y-s.bounds.lo.y,s.bounds.hi.z-s.bounds.lo.z,s.query[0],s.query[1],s.query[2],s.query[3],s.sim[0],s.sim[1],s.sim[2],s.sim[3]);
 }
 inline const NearShape& GunObstacle(int i) {return i<gunNearCount?gunNear[i]:gunMoving[i-gunNearCount];}
-void GunForget() {gunNearCount=gunNextCount=0;gunReady=false;gunNextFull=false;gunScene=-1;gunStart=0;for(Mover& m:movers)m.prevOn=false;gunMovingCount=gunLooseCount=0;gunLooseFresh=false;gunKinematicSeen.clear();}
+// ASKED FROM ANYWHERE, EVEN UNDER worldLock OR FROM AN EXCEPTION HANDLER: until ForgetNow has run on the thread that owns the lists, nothing is solved against them.
+void GunForget() {forgetAsked=true;for(Mover& m:movers)m.prevOn=false;}
+void ForgetNow() {
+    if(!forgetAsked.exchange(false))return;
+    AcquireSRWLockExclusive(&worldLock);
+    gunNearCount=gunNextCount=0;gunReady=false;gunNextFull=false;gunScene=-1;gunStart=0;
+    for(Mover& m:movers)m.prevOn=false;
+    gunMovingCount=gunLooseCount=gunMovingBackCount=gunLooseBackCount=0;gunLooseFresh=false;gunKinematicSeen.clear();
+    ReleaseSRWLockExclusive(&worldLock);
+}
 bool GunProveShape(void* shape) {
     if(gunProved)return gunProved>0;
     const uintptr_t dll=reinterpret_cast<uintptr_t>(GetModuleHandleA("PhysX3_x64.dll"));
@@ -690,9 +716,11 @@ void GunScanSlice(const Vec3& center) {
         if(got<kGunSlice) {++gunScene;gunStart=0;}
     }
     if(gunScene>=sceneCount) {
+        AcquireSRWLockExclusive(&worldLock);
         std::memcpy(gunNear,gunNext,sizeof(NearShape)*size_t(gunNextCount));
         gunNearCount=gunNextCount;
         gunReady=gunProved>0;
+        ReleaseSRWLockExclusive(&worldLock);
         if(gunNextFull && gunSaid<3) {++gunSaid;Log("[gunshape] more than %d shapes near\n",kGunNear);}
         gunScene=-1;
         gunLastAsked=gunScanAsked;gunLastScenes=gunScanScenes;
@@ -782,7 +810,256 @@ void GunTether(Mover& m,Vec3& pos,const Quat& turn) {
 // that is the far side of a crate once the hand has gone down far enough. This never crosses a surface, as a game's character controller does not. What it turned into this frame is still pushed out,
 // which is a small thing; and when the hand has gone further from it than an arm should, the gun comes, on the wrist's side of what is there. At .6 m it came straight through: a rifle held out at a wall reaches that
 // before the wrist has got to the wall, and then only the hand stopped.
+// +40 FIRST, as the game's log has always measured: a scan from +16 can stop at +32, where the end of the hit position and the normal's x can pass for a unit vector (found by tests/physics, 2026-11-08).
+void GunFindNormal(const uint8_t* bytes,float most) {
+    const auto fits=[&](int at) {
+        const float* f=reinterpret_cast<const float*>(bytes+at);
+        const float size=f[0]*f[0]+f[1]*f[1]+f[2]*f[2];
+        return size>.99f && size<1.01f && f[3]>=0.f && f[3]<=most+1e-3f;
+    };
+    if(fits(40))gunHitNormalAt=40;
+    else for(int at=36;at<=64 && gunHitNormalAt<0;at+=4)if(fits(at))gunHitNormalAt=at;
+    Log("[gunshape] a sweep's normal is at +%d\n",gunHitNormalAt);
+}
+// THE WORLD AS THE SOLVER SEES IT (include/Physics/ProxySolver.hpp): the published obstacles, each culled by its bounds. Under worldLock, shared.
+class MoverWorld:public cvr::physics::IWorld {
+    int tests=0;
+    static constexpr int kMost=4096;
+    using P=cvr::physics::Pose;
+    static Vec3 Extent(const GunBox& b,const Quat& q) {
+        const Vec3 ax=Rotate(q,{b.half.x,0,0}),ay=Rotate(q,{0,b.half.y,0}),az=Rotate(q,{0,0,b.half.z});
+        return {std::fabs(ax.x)+std::fabs(ay.x)+std::fabs(az.x),std::fabs(ax.y)+std::fabs(ay.y)+std::fabs(az.y),std::fabs(ax.z)+std::fabs(ay.z)+std::fabs(az.z)};
+    }
+    static GunBox Box(const cvr::physics::Part& p) {
+        GunBox b;
+        b.center={p.center.x,p.center.y,p.center.z};b.half={p.half.x,p.half.y,p.half.z};b.q={p.q.x,p.q.y,p.q.z,p.q.w};b.capsule=p.capsule;b.radius=p.radius;b.halfHeight=p.halfHeight;
+        return b;
+    }
+public:
+    bool Sweep(const cvr::physics::Part& part,const P& pose,const cvr::physics::V3& dir,float distance,cvr::physics::Hit& out) override {
+        constexpr uint16_t kFlags=1|2|4|16|128|256;
+        const GunBox box=Box(part);
+        PartGeom geometry;PartGeometry(box,geometry);
+        const Quat q{pose.q.x,pose.q.y,pose.q.z,pose.q.w};
+        const Vec3 extent=Extent(box,q),way{dir.x,dir.y,dir.z};
+        bool any=false;
+        float best=distance;
+        for(int i=0;i<GunObstacleCount() && tests<kMost;++i) {
+            const NearShape& s=GunObstacle(i);
+            const Vec3 p{pose.p.x-s.origin.x,pose.p.y-s.origin.y,pose.p.z-s.origin.z};
+            const Vec3 e{p.x+way.x*best,p.y+way.y*best,p.z+way.z*best};
+            if((p.x<e.x?p.x:e.x)-extent.x>s.bounds.hi.x || (p.x>e.x?p.x:e.x)+extent.x<s.bounds.lo.x || (p.y<e.y?p.y:e.y)-extent.y>s.bounds.hi.y || (p.y>e.y?p.y:e.y)+extent.y<s.bounds.lo.y ||
+               (p.z<e.z?p.z:e.z)-extent.z>s.bounds.hi.z || (p.z>e.z?p.z:e.z)+extent.z<s.bounds.lo.z)continue;
+            ++tests;
+            const Transform t{q,p};
+            SweepHit h{};
+            if(!gunSweep(&way,best,geometry.bytes,&t,s.geometry,&s.pose,&h,&kFlags,0.f))continue;
+            if(gunHitNormalAt<0) {
+                GunFindNormal(h.bytes,best);
+                if(gunHitNormalAt<0) {gunSweepBad=true;return false;}
+            }
+            const float* f=reinterpret_cast<const float*>(h.bytes+gunHitNormalAt);
+            const float size=f[0]*f[0]+f[1]*f[1]+f[2]*f[2];
+            if(!(size>.9f && size<1.1f) || !(f[3]>=0.f) || !std::isfinite(f[3]) || f[3]>best)continue;
+            best=f[3];
+            any=true;
+            out.distance=f[3];
+            out.normal={f[0],f[1],f[2]};
+            out.moving=i>=gunNearCount;
+            const cvr::physics::V3 said{f[-3]+s.origin.x,f[-2]+s.origin.y,f[-1]+s.origin.z};
+            const cvr::physics::V3 stopped{pose.p.x+way.x*f[3],pose.p.y+way.y*f[3],pose.p.z+way.z*f[3]};
+            const float reach=(box.capsule?box.radius+box.halfHeight:std::sqrt(box.half.x*box.half.x+box.half.y*box.half.y+box.half.z*box.half.z))+.05f;
+            const bool exact=gunHitNormalAt>=12 && std::isfinite(said.x+said.y+said.z) && cvr::physics::Length(said-stopped)<=reach;
+            out.pointExact=exact;
+            out.point=exact?said:stopped;
+            GunSayMoving(i,"stopped");
+        }
+        return any;
+    }
+    bool Penetration(const cvr::physics::Part& part,const P& pose,cvr::physics::V3& way,float& depth) override {
+        const GunBox box=Box(part);
+        PartGeom geometry;PartGeometry(box,geometry);
+        const Quat q{pose.q.x,pose.q.y,pose.q.z,pose.q.w};
+        const Vec3 extent=Extent(box,q);
+        bool any=false;
+        depth=0;
+        for(int i=0;i<GunObstacleCount() && tests<kMost;++i) {
+            const NearShape& s=GunObstacle(i);
+            const Vec3 p{pose.p.x-s.origin.x,pose.p.y-s.origin.y,pose.p.z-s.origin.z};
+            if(p.x+extent.x<s.bounds.lo.x || p.x-extent.x>s.bounds.hi.x || p.y+extent.y<s.bounds.lo.y || p.y-extent.y>s.bounds.hi.y || p.z+extent.z<s.bounds.lo.z || p.z-extent.z>s.bounds.hi.z)continue;
+            ++tests;
+            const Transform t{q,p};
+            Vec3 d{};
+            float e=0;
+            if(!gunPenetration(&d,&e,geometry.bytes,&t,s.geometry,&s.pose) || !(e>depth) || !std::isfinite(e))continue;
+            depth=e;way={d.x,d.y,d.z};any=true;
+            GunSayMoving(i,"pushed out");
+        }
+        return any;
+    }
+    bool Line(const cvr::physics::V3& from,const cvr::physics::V3& dir,float length,float skip,cvr::physics::Hit& out) override {
+        if(gunHitNormalAt<0)return false;
+        constexpr float kThin=.003f;
+        constexpr uint16_t kFlags=1|2|4|16|128|256;
+        const BoxGeometry thin{GeomBox,{kThin,kThin,kThin}};
+        const Vec3 way{dir.x,dir.y,dir.z};
+        bool any=false;
+        float best=length;
+        for(int i=0;i<GunObstacleCount() && tests<kMost;++i) {
+            const NearShape& s=GunObstacle(i);
+            const Vec3 p{from.x-s.origin.x,from.y-s.origin.y,from.z-s.origin.z};
+            const Vec3 e{p.x+way.x*length,p.y+way.y*length,p.z+way.z*length};
+            if((p.x<e.x?p.x:e.x)-kThin>s.bounds.hi.x || (p.x>e.x?p.x:e.x)+kThin<s.bounds.lo.x || (p.y<e.y?p.y:e.y)-kThin>s.bounds.hi.y || (p.y>e.y?p.y:e.y)+kThin<s.bounds.lo.y ||
+               (p.z<e.z?p.z:e.z)-kThin>s.bounds.hi.z || (p.z>e.z?p.z:e.z)+kThin<s.bounds.lo.z)continue;
+            ++tests;
+            const Transform t{Quat{0,0,0,1},p};
+            SweepHit h{};
+            if(!gunSweep(&way,best,&thin,&t,s.geometry,&s.pose,&h,&kFlags,0.f))continue;
+            const float* f=reinterpret_cast<const float*>(h.bytes+gunHitNormalAt);
+            if(f[3]>=skip && f[3]<=best && std::isfinite(f[3])) {best=f[3];any=true;out.distance=f[3];out.normal={f[0],f[1],f[2]};}
+        }
+        return any;
+    }
+};
+// RECORDING FOR tests/physics: with a file physics_record.on beside the plugin, the gun's parts, what is near it that a test can rebuild (boxes, capsules, spheres) and its tracked pose, for 60 s.
+struct Recorder {
+    FILE* f=nullptr;uint64_t until=0,checked=0,shapesAt=0;
+    int written=0;
+    // A mesh or a hull as world triangles, those within 1.5 m of the gun. A refresh is capped: this runs in the frame, though only while a recording was asked for.
+    void Tri(const NearShape& s,const Vec3& scale,const Vec3& a,const Vec3& b,const Vec3& c,const cvr::physics::Pose& t) {
+        if(written>=4000)return;
+        const Vec3 p[3]={a,b,c};
+        Vec3 w[3];
+        bool close=false;
+        for(int i=0;i<3;++i) {
+            w[i]=Apply(s.pose,Vec3{p[i].x*scale.x,p[i].y*scale.y,p[i].z*scale.z});
+            w[i]={w[i].x+s.origin.x,w[i].y+s.origin.y,w[i].z+s.origin.z};
+            const float dx=w[i].x-t.p.x,dy=w[i].y-t.p.y,dz=w[i].z-t.p.z;
+            if(dx*dx+dy*dy+dz*dz<2.25f)close=true;
+        }
+        if(!close)return;
+        ++written;
+        fprintf(f,"tri %f %f %f %f %f %f %f %f %f\n",w[0].x,w[0].y,w[0].z,w[1].x,w[1].y,w[1].z,w[2].x,w[2].y,w[2].z);
+    }
+    void Surface(const NearShape& s,const cvr::physics::Pose& t) {
+        if(s.type==GeomConvex) {
+            const auto* g=reinterpret_cast<const ConvexGeometry*>(s.geometry);
+            const Vec3* verts=Slot<const Vec3*(*)(void*)>(g->mesh,kConvexGetVertices)(g->mesh);
+            const uint8_t* idx=Slot<const uint8_t*(*)(void*)>(g->mesh,kConvexGetIndexBuffer)(g->mesh);
+            const uint32_t polygons=Slot<uint32_t(*)(void*)>(g->mesh,kConvexGetNbPolygons)(g->mesh);
+            const auto getPolygon=Slot<bool(*)(void*,uint32_t,HullPolygon*)>(g->mesh,kConvexGetPolygon);
+            if(!verts || !idx)return;
+            for(uint32_t i=0;i<polygons;++i) {
+                HullPolygon poly{};
+                if(!getPolygon(g->mesh,i,&poly))continue;
+                for(int k=2;k<poly.count;++k)Tri(s,g->scale,verts[idx[poly.base]],verts[idx[poly.base+k-1]],verts[idx[poly.base+k]],t);
+            }
+            return;
+        }
+        const auto* m=reinterpret_cast<const TriangleGeometry*>(s.geometry);
+        const Vec3* verts=Slot<const Vec3*(*)(void*)>(m->mesh,kTrianglesGetVertices)(m->mesh);
+        const uint32_t count=Slot<uint32_t(*)(void*)>(m->mesh,kTrianglesGetNbVertices)(m->mesh);
+        const uint32_t tris=Slot<uint32_t(*)(void*)>(m->mesh,kTrianglesGetNbTriangles)(m->mesh);
+        const void* data=Slot<const void*(*)(void*)>(m->mesh,kTrianglesGetTriangles)(m->mesh);
+        uint8_t flags=0;
+        Slot<void*(*)(void*,uint8_t*)>(m->mesh,kTrianglesGetFlags)(m->mesh,&flags);
+        if(!verts || !data)return;
+        const bool shortIndices=(flags&2)!=0;
+        for(uint32_t i=0;i<tris;++i) {
+            uint32_t k[3];
+            for(int c=0;c<3;++c)k[c]=shortIndices?static_cast<const uint16_t*>(data)[i*3+c]:static_cast<const uint32_t*>(data)[i*3+c];
+            if(k[0]<count && k[1]<count && k[2]<count)Tri(s,m->scale,verts[k[0]],verts[k[1]],verts[k[2]],t);
+        }
+    }
+    void Tick(const Mover& m,const cvr::physics::Pose& t) {
+        const uint64_t now=GetTickCount64();
+        if(!f && now-checked>2000) {
+            checked=now;
+            char dir[MAX_PATH];
+            if(GetModuleFileNameA(reinterpret_cast<HMODULE>(&__ImageBase),dir,MAX_PATH)) {
+                std::string base(dir);
+                base=base.substr(0,base.find_last_of("\\/")+1);
+                if(GetFileAttributesA((base+"physics_record.on").c_str())!=INVALID_FILE_ATTRIBUTES && !fopen_s(&f,(base+"physics_replay.txt").c_str(),"w") && f) {
+                    until=now+60000;shapesAt=0;
+                    DeleteFileA((base+"physics_record.on").c_str());
+                    for(int b=0;b<m.count;++b) {
+                        const GunBox& p=m.parts[b];
+                        fprintf(f,"part %f %f %f %f %f %f %f %f %f %f %d %f %f\n",p.center.x,p.center.y,p.center.z,p.half.x,p.half.y,p.half.z,p.q.x,p.q.y,p.q.z,p.q.w,p.capsule?1:0,p.radius,p.halfHeight);
+                    }
+                    Log("[physics] recording the gun for 60 s\n");
+                }
+            }
+        }
+        if(!f)return;
+        if(now>until) {fclose(f);f=nullptr;Log("[physics] recording done\n");return;}
+        if(now-shapesAt>500) {
+            shapesAt=now;
+            written=0;
+            fprintf(f,"clear\n");
+            for(int i=0;i<GunObstacleCount();++i) {
+                const NearShape& s=GunObstacle(i);
+                if(s.type==GeomTriangles || s.type==GeomConvex) {Surface(s,t);continue;}
+                if(s.type!=GeomBox && s.type!=GeomCapsule && s.type!=GeomSphere)continue;
+                Vec3 half{};float radius=0,hh=0;
+                if(s.type==GeomBox)half=reinterpret_cast<const BoxGeometry*>(s.geometry)->half;
+                else if(s.type==GeomCapsule) {radius=reinterpret_cast<const CapsuleGeometry*>(s.geometry)->radius;hh=reinterpret_cast<const CapsuleGeometry*>(s.geometry)->halfHeight;}
+                else radius=reinterpret_cast<const SphereGeometry*>(s.geometry)->radius;
+                fprintf(f,"shape %d %f %f %f %f %f %f %f %f %f %f %f %f\n",s.type==GeomBox?3:s.type==GeomCapsule?2:0,half.x,half.y,half.z,radius,hh,s.pose.q.x,s.pose.q.y,s.pose.q.z,s.pose.q.w,s.pose.p.x+s.origin.x,s.pose.p.y+s.origin.y,s.pose.p.z+s.origin.z);
+            }
+        }
+        fprintf(f,"frame %f %f %f %f %f %f %f\n",t.q.x,t.q.y,t.q.z,t.q.w,t.p.x,t.p.y,t.p.z);
+    }
+} recorder;
+// A MOVE BY THE SOLVER, for every mover: rotation stepped, the answer shared between going and turning (turnAnswer, only where the caller can use a turn).
+cvr::physics::Result ProxyMove(Mover& m,const cvr::physics::Pose& tracked,bool turnAnswer) {
+    namespace ph=cvr::physics;
+    ph::Part parts[kGunMostBoxes];
+    for(int b=0;b<m.count;++b) {
+        const GunBox& g=m.parts[b];
+        parts[b].center={g.center.x,g.center.y,g.center.z};parts[b].half={g.half.x,g.half.y,g.half.z};parts[b].q={g.q.x,g.q.y,g.q.z,g.q.w};parts[b].capsule=g.capsule;parts[b].radius=g.radius;parts[b].halfHeight=g.halfHeight;
+    }
+    MoverWorld world;
+    ph::Options o;
+    o.turnAnswer=turnAnswer;
+    m.proxy.on=m.prevOn;
+    const ph::V3 anchor{m.anchor.x,m.anchor.y,m.anchor.z};
+    if(&m==&gunMover)recorder.Tick(m,tracked);
+    const ph::Result r=ph::Solve(world,parts,m.count,m.proxy,tracked,m.anchorOn?&anchor:nullptr,m.anchorSkip,o);
+    LARGE_INTEGER at,freq;
+    QueryPerformanceCounter(&at);QueryPerformanceFrequency(&freq);
+    float dt=m.lastMoveAt?float(double(at.QuadPart-m.lastMoveAt)/double(freq.QuadPart)):.011f;
+    dt=dt<.004f?.004f:dt>.1f?.1f:dt;
+    m.lastMoveAt=at.QuadPart;
+    ++m.moves;
+    if(r.tethered) {++m.tethered;++gunTethered;}
+    if(r.gaveUp) {++m.gaveUp;++gunGaveUp;}
+    if(r.contact && (r.lastHit.normal.x!=0.f || r.lastHit.normal.y!=0.f || r.lastHit.normal.z!=0.f)) {
+        const Vec3 moved{r.pose.p.x-m.prev.x,r.pose.p.y-m.prev.y,r.pose.p.z-m.prev.z};
+        const Vec3 n{r.lastHit.normal.x,r.lastHit.normal.y,r.lastHit.normal.z};
+        const float off=moved.x*n.x+moved.y*n.y+moved.z*n.z;
+        const Vec3 along{moved.x-n.x*off,moved.y-n.y*off,moved.z-n.z*off};
+        const Vec3 want{tracked.p.x-m.prev.x,tracked.p.y-m.prev.y,tracked.p.z-m.prev.z};
+        const float toward=-(want.x*n.x+want.y*n.y+want.z*n.z);
+        m.contactAt={r.lastHit.point.x,r.lastHit.point.y,r.lastHit.point.z};
+        m.contactNormal=n;
+        m.contactExact=r.lastHit.pointExact;
+        m.contactMoving=r.lastHit.moving;
+        m.contactSpeed=toward>0.f?toward/dt:0.f;
+        m.contactSlide=std::sqrt(along.x*along.x+along.y*along.y+along.z*along.z)/dt;
+        m.contactMove=m.moves;
+        m.contactEver=true;
+    }
+    m.prev={r.pose.p.x,r.pose.p.y,r.pose.p.z};
+    m.solvedTurn={r.pose.q.x,r.pose.q.y,r.pose.q.z,r.pose.q.w};
+    m.prevOn=true;
+    return r;
+}
 bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
+    if(g_liveControls.xrNativePhysics && gunSweep && !gunSweepBad) {
+        const cvr::physics::Result r=ProxyMove(m,cvr::physics::Pose{{turn.x,turn.y,turn.z,turn.w},{target.x,target.y,target.z}},false);
+        *push={r.pose.p.x-target.x,r.pose.p.y-target.y,r.pose.p.z-target.z};
+        return true;
+    }
     constexpr float kSkin=.002f,kGiveUp=1.f;
     constexpr uint16_t kFlags=1|2|4|16|128|256;   // position, normal, distance, assume no overlap at the start, both sides of a mesh, precise
     *push={0,0,0};
@@ -835,12 +1112,7 @@ bool GunMove(Mover& m,const Vec3& target,const Quat& turn,Vec3* push) {
                 SweepHit h{};
                 if(!gunSweep(&dir,best,geometry.bytes,&pose,s.geometry,&s.pose,&h,&kFlags,0.f))continue;
                 if(gunHitNormalAt<0) {
-                    for(int at=16;at<=64 && gunHitNormalAt<0;at+=4) {
-                        const float* f=reinterpret_cast<const float*>(h.bytes+at);
-                        const float size=f[0]*f[0]+f[1]*f[1]+f[2]*f[2];
-                        if(size>.99f && size<1.01f && f[3]>=0.f && f[3]<=best+1e-3f)gunHitNormalAt=at;
-                    }
-                    Log("[gunshape] a sweep's normal is at +%d\n",gunHitNormalAt);
+                    GunFindNormal(h.bytes,best);
                     if(gunHitNormalAt<0) {
                         gunSweepBad=true;
                         return GunQueryInner(m,target,turn,push);
@@ -903,9 +1175,19 @@ inline double MsSince(const LARGE_INTEGER& t0) {
 }
 void GunCollectInner(const Vec3& at);
 double gunCollectMs=0;
+// Its own function: an exception inside the guard must not leave the lock held, or the next publish waits for ever.
+bool GunMoveLocked(const Vec3& at,const Quat& turn,Vec3* push) {
+    AcquireSRWLockShared(&worldLock);
+    bool moved=false;
+    __try {moved=GunMove(gunMover,at,turn,push);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {GunForget();moved=false;}
+    ReleaseSRWLockShared(&worldLock);
+    return moved;
+}
 bool GunGuarded(const Vec3& at,const Quat& turn,const Vec3& center,Vec3* push,bool worldGiven) {
     __try {
         LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
+        ForgetNow();
         if(!worldGiven) {
             scanReach=gunRadius+1.5f;
             collectReach=gunRadius+.5f;   // kGunMovingSlack, defined further on
@@ -918,7 +1200,8 @@ bool GunGuarded(const Vec3& at,const Quat& turn,const Vec3& center,Vec3* push,bo
         if(!worldGiven)GunCollectInner(center);
         gunCollectMs+=MsSince(t0);
         QueryPerformanceCounter(&t0);
-        const bool moved=GunMove(gunMover,at,turn,push);
+        if(forgetAsked)return false;
+        const bool moved=GunMoveLocked(at,turn,push);
         gunMoveMs+=MsSince(t0);
         return moved;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -997,16 +1280,31 @@ bool GunStopsAt(void* actor,bool& kinematic) {
 // As an obstacle it never got that first shove, and stopped the gun for good. PhysX gives a kinematic body no mass, so the game is asked. Only props (kind 10, what bodyWake
 // can wake and what the log shows as light props) and only small ones: a ragdoll's limbs, a door, a thing without a mass stay obstacles.
 constexpr int kProxyProp=10;
+thread_local bool offGameThread=false;
+struct KinematicAsk {void* actor;uint32_t proxy,body;Bounds whole;};
+std::vector<KinematicAsk> kinematicAsks;
+std::mutex kinematicAskLock;
 constexpr float kGunShovedMost=1.2f;  // m, the longest side of a kinematic thing the gun may shove
 bool GunKinematicIsLoose(void* actor,uint32_t proxy,uint32_t body,const Bounds& whole) {
+    if(offGameThread) {
+        std::lock_guard<std::mutex> hold(kinematicAskLock);
+        const auto known=gunKinematicSeen.find(actor);
+        if(known!=gunKinematicSeen.end() && known->second.proxy==proxy && known->second.body==body)return known->second.loose;
+        // asking the game for a mass belongs on its thread: the script's next call does, and until then it stands as an obstacle, as what is unknown always has
+        if(kinematicAsks.size()<64)kinematicAsks.push_back(KinematicAsk{actor,proxy,body,whole});
+        return false;
+    }
     const auto known=gunKinematicSeen.find(actor);
     if(known!=gunKinematicSeen.end() && known->second.proxy==proxy && known->second.body==body)return known->second.loose;
     const int kind=proxy?ProxyKind(proxy):0;
     const float mass=kind==kProxyProp?BodyGameMass(proxy,body):0.f;
     const float longest=std::fmax(std::fmax(whole.hi.x-whole.lo.x,whole.hi.y-whole.lo.y),whole.hi.z-whole.lo.z);
     const bool loose=kind==kProxyProp && mass>.01f && mass<=kGunHeavy && longest<=kGunShovedMost;
-    if(gunKinematicSeen.size()>=2048)gunKinematicSeen.clear();
-    gunKinematicSeen[actor]=KinematicSeen{proxy,body,loose};
+    {
+        std::lock_guard<std::mutex> hold(kinematicAskLock);
+        if(gunKinematicSeen.size()>=2048)gunKinematicSeen.clear();
+        gunKinematicSeen[actor]=KinematicSeen{proxy,body,loose};
+    }
     if(gunKinematicSaid<60) {
         ++gunKinematicSaid;
         Log("[gunshape] a kinematic body near: kind %d, game mass %.2f kg, longest side %.2f m, proxy %u/%u: %s\n",kind,mass,longest,proxy,body,loose?"shoved":"stops");
@@ -1016,6 +1314,7 @@ bool GunKinematicIsLoose(void* actor,uint32_t proxy,uint32_t body,const Bounds& 
 void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
     ++gunWalkActors;
     if(Slot<int(*)(void*)>(actor,kActorGetType)(actor)!=1)return;
+    if(cvr::physicsruntime::IsCarried(actor))return;     // kinematic while held: it would stop the hand that holds it
     ++gunWalkDynamic;
     // MOST OF THEM ARE NOWHERE NEAR, and where an actor stands costs far less to ask than its bounds. 4 m: what is further and still reaches the gun is no loose thing.
     Transform place{};
@@ -1051,8 +1350,8 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
             // and the gun stopped a hand's width off every NPC at it. Nothing solid in the game is query-only.
             // NOR THE PLAYER'S OWN BODY CAPSULES: they follow the hands, carry filter words that are all zero, and escape the chest test once an
             // arm is out. A hand stopped at its own capsule was pushed, the capsule followed, and the arms moved by themselves (2026-11-08).
-            if(gunMovingCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunMoving[gunMovingCount],true)) {
-                const NearShape& got=gunMoving[gunMovingCount];
+            if(gunMovingBackCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunMovingBack[gunMovingBackCount],true)) {
+                const NearShape& got=gunMovingBack[gunMovingBackCount];
                 // AND NO CHARACTER'S CAPSULE: a tall, thin, upright capsule on something moving (seen 2026-11-08: 0.12 x 0.12 x 1.72 and 0.40 x 0.40 x 1.44 m).
                 // The player's own stands beside the chest, so "bounds hold the chest" misses it, and the gun stopped at it.
                 const float wide=got.bounds.hi.x-got.bounds.lo.x,deep=got.bounds.hi.y-got.bounds.lo.y,tall=got.bounds.hi.z-got.bounds.lo.z;
@@ -1061,13 +1360,13 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
                 const bool standingWords=got.type==GeomCapsule && got.query[2]==0x48000002u && got.sim[0]==2u;
                 const bool characterWords=standingWords || (got.type==GeomCapsule && got.query[2]==0x00002000u && got.sim[0]==1u && got.sim[2]==0x000041ceu);
                 const bool character=characterWords || (got.type==GeomCapsule && tall>1.f && wide<.6f && deep<.6f);
-                if(!character && (got.query[0]|got.query[1]|got.query[2]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]))++gunMovingCount;
+                if(!character && (got.query[0]|got.query[1]|got.query[2]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]))++gunMovingBackCount;
                 else ++gunMovingOwnSkipped;
             }
-        } else if(gunLooseCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunLoose[gunLooseCount].s,true)) {
-            gunLoose[gunLooseCount].proxy=proxy;
-            gunLoose[gunLooseCount].body=body;
-            ++gunLooseCount;
+        } else if(gunLooseBackCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunLooseBack[gunLooseBackCount].s,true)) {
+            gunLooseBack[gunLooseBackCount].proxy=proxy;
+            gunLooseBack[gunLooseBackCount].body=body;
+            ++gunLooseBackCount;
         }
     }
     if(stop)++gunMovingStops;else ++gunMovingShoved;
@@ -1097,9 +1396,15 @@ inline void GunTouchConsider(void* actor,const Transform& gun,const Vec3& origin
     GunTouchActor(actor,gun,origin);
 }
 void GunCollectInner(const Vec3& at) {
-    gunMovingCount=gunLooseCount=0;
-    gunLooseFresh=false;
-    if(gunMover.count==0 || gunProved<=0 || !ReadScenes())return;
+    gunMovingBackCount=gunLooseBackCount=0;
+    // Not only with a gun: the hands use this list too. Gated on the gun's boxes, empty hands shoved nothing and were stopped by nothing that moves until a gun had been drawn (2026-11-08).
+    if(gunProved<=0 || !ReadScenes()) {
+        AcquireSRWLockExclusive(&worldLock);
+        gunMovingCount=gunLooseCount=0;
+        gunLooseFresh=false;
+        ReleaseSRWLockExclusive(&worldLock);
+        return;
+    }
     const Transform gun{Quat{0,0,0,1},at};
     const uint64_t now=GetTickCount64();
     const float jx=at.x-touchBuiltAt.x,jy=at.y-touchBuiltAt.y,jz=at.z-touchBuiltAt.z;
@@ -1120,7 +1425,13 @@ void GunCollectInner(const Vec3& at) {
             for(uint32_t m=0;m<n && m<64;++m)GunTouchConsider(members[m],gun,origin);
         }
     }
+    AcquireSRWLockExclusive(&worldLock);
+    std::memcpy(gunMoving,gunMovingBack,sizeof(NearShape)*size_t(gunMovingBackCount));
+    std::memcpy(gunLoose,gunLooseBack,sizeof(LooseShape)*size_t(gunLooseBackCount));
+    gunMovingCount=gunMovingBackCount;
+    gunLooseCount=gunLooseBackCount;
     gunLooseFresh=true;
+    ReleaseSRWLockExclusive(&worldLock);
 }
 // WHAT THE GUN'S BOXES ARE IN, OF WHAT IT SHOVES, where it was put: from the shapes gathered this call before the move. One touch a body.
 int GunTouchInner(Mover& m,const Vec3& at,const Quat& turn) {
@@ -1267,8 +1578,12 @@ int ProxyBodiesGuarded(uint32_t proxy) {
     __except(EXCEPTION_EXECUTE_HANDLER) {return 0;}
 }
 int GunTouchGuarded(const Vec3& at,const Quat& turn) {
-    __try {return GunTouchInner(gunMover,at,turn);}
-    __except(EXCEPTION_EXECUTE_HANDLER) {gunTouchCount=0;return 0;}
+    AcquireSRWLockShared(&worldLock);
+    int n=0;
+    __try {n=GunTouchInner(gunMover,at,turn);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {gunTouchCount=0;n=0;}
+    ReleaseSRWLockShared(&worldLock);
+    return n;
 }
 int PickConeGuarded(const Vec3& from,const Vec3& a,const Vec3& b,float cone,float range,uint32_t kp,uint32_t kb,NearBody* out,int capacity) {
     __try {return PickConeInner(from,a,b,cone,range,kp,kb,out,capacity);}
@@ -1286,6 +1601,107 @@ void ProbeBodyGuarded(int32_t proxy,int32_t body,const Vec3& world) {
     }
 }
 
+// WHAT MOVES NEAR THE PLAYER, as numbers only, refreshed at the top of a physics step (RuntimeCollect). A hand closing and a hand pointing used to walk all ~2750 moving actors on the script's thread:
+// 40-70 ms frames were measured in the pointing. No actor pointer is kept, since an actor can be freed by the time the script looks.
+struct NearActor {uint32_t proxy,body;Bounds world;};
+constexpr int kMostNearActors=768;
+constexpr float kNearActorReach=10.f;   // m round the chest: an arm and PULL_RANGE
+constexpr uint64_t kNearActorsFresh=150;
+NearActor nearActors[kMostNearActors],nearActorsBack[kMostNearActors];
+int nearActorCount=0,nearActorBackCount=0;
+uint64_t nearActorsTick=0;
+Vec3 nearActorsAt{};
+uint32_t nearActorTurn=0;
+inline bool NearActorsCover(const Vec3& at,float reach) {
+    if(!cvr::physicsruntime::RunsLists() || !nearActorsTick || GetTickCount64()-nearActorsTick>kNearActorsFresh || forgetAsked)return false;
+    const float dx=at.x-nearActorsAt.x,dy=at.y-nearActorsAt.y,dz=at.z-nearActorsAt.z;
+    const float room=kNearActorReach-reach;
+    return room>0 && dx*dx+dy*dy+dz*dz<=room*room;
+}
+int NearFromSnapshot(const Vec3& center,float radius,NearBody* out,int capacity) {
+    AcquireSRWLockShared(&worldLock);
+    if(!NearActorsCover(center,radius)) {ReleaseSRWLockShared(&worldLock);return -1;}
+    int count=0;
+    for(int i=0;i<nearActorCount;++i) {
+        const Bounds& b=nearActors[i].world;
+        const float dx=center.x<b.lo.x?b.lo.x-center.x:(center.x>b.hi.x?center.x-b.hi.x:0.f);
+        const float dy=center.y<b.lo.y?b.lo.y-center.y:(center.y>b.hi.y?center.y-b.hi.y:0.f);
+        const float dz=center.z<b.lo.z?b.lo.z-center.z:(center.z>b.hi.z?center.z-b.hi.z:0.f);
+        const float d2=dx*dx+dy*dy+dz*dz;
+        if(!(d2<=radius*radius))continue;
+        NearBody n{nearActors[i].proxy,nearActors[i].body,std::sqrt(d2),(b.hi.x-b.lo.x)*(b.hi.y-b.lo.y)*(b.hi.z-b.lo.z)};
+        int at=count<capacity?count++:capacity-1;
+        if(count==capacity && out[at].distance<n.distance)continue;
+        while(at>0 && (out[at-1].distance>n.distance || (out[at-1].distance==n.distance && out[at-1].volume>n.volume))) {out[at]=out[at-1];--at;}
+        out[at]=n;
+    }
+    ReleaseSRWLockShared(&worldLock);
+    return count;
+}
+int ConeFromSnapshot(const Vec3& from,const Vec3& dirA,const Vec3& dirB,float cone,float range,uint32_t keepProxy,uint32_t keepBody,NearBody* out,int capacity) {
+    AcquireSRWLockShared(&worldLock);
+    if(!NearActorsCover(from,range)) {ReleaseSRWLockShared(&worldLock);return -1;}
+    int count=0;
+    const float cosCone=std::cos(cone);
+    for(int i=0;i<nearActorCount;++i) {
+        const Bounds& b=nearActors[i].world;
+        if(b.hi.x-b.lo.x>2.f || b.hi.y-b.lo.y>2.f || b.hi.z-b.lo.z>2.f)continue;    // no loose thing to pull
+        const Vec3 m{(b.lo.x+b.hi.x)*.5f-from.x,(b.lo.y+b.hi.y)*.5f-from.y,(b.lo.z+b.hi.z)*.5f-from.z};
+        const float d=std::sqrt(m.x*m.x+m.y*m.y+m.z*m.z);
+        if(d>range || d<.15f)continue;
+        const float c1=(m.x*dirA.x+m.y*dirA.y+m.z*dirA.z)/d,c2=(m.x*dirB.x+m.y*dirB.y+m.z*dirB.z)/d;
+        const float c=c1>c2?c1:c2;
+        if(c<cosCone)continue;
+        float angle=std::acos(c<1.f?c:1.f);
+        if(nearActors[i].proxy==keepProxy && nearActors[i].body==keepBody)angle-=.05f;
+        NearBody n{nearActors[i].proxy,nearActors[i].body,angle,d};
+        int at=count<capacity?count++:capacity-1;
+        if(count==capacity && out[at].distance<n.distance)continue;
+        while(at>0 && out[at-1].distance>n.distance) {out[at]=out[at-1];--at;}
+        out[at]=n;
+    }
+    ReleaseSRWLockShared(&worldLock);
+    return count;
+}
+void CollectNearActors(const Vec3& center) {
+    if(nearActorTurn++%2 || proved<0 || !ReadScenes())return;
+    nearActorBackCount=0;
+    const auto consider=[&](void* actor,const Vec3& origin) {
+        if(nearActorBackCount>=kMostNearActors || Slot<int(*)(void*)>(actor,kActorGetType)(actor)!=1)return;
+        Transform place{};
+        Slot<void*(*)(void*,Transform*)>(actor,kActorGetGlobalPose)(actor,&place);
+        const float fx=place.p.x+origin.x-center.x,fy=place.p.y+origin.y-center.y,fz=place.p.z+origin.z-center.z;
+        if(fx*fx+fy*fy+fz*fz>kNearActorReach*kNearActorReach)return;
+        struct {Vec3 lo,hi;} w{};
+        Slot<void*(*)(void*,void*,float)>(actor,kActorGetWorldBounds)(actor,&w,1.01f);
+        const char* a=static_cast<const char*>(actor);
+        NearActor& n=nearActorsBack[nearActorBackCount++];
+        n.proxy=*reinterpret_cast<const uint32_t*>(a+0x10);
+        n.body=*reinterpret_cast<const uint16_t*>(a+0x14);
+        n.world={{w.lo.x+origin.x,w.lo.y+origin.y,w.lo.z+origin.z},{w.hi.x+origin.x,w.hi.y+origin.y,w.hi.z+origin.z}};
+    };
+    for(int s=0;s<sceneCount;++s) {
+        if(!sceneOwners[s])continue;
+        const float* o=reinterpret_cast<const float*>(static_cast<char*>(sceneOwners[s])+0x134);
+        const Vec3 origin{o[0],o[1],o[2]};
+        const uint16_t types=2;
+        const uint32_t got=Slot<uint32_t(*)(void*,const uint16_t*,void**,uint32_t,uint32_t)>(scenes[s],kSceneGetActors)(scenes[s],&types,actorBuffer,kMaxActors,0);
+        for(uint32_t i=0;i<got;++i)consider(actorBuffer[i],origin);
+        const uint32_t aggregates=Slot<uint32_t(*)(void*)>(scenes[s],kSceneGetNbAggregates)(scenes[s]);
+        const uint32_t gotA=aggregates<=kMaxActors?Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(scenes[s],kSceneGetAggregates)(scenes[s],aggregateBuffer,kMaxActors,0):0;
+        for(uint32_t i=0;i<gotA;++i) {
+            void* members[64]{};
+            const uint32_t n=Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(aggregateBuffer[i],kAggregateGetActors)(aggregateBuffer[i],members,64,0);
+            for(uint32_t m=0;m<n && m<64;++m)consider(members[m],origin);
+        }
+    }
+    AcquireSRWLockExclusive(&worldLock);
+    std::memcpy(nearActors,nearActorsBack,sizeof(NearActor)*size_t(nearActorBackCount));
+    nearActorCount=nearActorBackCount;
+    nearActorsAt=center;
+    nearActorsTick=GetTickCount64();
+    ReleaseSRWLockExclusive(&worldLock);
+}
 int FindNearInner(const Vec3& center,float radius,NearBody* out,int capacity) {
     if(proved<0 || !ReadScenes())return 0;
     int count=0;
@@ -1413,6 +1829,10 @@ void WorldRing(const float* center,const float* u,const float* v,float radius,in
 }
 
 int FindNear(float x,float y,float z,float radius,NearBody* out,int capacity) {
+    {
+        const int fast=NearFromSnapshot(Vec3{x,y,z},radius,out,capacity);
+        if(fast>=0)return fast;
+    }
     __try {
         return FindNearInner(Vec3{x,y,z},radius,out,capacity);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -1427,6 +1847,10 @@ bool ActorWorld(uint32_t proxy,uint32_t body,float* xyz) {
     }
 }
 int PickCone(const float* from,const float* a,const float* b,float cone,float range,uint32_t keepProxy,uint32_t keepBody,NearBody* out,int capacity) {
+    {
+        const int fast=ConeFromSnapshot(Vec3{from[0],from[1],from[2]},Vec3{a[0],a[1],a[2]},Vec3{b[0],b[1],b[2]},cone,range,keepProxy,keepBody,out,capacity);
+        if(fast>=0)return fast;
+    }
     return PickConeGuarded(Vec3{from[0],from[1],from[2]},Vec3{a[0],a[1],a[2]},Vec3{b[0],b[1],b[2]},cone,range,keepProxy,keepBody,out,capacity);
 }
 bool RaiseSpin(uint32_t proxy,uint32_t body,float most,float* was) {
@@ -1817,10 +2241,12 @@ void VRBodyPhysXPos(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext:
 // THE GUN'S SHAPE, boxes in its own frame, and how far it must go to be out of the world's. W 1 with an answer, 0 while there is none yet (the near list takes a few frames).
 void VRGunBoxClear(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
     stack->code++;
+    AcquireSRWLockExclusive(&worldLock);
     gunMover.count = 0;
     gunRadius = .3f;
     gunMover.prevOn = false;
     gunTouchCount = 0;
+    ReleaseSRWLockExclusive(&worldLock);
     if (out) *out = true;
 }
 void VRGunBoxAdd(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, int64_t) {
@@ -1829,6 +2255,7 @@ void VRGunBoxAdd(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out, 
     RED4ext::GetParameter(stack, &hi);
     stack->code++;
     bool added = false;
+    SrwExclusive partsHeld(worldLock);
     if (gunMover.count < kGunMostBoxes && hi.X > lo.X && hi.Y > lo.Y && hi.Z > lo.Z) {
         GunBox& b = gunMover.parts[gunMover.count++];
         b.center = {(lo.X + hi.X) * .5f, (lo.Y + hi.Y) * .5f, (lo.Z + hi.Z) * .5f};
@@ -1850,6 +2277,7 @@ void VRGunBoxAddTurned(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool*
     stack->code++;
     bool added = false;
     const float size = std::sqrt(turn.X * turn.X + turn.Y * turn.Y + turn.Z * turn.Z + turn.W * turn.W);
+    SrwExclusive partsHeld(worldLock);
     if (gunMover.count < kGunMostBoxes && half.X > 0 && half.Y > 0 && half.Z > 0 && size > .5f && std::isfinite(size)) {
         GunBox& b = gunMover.parts[gunMover.count++];
         b.center = {mid.X, mid.Y, mid.Z};
@@ -1957,6 +2385,10 @@ uint32_t handCalls=0;
 double handMs=0;
 // VRWorldCenter(the chest, world) -> whether the world near it is known yet. Once a frame, before the gun and the hands: the near list
 // round the chest a slice at a time, and the moving things round it gathered. A jump of the chest or a pause throws both away.
+void __GunAsk(const KinematicAsk& a) {
+    __try {GunKinematicIsLoose(a.actor,a.proxy,a.body,a.whole);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
 bool WorldGuarded(const Vec3& chest) {
     __try {
         LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
@@ -1964,6 +2396,7 @@ bool WorldGuarded(const Vec3& chest) {
         collectReach=kWorldReach;
         collectAvoid=chest;
         collectAvoidOn=true;
+        ForgetNow();
         GunScanSlice(chest);
         gunScanMs+=MsSince(t0);
         if(!gunReady)return false;
@@ -1988,8 +2421,16 @@ void VRWorldCenter(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out
     if (!worldCenterTick || now - worldCenterTick > 500 || dx * dx + dy * dy + dz * dz > 1.f) GunForget();
     worldCenterTick = now;
     worldCenter = chest;
+    cvr::physicsruntime::Tick();
+    // what the simulate detour could not ask the game
+    {
+        std::vector<KinematicAsk> asks;
+        {std::lock_guard<std::mutex> hold(kinematicAskLock);asks.swap(kinematicAsks);}
+        for(const KinematicAsk& a:asks)__GunAsk(a);
+    }
     LARGE_INTEGER t0;QueryPerformanceCounter(&t0);
-    const bool ready = WorldGuarded(chest);
+    // WITH THE RUNTIME RUNNING THE LISTS ARE KEPT OFF THIS THREAD: the moving things at the top of each step, the statics on the worker.
+    const bool ready = cvr::physicsruntime::RunsLists() ? (gunReady && !forgetAsked) : WorldGuarded(chest);
     static double worldMs = 0;
     static uint32_t worldCalls = 0;
     static uint64_t worldSaid = 0;
@@ -2013,6 +2454,7 @@ void VRMoverClear(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out,
     int32_t id = 0;
     RED4ext::GetParameter(stack, &id);
     stack->code++;
+    SrwExclusive partsHeld(worldLock);
     if (id >= 0 && id <= 1) {movers[id].count = 0;movers[id].prevOn = false;}
     if (out) *out = id >= 0 && id <= 1;
 }
@@ -2028,6 +2470,7 @@ void VRMoverCapsule(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* ou
     stack->code++;
     bool added = false;
     const float size = std::sqrt(turn.X * turn.X + turn.Y * turn.Y + turn.Z * turn.Z + turn.W * turn.W);
+    SrwExclusive partsHeld(worldLock);
     if (id >= 0 && id <= 1 && movers[id].count < kGunMostBoxes && radius > 0 && halfHeight >= 0 && size > .5f && std::isfinite(size)) {
         GunBox& b = movers[id].parts[movers[id].count++];
         b.center = {mid.X, mid.Y, mid.Z};
@@ -2065,10 +2508,20 @@ void VRHandPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vec
     m.anchor = {anchor.X, anchor.Y, anchor.Z};
     m.anchorOn = true;
     m.anchorSkip = .12f;   // what the chest is in: a seat, a low beam (WORLD_INSIDE in HandCollision)
+    // SOLVED IN THE ANIMATION PASS ALREADY (physicsruntime::AfterHandStop), in the frame it is drawn: w 3 says so, and the push is that solve's, for what the script still does with it (loose things, sounds).
+    if (cvr::physicsruntime::HandsNative()) {
+        const float turnNow[4] = {turn.X, turn.Y, turn.Z, turn.W};
+        cvr::physicsruntime::NoteHandTurn(id, turnNow);
+        *out = RED4ext::Vector4{m.lastPush.x, m.lastPush.y, m.lastPush.z, 3.f};
+        return;
+    }
     Vec3 push{};
     bool ok = false;
+    if (forgetAsked) return;
+    AcquireSRWLockShared(&worldLock);
     __try {ok = GunMove(m, target, Quat{turn.X, turn.Y, turn.Z, turn.W}, &push);}
     __except (EXCEPTION_EXECUTE_HANDLER) {GunForget();ok = false;}
+    ReleaseSRWLockShared(&worldLock);
     if (ok) *out = RED4ext::Vector4{push.x, push.y, push.z, m.prevOn && gunSweep && !gunSweepBad ? 2.f : 1.f};
     // THE HAND PROBE (2026-11-08): arms that moved by themselves once an arm was out past 40 cm. Said when a hand is pushed more than
     // 10 cm, or the other way than the frame before, at most every 200 ms a hand and 80 times a session.
@@ -2094,8 +2547,12 @@ void VRHandPush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, RED4ext::Vec
 }
 // VRHandTouches(hand, wrist, turn) -> how many loose bodies the hand is in; read with VRGunTouchOf / VRGunTouchWay as the gun's.
 int HandTouchGuarded(int id,const Vec3& at,const Quat& turn) {
-    __try {return GunTouchInner(movers[id],at,turn);}
-    __except(EXCEPTION_EXECUTE_HANDLER) {gunTouchCount=0;return 0;}
+    AcquireSRWLockShared(&worldLock);
+    int n=0;
+    __try {n=GunTouchInner(movers[id],at,turn);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {gunTouchCount=0;n=0;}
+    ReleaseSRWLockShared(&worldLock);
+    return n;
 }
 void VRHandTouches(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, int32_t* out, int64_t) {
     int32_t id = 0;
@@ -2185,3 +2642,145 @@ void VRDebugFlush(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out,
     backCount = 0;
     if (out) *out = true;
 }
+
+// ---- For Natives/PhysicsRuntime.cpp: the movers and the lists, from the threads that are not the script's.
+namespace cvr::debugview {
+namespace ph=cvr::physics;
+void RuntimeCollect(const float* center) {
+    __try {
+        threadBuffers=&simulateBuffers;
+        offGameThread=true;
+        ForgetNow();
+        if(proved>=0 && gunProved>=0) {
+            collectReach=kWorldReach;
+            collectAvoid={center[0],center[1],center[2]};
+            collectAvoidOn=true;
+            GunCollectInner(collectAvoid);
+            CollectNearActors(collectAvoid);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {GunForget();}
+    offGameThread=false;
+    threadBuffers=nullptr;
+}
+void RuntimeScan(const float* center) {
+    __try {
+        threadBuffers=&workerBuffers;
+        offGameThread=true;
+        if(proved>=0 && gunProved>=0 && !forgetAsked) {
+            scanReach=kWorldReach;
+            GunScanSlice(Vec3{center[0],center[1],center[2]});
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {GunForget();}
+    offGameThread=false;
+    threadBuffers=nullptr;
+}
+bool WorldCenter(float* out) {
+    if(!worldCenterTick || GetTickCount64()-worldCenterTick>500)return false;
+    out[0]=worldCenter.x;out[1]=worldCenter.y;out[2]=worldCenter.z;
+    return true;
+}
+static bool SolveGuarded(Mover& m,const ph::Pose& tracked,bool turn,ph::Result& r) {
+    __try {r=ProxyMove(m,tracked,turn);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {GunForget();return false;}
+}
+bool MoverSolve(int id,const float* p,const float* q,const float* anchor,float skip,bool turnAnswer,float* outP,float* outQ,bool* contact) {
+    if(id<0 || id>=5 || forgetAsked || !gunReady || !gunSweep || gunSweepBad || gunProved<=0)return false;
+    Mover& m=movers[id];
+    if(m.count==0)return false;
+    AcquireSRWLockShared(&worldLock);
+    const uint64_t now=GetTickCount64();
+    const float dx=p[0]-m.lastAt.x,dy=p[1]-m.lastAt.y,dz=p[2]-m.lastAt.z;
+    // a teleport, or back after a pause: it starts again where the hand is
+    if(id>=2 && (!m.lastCall || now-m.lastCall>500 || dx*dx+dy*dy+dz*dz>1.f))m.prevOn=false;
+    if(id>=2)m.lastCall=now;
+    m.lastAt={p[0],p[1],p[2]};
+    m.anchorOn=anchor!=nullptr;
+    if(anchor)m.anchor={anchor[0],anchor[1],anchor[2]};
+    m.anchorSkip=skip;
+    ph::Result r{};
+    const bool ok=SolveGuarded(m,ph::Pose{{q[0],q[1],q[2],q[3]},{p[0],p[1],p[2]}},turnAnswer,r);
+    ReleaseSRWLockShared(&worldLock);
+    if(!ok)return false;
+    outP[0]=r.pose.p.x;outP[1]=r.pose.p.y;outP[2]=r.pose.p.z;
+    outQ[0]=r.pose.q.x;outQ[1]=r.pose.q.y;outQ[2]=r.pose.q.z;outQ[3]=r.pose.q.w;
+    if(id<=2)m.lastPush={outP[0]-p[0],outP[1]-p[1],outP[2]-p[2]};
+    if(contact)*contact=r.contact;
+    return true;
+}
+// The hands are asked for by VRHandPush, which keeps lastCall; the others by MoverTouched. A solve must not count as being asked, or the gun would go on being solved after it was put away.
+bool MoverAsked(int id,uint64_t withinMs) {
+    if(id<0 || id>=5 || movers[id].count==0)return false;
+    const uint64_t at=id<2?movers[id].lastCall:movers[id].askedAt;
+    return at && GetTickCount64()-at<=withinMs;
+}
+void MoverTouched(int id) {if(id>=0 && id<5)movers[id].askedAt=GetTickCount64();}
+void MoverReset(int id) {if(id>=0 && id<5) {movers[id].prevOn=false;movers[id].lastCall=0;movers[id].askedAt=0;}}
+void MoverPush(int id,float* out) {
+    if(id<0 || id>2) {out[0]=out[1]=out[2]=0;return;}
+    out[0]=movers[id].lastPush.x;out[1]=movers[id].lastPush.y;out[2]=movers[id].lastPush.z;
+}
+// The body's shapes as parts of a mover, each by its own bounds: a convex or a mesh becomes the box round it, a little shrunk, since a box stands proud of a rounded thing at its corners.
+static int ActorPartsInner(void* actor,int id) {
+    Mover& m=movers[id];
+    AcquireSRWLockExclusive(&worldLock);
+    m.count=0;
+    ReleaseSRWLockExclusive(&worldLock);
+    void* shapes[kGunMostBoxes]{};
+    const uint32_t n=Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(actor,kActorGetShapes)(actor,shapes,kGunMostBoxes,0);
+    int count=0;
+    GunBox built[kGunMostBoxes];
+    for(uint32_t i=0;i<n && i<kGunMostBoxes;++i) {
+        if(!GunProveShape(shapes[i]))return 0;
+        NearShape s{};
+        const Transform identity{Quat{0,0,0,1},Vec3{0,0,0}};
+        if(!GunCopyShape(shapes[i],identity,Vec3{0,0,0},s,true))continue;
+        // pose is the shape's own, in the body's frame, since the actor's was given as identity
+        GunBox& b=built[count];
+        if(s.type==GeomBox) {
+            b.center=s.pose.p;b.q=s.pose.q;b.half=reinterpret_cast<const BoxGeometry*>(s.geometry)->half;
+        } else if(s.type==GeomCapsule) {
+            const auto* c=reinterpret_cast<const CapsuleGeometry*>(s.geometry);
+            b.center=s.pose.p;b.q=s.pose.q;b.capsule=true;b.radius=c->radius;b.halfHeight=c->halfHeight;b.half={c->halfHeight+c->radius,c->radius,c->radius};
+        } else {
+            b.center={(s.bounds.lo.x+s.bounds.hi.x)*.5f,(s.bounds.lo.y+s.bounds.hi.y)*.5f,(s.bounds.lo.z+s.bounds.hi.z)*.5f};
+            constexpr float kShrink=.92f;
+            b.half={(s.bounds.hi.x-s.bounds.lo.x)*.5f*kShrink,(s.bounds.hi.y-s.bounds.lo.y)*.5f*kShrink,(s.bounds.hi.z-s.bounds.lo.z)*.5f*kShrink};
+        }
+        ++count;
+    }
+    AcquireSRWLockExclusive(&worldLock);
+    for(int i=0;i<count;++i)m.parts[i]=built[i];
+    m.count=count;
+    m.prevOn=false;
+    ReleaseSRWLockExclusive(&worldLock);
+    return count;
+}
+static void* FindActorInner(uint32_t proxy,uint32_t body,float* origin) {
+    if(proved<0 || !ReadScenes())return nullptr;
+    for(int s=0;s<sceneCount;++s) {
+        if(!sceneOwners[s])continue;
+        const float* o=reinterpret_cast<const float*>(static_cast<char*>(sceneOwners[s])+0x134);
+        origin[0]=o[0];origin[1]=o[1];origin[2]=o[2];
+        const uint32_t aggregates=Slot<uint32_t(*)(void*)>(scenes[s],kSceneGetNbAggregates)(scenes[s]);
+        const uint32_t gotA=aggregates<=kMaxActors?Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(scenes[s],kSceneGetAggregates)(scenes[s],aggregateBuffer,kMaxActors,0):0;
+        for(uint32_t i=0;i<gotA;++i) {
+            void* members[64]{};
+            const uint32_t n=Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(aggregateBuffer[i],kAggregateGetActors)(aggregateBuffer[i],members,64,0);
+            if(void* f=FindActorIn(members,n<64?n:64,int32_t(proxy),int32_t(body)))return f;
+        }
+        const uint16_t types=2;
+        const uint32_t got=Slot<uint32_t(*)(void*,const uint16_t*,void**,uint32_t,uint32_t)>(scenes[s],kSceneGetActors)(scenes[s],&types,actorBuffer,kMaxActors,0);
+        if(void* f=FindActorIn(actorBuffer,got,int32_t(proxy),int32_t(body)))return f;
+    }
+    return nullptr;
+}
+void* FindDynamicActor(uint32_t proxy,uint32_t body,float* origin) {
+    __try {return FindActorInner(proxy,body,origin);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return nullptr;}
+}
+int ActorParts(void* actor,int moverId) {
+    if(moverId<3 || moverId>=5)return 0;
+    __try {return ActorPartsInner(actor,moverId);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return 0;}
+}
+}  // namespace cvr::debugview

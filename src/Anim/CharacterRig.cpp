@@ -1,3 +1,4 @@
+#include "Natives/PhysicsRuntime.hpp"
 #include "Core/Paths.hpp"
 #include "Hooks/BodyHeading.hpp"
 #include "Utils/DebugGate.hpp"
@@ -2259,8 +2260,19 @@ volatile int   g_VRHandRawValid[2]    = { 0, 0 };
 // depends on the previous frame's clamp, which is a feedback loop that shakes the hand in a cluster of capsules.
 volatile float g_VRHandRawRot[2][4]   = { {0.0f,0.0f,0.0f,1.0f}, {0.0f,0.0f,0.0f,1.0f} };
 
+static void ApplyScriptHandStop(int side, float* target, float* handRot);
 void VRIK_ApplyHandStop(int side, float* target, float* handRot) {
     if (side < 0 || side > 1 || !target) return;
+    {
+        const float before[3] = {target[0], target[1], target[2]};
+        ApplyScriptHandStop(side, target, handRot);
+        const float moved[3] = {target[0] - before[0], target[1] - before[1], target[2] - before[2]};
+        cvr::physicsruntime::NoteScriptStop(side, moved);
+    }
+    // what the script stops (people, glued hands) comes first; the world, the hand's shape and the gun in it are solved on that, here, in the frame it is drawn
+    cvr::physicsruntime::AfterHandStop(side, target, handRot);
+}
+static void ApplyScriptHandStop(int side, float* target, float* handRot) {
     // published unconditionally, so the loop has a target even while no hold is active
     g_VRHandRawModel[side][0] = target[0];
     g_VRHandRawModel[side][1] = target[1];

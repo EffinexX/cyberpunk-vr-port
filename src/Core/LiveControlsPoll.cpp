@@ -677,7 +677,7 @@ void PollLiveControls() {
     int xrHandPush = g_liveControls.xrHandPush;
     int xrFingerContact = g_liveControls.xrFingerContact;
     int xrPropGrab = g_liveControls.xrPropGrab;
-    int xrCarryPicture = g_liveControls.xrCarryPicture;
+    int xrNativePhysics = g_liveControls.xrNativePhysics;
     float xrCarryLead = g_liveControls.xrCarryLead;
     float xrContactMargin = g_liveControls.xrContactMargin;
     float xrTouchObjectVolume = g_liveControls.xrTouchObjectVolume;
@@ -1670,9 +1670,9 @@ void PollLiveControls() {
             xrPropGrab = intValue;
             continue;
         }
-        if (sscanf_s(line, "xr_carry_picture=%d", &intValue) == 1 ||
-            sscanf_s(line, "xr_carry_picture = %d", &intValue) == 1) {
-            xrCarryPicture = intValue;
+        if (sscanf_s(line, "xr_native_physics=%d", &intValue) == 1 ||
+            sscanf_s(line, "xr_native_physics = %d", &intValue) == 1) {
+            xrNativePhysics = intValue;
             continue;
         }
         if (sscanf_s(line, "xr_carry_lead=%f", &value) == 1 ||
@@ -1901,7 +1901,7 @@ void PollLiveControls() {
     g_liveControls.xrHandPush = xrHandPush != 0 ? 1 : 0;
     g_liveControls.xrFingerContact = xrFingerContact != 0 ? 1 : 0;
     g_liveControls.xrPropGrab = xrPropGrab != 0 ? 1 : 0;
-    g_liveControls.xrCarryPicture = xrCarryPicture != 0 ? 1 : 0;
+    g_liveControls.xrNativePhysics = xrNativePhysics != 0 ? 1 : 0;
     g_liveControls.xrCarryLead = xrCarryLead < 0.0f ? 0.0f : (xrCarryLead > 0.1f ? 0.1f : xrCarryLead);
     g_liveControls.xrContactMargin = xrContactMargin < 0.0f ? 0.0f : (xrContactMargin > 0.05f ? 0.05f : xrContactMargin);
     g_liveControls.xrTouchObjectVolume = xrTouchObjectVolume < 0.0f ? 0.0f : (xrTouchObjectVolume > 1.0f ? 1.0f : xrTouchObjectVolume);
@@ -2268,7 +2268,7 @@ LiveControlsUiState MakeLiveControlsUiState() {
     state.xrDebugView = g_liveControls.xrDebugView;
     state.xrGunRays = g_liveControls.xrGunRays;
     state.xrHandRays = g_liveControls.xrHandRays;
-    state.xrCarryPicture = g_liveControls.xrCarryPicture;
+    state.xrNativePhysics = g_liveControls.xrNativePhysics;
     state.xrCarryLead = g_liveControls.xrCarryLead;
     state.xrContactMargin = g_liveControls.xrContactMargin;
     state.xrTouchObjectVolume = g_liveControls.xrTouchObjectVolume;
@@ -2650,7 +2650,7 @@ void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_hand_push=%d\n", state.xrHandPush != 0 ? 1 : 0);
     fprintf(file, "xr_finger_contact=%d\n", state.xrFingerContact != 0 ? 1 : 0);
     fprintf(file, "xr_prop_grab=%d\n", state.xrPropGrab != 0 ? 1 : 0);
-    fprintf(file, "xr_carry_picture=%d\n", state.xrCarryPicture != 0 ? 1 : 0);
+    fprintf(file, "xr_native_physics=%d\n", state.xrNativePhysics != 0 ? 1 : 0);
     fprintf(file, "xr_carry_lead=%.3f\n", state.xrCarryLead);
     fprintf(file, "xr_contact_margin=%.3f\n", state.xrContactMargin);
     fprintf(file, "xr_touch_object_volume=%.3f\n", state.xrTouchObjectVolume);
@@ -2822,7 +2822,7 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
     g_liveControls.xrDebugView = state->xrDebugView != 0 ? 1 : 0;
     g_liveControls.xrGunRays = state->xrGunRays != 0 ? 1 : 0;
     g_liveControls.xrHandRays = state->xrHandRays != 0 ? 1 : 0;
-    g_liveControls.xrCarryPicture = state->xrCarryPicture != 0 ? 1 : 0;
+    g_liveControls.xrNativePhysics = state->xrNativePhysics != 0 ? 1 : 0;
     g_liveControls.xrCarryLead = state->xrCarryLead < 0.0f ? 0.0f : (state->xrCarryLead > 0.1f ? 0.1f : state->xrCarryLead);
     g_liveControls.xrContactMargin = state->xrContactMargin < 0.0f ? 0.0f : (state->xrContactMargin > 0.05f ? 0.05f : state->xrContactMargin);
     g_liveControls.xrTouchObjectVolume = state->xrTouchObjectVolume < 0.0f ? 0.0f : (state->xrTouchObjectVolume > 1.0f ? 1.0f : state->xrTouchObjectVolume);

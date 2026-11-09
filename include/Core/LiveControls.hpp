@@ -143,7 +143,7 @@ struct LiveControls {
     volatile int xrDebugView = 0;
     volatile int xrGunRays = 0;      // the gun's backup rays from the wrist (HandCollision); a test switch, off after a restart: the boxes stop at the world themselves (2026-11-08)
     volatile int xrHandRays = 0;     // the hands' old world rays instead of their shapes (HandCollision); a test switch, off after a restart      // the gun's backup rays from the wrist (HandCollision); a test switch, on after a restart
-    volatile int xrCarryPicture = 1;          // a carried thing is drawn on the hand, its body following
+    volatile int xrNativePhysics = 1;         // hands, gun and carried things solved natively (Natives/PhysicsRuntime.cpp); off: the script's way
     volatile float xrCarryLead = 0.03f;       // s a carried thing is put ahead of the hand
     volatile float xrContactMargin = 0.01f;   // m kept from a surface, because the collision is smaller than the mesh
     volatile float xrTouchObjectVolume = 0.5f;   // 0..1, what a surface sounds like when the gun or a hand meets it

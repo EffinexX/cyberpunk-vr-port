@@ -1809,6 +1809,11 @@ K.worldNow = function(bx, by, bz, ii, ij, ik, ir)
         K.WC_SAID = true
         pcall(function() spdlog.info('[HandColl] the hands are stopped by their own shapes now, the rays are off') end)
     end
+    if K.WC_OK ~= K.WC_WAS then
+        K.WC_WAS = K.WC_OK
+        K.WC_FLIPS = (K.WC_FLIPS or 0) + 1
+        if K.WC_FLIPS <= 40 then pcall(function() spdlog.info('[HandColl] the world list ' .. (K.WC_OK and 'is ready: the hands go by their shapes' or 'is NOT ready: the hands are on the old rays')) end) end
+    end
     return K.WC_OK
 end
 -- what the rays found for a hand, forgotten: called from onUpdate, which cannot see WORLD_HIT
@@ -1836,7 +1841,8 @@ K.handWorldOne = function(side, bx, by, bz, ii, ij, ik, ir)
     local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, hi, hj, hk, hr)
     local ok, p = pcall(VRHandPush, side, Vector4.new(ax, ay, az, 1.0), Vector4.new(qi, qj, qk, qr), Vector4.new(K.WC_X, K.WC_Y, K.WC_Z, 1.0))
     if not ok or not p or p.w < 0.5 then return false end
-    if p.x ~= 0.0 or p.y ~= 0.0 or p.z ~= 0.0 then
+    -- w 3: the animation pass has already put the hand where the world lets it, this frame. Only what still goes by the script needs to know where that is.
+    if p.w < 2.5 and (p.x ~= 0.0 or p.y ~= 0.0 or p.z ~= 0.0) then
         local mx, my, mz = qrot(ii, ij, ik, ir, p.x, p.y, p.z)
         PX[side], PY[side], PZ[side] = x + mx, y + my, z + mz
     end
@@ -2066,6 +2072,41 @@ local function weaponStop(side, w, bx, by, bz, ii, ij, ik, ir)
                 if #list < GUN_SIDES then list[#list + 1] = { s[1] + fx, s[2] + fy, s[3] + fz } end
             end
             for i = 1, GUN_SIDES do GDEPTH[i] = false end
+        end
+        -- SOLVED IN THE ANIMATION PASS (Natives/PhysicsRuntime.cpp), turn and all, in the frame it is drawn. What is left here: the weapon's place for the grip, the touch, the sounds, and shoving what is loose.
+        if type(VRGunNative) == 'function' then
+            local okP, ep = pcall(worldPos, w)
+            local okQ, eq = pcall(worldOrient, w)
+            local there = okP and ep and okQ and eq
+            local okN, n = pcall(VRGunNative, side, there and Vector4.new(ep.x, ep.y, ep.z, 1.0) or Vector4.new(0.0, 0.0, 0.0, 0.0), there and Vector4.new(eq.i, eq.j, eq.k, eq.r) or Vector4.new(0.0, 0.0, 0.0, 1.0))
+            if okN and n and n.w > 0.5 then
+                if not K.GUN_ON then
+                    K.GUN_ON = true
+                    pcall(function() spdlog.info('[HandColl] the gun is solved natively now: ' .. tostring(key) .. ', ' .. tostring(#parts) .. ' boxes') end)
+                end
+                local wasTouching = gunTouching
+                gunTouching = n.w > 1.5
+                if gunTouching and not wasTouching then K.pulse(side) end
+                K.GUN_HAND, K.GUN_HAND_GEN = side, gen
+                if pushOn and there then
+                    local mx, my, mz = qrot(ii, ij, ik, ir, n.x, n.y, n.z)
+                    local gx, gy, gz = qrot(-ii, -ij, -ik, ir, rx + x + mx, ry + y + my, rz + z + mz)
+                    local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, ei, ej, ek, er)
+                    K.gunLoose(side, gx + bx, gy + by, gz + bz, qi, qj, qk, qr)
+                end
+                K.contactGun()
+                FIRM[side] = gunTouching
+                GO[side] = GO[side] or {}
+                local out = GO[side]
+                out[1], out[2], out[3] = x, y, z
+                return
+            end
+            -- not ready for a frame or two (a new grip being measured): the old way must not put a push of its own on top
+            local okO, on = pcall(function() return type(VRNativePhysicsOn) == 'function' and VRNativePhysicsOn() end)
+            if okO and on then
+                sayOnce('the native gun was not ready for a frame: nothing done that frame')
+                return
+            end
         end
         local gx, gy, gz = qrot(-ii, -ij, -ik, ir, rx + x, ry + y, rz + z)
         local qi, qj, qk, qr = qmul(-ii, -ij, -ik, ir, ei, ej, ek, er)
@@ -2672,7 +2713,7 @@ K.CARRY_FOLLOW, K.CARRY_SPIN, K.CARRY_MAX_SPEED = 0.85, 25.0, 30.0
 K.TURN_TAU, K.TURN_MOST = 0.02, 40.0   -- s the wanted turn is smoothed over, rad/s at most
 -- m/s^2. Up to 3 kg a hand keeps up with any swing; past it the limit falls steeply, to 12 at 6 kg, which about holds it up. Two hands count
 -- as a fifth of the mass.
-K.CARRY_ACCEL, K.CARRY_EASY, K.CARRY_MASS_POWER, K.CARRY_TWO_HANDS = 500.0, 3.0, 5.4, 5.0
+K.CARRY_ACCEL, K.CARRY_EASY, K.CARRY_MASS_POWER, K.CARRY_TWO_HANDS = 500.0, 6.0, 5.4, 5.0
 -- s the thing is put ahead of the hand: the hand is drawn where it will be when the frame is seen, the thing where physics has left it.
 K.CARRY_LEAD = 0.03       -- until the setting is read
 -- A THING THAT CANNOT GO WHERE IT IS PULLED, by a wall or a table: it is not going at the speed it was given. Pulled at full speed it beats
@@ -2687,8 +2728,252 @@ K.HAND_STILL = 0.15       -- m/s: slower than this, the bone and the arm's targe
 -- WHAT WAS WOKEN GOES BACK TO SLEEP FOR GOOD once it has lain still that long: kinematic, as the world had it, until a hand comes for it again.
 K.SETTLE_SPEED, K.SETTLE_FOR = 0.05, 3.0   -- m/s and s
 K.BLOCK_MISS, K.BLOCK_FREE_MISS, K.BLOCK_SLIP, K.BLOCK_SPEED, K.BLOCK_RAMP = 0.03, 0.02, 0.25, 0.6, 30.0
-K.PICTURE_STEPS = 1.5
-K.PICTURE_GAP, K.PICTURE_MEASURE, K.PICTURE_MARGIN = 0.003, 0.05, 0.005   -- m: no ray for less, what a thing measures if it does not say, and room kept from the wall
+-- THE PROOF OF THE HAND CARRIER (2026-11-08): what is held drawn by the engine in the hand's own pass, by a mesh component of the player's bound to the hand slot. Each step says so in the log as [carrier].
+K.CARRIER = { comp = {}, slots = nil }
+K.CARRIER_SAY = function(text) pcall(function() spdlog.info('[carrier] ' .. text) end) end
+-- THE REPLACEMENT (docs/native-hand-physics-build-20261108.md): a world prop is streamed out with distance from where it was placed and its body with it, so what is carried becomes a spawned entity of that mesh, which nothing streams out. On every grab, the user's decision. Each step says so as [swap].
+K.SWAP_TAG = 'VRCarrySwap'
+K.SWAP_DOWN = 25.0           -- m below the prop it is spawned, out of everything's way until it is put in the hand
+K.SWAP_SETTLE = 0.1          -- s before it is put in the hand
+K.SWAP_WAIT = 6.0            -- s the entity may take
+K.SWAP_BACK = 2.0            -- m inside the distance at which the real one was unloaded: it reloads, and the replacement goes
+K.SWAP_ENDS, K.SWAP_LEFT, K.SWAP_LOOK = {}, {}, 0.0
+do
+    local ok, t = pcall(require, 'carry_templates')
+    K.SWAP_TEMPLATES = ok and t or {}
+end
+K.swapSay = function(text) pcall(function() spdlog.info('[swap] ' .. text) end) end
+K.swapDelete = function(id) pcall(function() Game.VRSpawnDelete(id) end) end
+-- It comes out of its template too small to see. Left behind, it is given its size, and the mesh loaded anew so that the size is drawn; the body is not touched by that (a mesh change left it alone, 2026-11-09).
+K.swapShow = function(comp)
+    local okS = pcall(function() comp.visualScale = Vector3.new(1.0, 1.0, 1.0) end)
+    local okR, done = pcall(function() return Game.VRComponentChangeAppearance(comp, CName.new('default'), false) end)
+    return okS and okR and done
+end
+K.swapBegin = function(rec, side)
+    if rec.swap or rec.swapFailed or type(VRCarrierMeshHash) ~= 'function' then return end
+    local hash = VRCarrierMeshHash(side)
+    if not K.SWAP_TEMPLATES[hash] then
+        rec.swapFailed = true
+        K.swapSay('no template for mesh ' .. tostring(hash) .. ': stays the real body')
+        return
+    end
+    local okP, pos = pcall(VRBodyGetPos, rec.body)
+    if not (okP and pos and pos.w > 0.5) then rec.swapFailed = true return end
+    local ok, id = pcall(function()
+        return Game.VRSpawnTemplate('vrport\\carry\\' .. hash .. '.ent', CName.new(''), Vector4.new(pos.x, pos.y, pos.z - K.SWAP_DOWN, 1.0), Quaternion.new(0.0, 0.0, 0.0, 1.0), { CName.new(K.SWAP_TAG) })
+    end)
+    if not ok or not id or id.hash == 0 then
+        rec.swapFailed = true
+        K.swapSay('the spawn could not be asked for: ' .. tostring(id))
+        return
+    end
+    rec.swap = { id = id, step = 'wait', at = os.clock(), hash = hash }
+    K.swapSay(string.format('spawn asked: mesh %s for proxy %.0f', hash, rec.proxy))
+end
+K.swapAbort = function(rec, why)
+    local S = rec.swap
+    if not S then return end
+    rec.swap = nil
+    rec.swapFailed = true
+    K.swapDelete(S.id)
+    K.swapSay('given up, the real body stays: ' .. tostring(why))
+end
+K.swapTick = function(rec, held)
+    local S = rec.swap
+    if not S then return end
+    local now = os.clock()
+    if S.step == 'wait' then
+        local c
+        pcall(function()
+            local e = Game.FindEntityByID(S.id)
+            if e then c = e:FindComponentByName(CName.new('item')) end
+        end)
+        if c then
+            local okB, b = pcall(function() return c:CreatePhysicalBodyInterface(0) end)
+            if okB and b then
+                S.comp, S.body, S.step = c, b, 'settle'
+                K.swapSay(string.format('the entity is in after %.2f s', now - S.at))
+                S.at = now
+            end
+        end
+        if S.step == 'wait' and now - S.at > K.SWAP_WAIT then K.swapAbort(rec, 'no entity in time') end
+    elseif S.step == 'settle' and now - S.at >= K.SWAP_SETTLE then
+        local okI, ids = pcall(VRBodyIds, S.body)
+        local okP, p = pcall(VRBodyGetPos, S.body)
+        local okR, q = pcall(VRBodyGetRot, S.body)
+        if not (okI and ids and ids.w > 0.5 and okP and p and okR and q) then K.swapAbort(rec, 'its body could not be read') return end
+        S.key = ids.x * 4096.0 + ids.y
+        local okS, done = pcall(VRCarrySwap, rec.proxy, rec.index, S.body, Vector4.new(p.x, p.y, p.z, 1.0), Vector4.new(q.i, q.j, q.k, q.r))
+        if okS and done then
+            S.step, S.at = 'asked', now
+        else
+            K.swapAbort(rec, 'the native step refused it')
+        end
+    elseif S.step == 'asked' then
+        if held and held.z > 0.5 then
+            rec.realBody = rec.body
+            rec.body = S.body
+            BODIES[S.key] = rec    -- a ray or a free hand finding the replacement finds this carry
+            S.step = 'done'
+            K.swapSay('carried by the replacement')
+        elseif now - S.at > 2.0 then
+            K.swapAbort(rec, 'the step did not take it')
+        end
+    end
+end
+-- the grip has opened. The native step says at the next physics step what became of the real one
+K.swapRelease = function(rec)
+    local S = rec.swap
+    if not S then return end
+    if S.step ~= 'done' then K.swapAbort(rec, 'let go first') rec.swapFailed = nil return end
+    rec.swap = nil
+    K.SWAP_ENDS[#K.SWAP_ENDS + 1] = { rec = rec, S = S, at = os.clock() }
+end
+K.swapFrame = function()
+    local now = os.clock()
+    for i = #K.SWAP_ENDS, 1, -1 do
+        local E = K.SWAP_ENDS[i]
+        local ok, v = pcall(VRCarrySwapEnd, E.rec.proxy, E.rec.index)
+        local w = ok and v and v.w or -1.0
+        if w >= 0.0 or now - E.at > 2.0 then
+            table.remove(K.SWAP_ENDS, i)
+            BODIES[E.S.key] = nil
+            if E.rec.realBody then E.rec.body, E.rec.realBody = E.rec.realBody, nil end
+            if w > 0.0 then
+                BODIES[E.rec.key] = nil
+                K.swapSay('shown again: ' .. tostring(K.swapShow(E.S.comp)))
+                K.SWAP_LEFT[#K.SWAP_LEFT + 1] = { S = E.S, x = v.x, y = v.y, z = v.z, reach = w }
+                K.swapSay(string.format('the replacement stays; it goes when the player is back within %.1f m of the placement', math.max(w - K.SWAP_BACK, 0.5)))
+            else
+                K.swapDelete(E.S.id)
+                K.swapSay(w == 0.0 and 'the real one took over, replacement deleted' or 'no answer from the step, replacement deleted')
+            end
+        end
+    end
+    if now >= K.SWAP_LOOK and #K.SWAP_LEFT > 0 then
+        K.SWAP_LOOK = now + 0.5
+        local pl = Game.GetPlayer()
+        local p = pl and pl:GetWorldPosition()
+        if p then
+            for i = #K.SWAP_LEFT, 1, -1 do
+                local L = K.SWAP_LEFT[i]
+                local dx, dy, dz = p.x - L.x, p.y - L.y, p.z - L.z
+                local near = math.sqrt(dx * dx + dy * dy + dz * dz) < math.max(L.reach - K.SWAP_BACK, 0.5)
+                local held = false
+                for side = 0, 1 do
+                    if HOLD[side] and HOLD[side].rec.key == L.S.key then held = true end
+                end
+                if near and not held then
+                    table.remove(K.SWAP_LEFT, i)
+                    K.swapDelete(L.S.id)
+                    K.swapSay('back in range of its placement: replacement deleted')
+                end
+            end
+        end
+    end
+end
+K.carrierFind = function(side)
+    local C = K.CARRIER
+    if C.comp[side] and C.slots then return C.comp[side] end
+    local pl = Game.GetPlayer()
+    if not pl then return nil end
+    local ok, cs = pcall(function() return Game.VREntityComponents(pl) end)
+    if not (ok and cs) then return nil end
+    local want = side == 0 and 'vrp_hold_left' or 'vrp_hold_right'
+    for i = 1, #cs do
+        local n = tostring(cs[i]:GetName())
+        if n:find('ItemAttachmentSlots', 1, true) then C.slots = cs[i] end
+        if n:find(want, 1, true) then
+            C.comp[side] = cs[i]
+            pcall(function() cs[i].renderingPlane = 'RPl_Weapon' end)
+            pcall(function() cs[i].forceLODLevel = 0 end)
+        end
+    end
+    return C.comp[side]
+end
+K.carrierOff = function(rec)
+    local S = rec.carrier
+    if not S then return end
+    rec.carrier = nil
+    pcall(function() S.c:Toggle(false) end)
+    if type(VRCarryHide) == 'function' then pcall(VRCarryHide, rec.proxy, rec.index, false) end
+    K.CARRIER_SAY(string.format('off: proxy %.0f, the copy was in the hand %.2f s', rec.proxy, os.clock() - S.at))
+end
+K.carrierTick = function(rec, side, tx, ty, tz, ti, tj, tk, tr)
+    if rec.carrierFailed or type(VRHeldMeshOnto) ~= 'function' then return end
+    local S = rec.carrier
+    -- ON THE HAND IT IS ON, for as long as that hand has it: with both on it the list starts with the left, and the copy jumped there and was loaded again
+    if S and S.side ~= side then
+        local H = K.carrierHold and K.carrierHold(S.side)
+        if H and H.rec == rec then side = S.side else K.carrierOff(rec); S = nil end
+    end
+    if not S then
+        local c = K.carrierFind(side)
+        if not c or not K.CARRIER.slots then
+            rec.carrierFailed = true
+            K.CARRIER_SAY('no carrier or no slots component on the player: the picture stays')
+            return
+        end
+        local ok, done = pcall(VRHeldMeshOnto, c, rec.proxy, side)
+        if not ok or not done then
+            rec.carrierFailed = true
+            K.CARRIER_SAY('the mesh could not be read: ' .. tostring(done))
+            return
+        end
+        local okT = pcall(function() c:Toggle(true) end)
+        S = { c = c, side = side, at = os.clock() }
+        rec.carrier = S
+        K.CARRIER_SAY(string.format('on: proxy %.0f body %.0f, hand %d, toggled %s', rec.proxy, rec.index, side, tostring(okT)))
+        pcall(K.swapBegin, rec, side)
+    end
+    if type(VRCarrierSlotHold) == 'function' then pcall(VRCarrierSlotHold, S.side) end
+    local age = os.clock() - S.at
+    -- THE GRIP WAS REBUILT (carryBase): the copy goes where the body now is in the hand. Not while a wall holds it off: the slot is then moved with the hand and the target is not.
+    if rec.carrierReplace or S.placeWait then
+        rec.carrierReplace = nil
+        S.placeWait = (rec.nativeHeld or 0.0) > K.HAND_SLACK
+        S.placeAt = os.clock()
+        S.placed = nil
+    end
+    local placeAge = os.clock() - (S.placeAt or S.at)
+    -- how it sits in the slot's frame: while the grip settles, then left alone, so it is rigid on the hand
+    if placeAge < 0.35 and not S.placeWait then
+        local name = side == 0 and 'WeaponLeft' or 'WeaponRight'
+        local ok, f, st = pcall(function() return K.CARRIER.slots:GetSlotTransform(CName.new(name)) end)
+        if ok and f and st then
+            local okP, sp = pcall(function() return WorldPosition.ToVector4(st.Position) end)
+            local sq = st.Orientation
+            if okP and sp and sq then
+                local lx, ly, lz = qrot(-sq.i, -sq.j, -sq.k, sq.r, tx - sp.x, ty - sp.y, tz - sp.z)
+                local li, lj, lk, lr = qmul(-sq.i, -sq.j, -sq.k, sq.r, ti, tj, tk, tr)
+                local okS = pcall(function() S.c:SetLocalTransform(Vector4.new(lx, ly, lz, 1.0), Quaternion.new(li, lj, lk, lr)) end)
+                if not S.placed then
+                    S.placed = true
+                    K.CARRIER_SAY(string.format('placed %s: %.3f %.3f %.3f in the slot', tostring(okS), lx, ly, lz))
+                end
+            end
+        elseif not S.noSlot then
+            S.noSlot = true
+            K.CARRIER_SAY('the hand slot gave no transform')
+        end
+    end
+    -- THE REAL ONE STAYS UNTIL THE COPY IS THERE: the load has finished, and a little more for the renderer to have it. Two seconds at most, so a load that never reports does not leave two of them.
+    if not S.hidden and type(VRCarryHide) == 'function' then
+        local now = os.clock()
+        if not S.readyAt and type(VRCarrierReady) == 'function' then
+            local okR, ready = pcall(VRCarrierReady, S.side)
+            if okR and ready then S.readyAt = now end
+        end
+        local noSignal = type(VRCarrierReady) ~= 'function'
+        if (S.readyAt and now - S.readyAt >= 0.05) or age >= 2.0 or (noSignal and age >= 0.15) then
+            S.hidden = true
+            pcall(VRCarryHide, rec.proxy, rec.index, true)
+            K.CARRIER_SAY(string.format('the real mesh is out of sight after %.2f s (%s)', age, S.readyAt and 'copy loaded' or 'time limit'))
+        end
+    end
+end
+K.QUERY_MOST = 0.0   -- nothing is hidden from queries any more: Natives/PhysicsRuntime.cpp keeps a held thing out of the player capsule's way instead
 K.QUERY_HAND, K.QUERY_AFTER, K.QUERY_BACK = 0.3, 0.3, {}   -- m a free hand is near, s after letting go it stays hidden (it may still be inside the player), and what is waiting for that
 K.BLOCK_ALONG, K.BLOCK_STEPS, K.BLOCK_FREE_STEPS = 0.5, 3, 6   -- less of the told speed than this along it, this many steps running, and this many free steps end it
 K.HAND_SLACK, K.HAND_TRAIL = 0.02, 0.25          -- m the drawn hand ignores, and the most it stays behind
@@ -2778,6 +3063,7 @@ end
 -- How a hand holds the thing, from how they stand now: the place it took (lx, ly, lz, in the thing's frame) is at (ax, ay, az) in the hand's, and
 -- that is one point: a thing turned in the hand turns about it. (gx, gy, gz) is the wrist, in the thing's frame, for two hands.
 local function carryBase(H, pos, rot)
+    H.rec.carrierReplace = true
     local ci, cj, ck, cr = -H.qi, -H.qj, -H.qk, H.qr
     local wx, wy, wz = qrot(rot.i, rot.j, rot.k, rot.r, H.lx, H.ly, H.lz)
     H.ax, H.ay, H.az = qrot(ci, cj, ck, cr, pos.x + wx - H.px, pos.y + wy - H.py, pos.z + wz - H.pz)
@@ -2961,6 +3247,7 @@ K.deadForce = function(side, bx, by, bz, ii, ij, ik, ir)
     end
 end
 
+K.carrierHold = function(side) return HOLD[side] end
 local function carryRelease(side, keepSpeed)
     local H = HOLD[side]
     HOLD[side] = nil
@@ -2985,8 +3272,11 @@ local function carryRelease(side, keepSpeed)
         pcall(function() spdlog.info('[HandColl] the other hand has it') end)
         return
     end
-    if type(VRHeldPictureLetGo) == 'function' then pcall(VRHeldPictureLetGo, rec.proxy, rec.index) end
     if rec.queryOff then K.QUERY_BACK[rec] = os.clock() + K.QUERY_AFTER end
+    local nativeHeld = rec.nativeMode and rec.nativeMode > 0
+    pcall(K.carrierOff, rec)
+    pcall(K.swapRelease, rec)
+    rec.nativeMode = nil
     local speed = 0.0
     if keepSpeed then
         local vx, vy, vz, wx, wy, wz = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -3020,8 +3310,18 @@ local function carryRelease(side, keepSpeed)
             wx, wy, wz = wx * k, wy * k, wz * k
         end
         rec.thrown = os.clock()
-        pcall(VRBodySetVel, rec.body, Vector4.new(vx, vy, vz, 0.0))
-        pcall(VRBodySetAngVel, rec.body, Vector4.new(wx, wy, wz, 0.0))
+        -- in the native step before PhysX runs it, or the throw lands on a body that is still kinematic
+        -- once only: through the game's queue as well, it landed a frame later over whatever had happened since
+        local okL, sent = false, false
+        if nativeHeld and type(VRCarryLetGo) == 'function' then
+            okL, sent = pcall(VRCarryLetGo, rec.proxy, rec.index, Vector4.new(vx, vy, vz, 0.0), Vector4.new(wx, wy, wz, 0.0), true)
+        end
+        if not (okL and sent) then
+            pcall(VRBodySetVel, rec.body, Vector4.new(vx, vy, vz, 0.0))
+            pcall(VRBodySetAngVel, rec.body, Vector4.new(wx, wy, wz, 0.0))
+        end
+    elseif nativeHeld and type(VRCarryLetGo) == 'function' then
+        pcall(VRCarryLetGo, rec.proxy, rec.index, Vector4.new(0.0, 0.0, 0.0, 0.0), Vector4.new(0.0, 0.0, 0.0, 0.0), false)
     end
     pcall(function() spdlog.info(string.format('[HandColl] let go: %.1f m/s', speed)) end)
 end
@@ -3318,7 +3618,8 @@ local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
     -- would look left behind, by its speed times a frame.
     local okV, v = pcall(VRBodyGetVel, body)
     local hasV = okV and v and v.w > 0.5
-    local ahead = step + K.CARRY_LEAD
+    -- the native step already aims a frame ahead, and its body is where it was sent
+    local ahead = (rec.nativeMode or 0) > 0 and 0.0 or step + K.CARRY_LEAD
     local goesx, goesy, goesz = pos.x, pos.y, pos.z
     if hasV then goesx, goesy, goesz = pos.x + v.x * ahead, pos.y + v.y * ahead, pos.z + v.z * ahead end
     tx, ty, tz = tx + vx * K.CARRY_LEAD, ty + vy * K.CARRY_LEAD, tz + vz * K.CARRY_LEAD
@@ -3356,7 +3657,8 @@ local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
 
     -- NOT IN THE PLAYER'S WAY. To the player's movement a carried thing is an obstacle, so with it in front of them they walked into their own hand and stood still. Queries off hides it from
     -- movement, as the lobby does with what it carries; it goes on colliding with walls. But rays do not see it either, so a free hand coming to it gets it back: for taking hold, and to lay its fingers on it.
-    if type(VRBodySetQueryable) == 'function' then
+    -- OFF (K.QUERY_MOST 0): every crash on letting go was a query reaching a released shape, with the native carry on and off alike, and with this off for that prop they stopped (2026-11-08).
+    if type(VRBodySetQueryable) == 'function' and rec.mass < K.QUERY_MOST then
         local off = true
         if n == 1 then
             local ox, oy, oz = handReal(1 - hands[1], bx, by, bz, ii, ij, ik, ir)
@@ -3371,39 +3673,35 @@ local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
             pcall(VRBodySetQueryable, body, not off)
         end
     end
-    rec.pictured = false
-    if type(VRHeldPicture) == 'function' then
-        -- A WALL AHEAD. The body stops at it, but learning that from the body takes some steps, and meanwhile the picture is in the wall. So ask the wall: along the way from the body to where the
-        -- picture goes, how much room is there, less what the thing measures in that direction? Too much of a measure only means the picture is on its body a little sooner, near a wall.
-        local reach = -1.0
-        local gx, gy, gz = ptx - pos.x, pty - pos.y, ptz - pos.z
-        local gap = math.sqrt(gx * gx + gy * gy + gz * gz)
-        local sys = gap > K.PICTURE_GAP and worldSystem() or nil
-        if sys then
-            if rec.dims == nil then
-                local okD, d = pcall(VRBodyGetDims, body)
-                rec.dims = okD and d and d.w > 0.5 and { d.x, d.y, d.z } or false
+    -- THE BODY ITSELF ON THE HAND (Natives/PhysicsRuntime.cpp): kinematic, or by velocity written just before PhysX steps. No picture, nothing a frame behind.
+    rec.nativeMode = 0
+    if type(VRCarryHold) == 'function' then
+        local accel = rec.kind == 12 and K.CARRY_ACCEL or carryAccel(rec.mass, n)
+        local okH, held = pcall(VRCarryHold, rec.proxy, rec.index, hands[1], Vector4.new(pgx, pgy, pgz, 1.0), Vector4.new(pti, ptj, ptk, ptr), accel, Vector4.new(pos.x, pos.y, pos.z, 1.0), Vector4.new(rot.i, rot.j, rot.k, rot.r), Vector4.new(pa.px, pa.py, pa.pz, 1.0), Vector4.new(pa.qi, pa.qj, pa.qk, pa.qr), HAND[hands[1]].index)
+        if okH and held and held.w > 0.5 then
+            rec.nativeMode = held.w
+            rec.nativeHeld = held.x
+            if held.y > 0.5 then
+                local okC, errC = pcall(K.carrierTick, rec, hands[1], ptx, pty, ptz, wti, wtj, wtk, wtr)
+                if not okC then rec.carrierFailed = true; K.CARRIER_SAY('failed: ' .. tostring(errC)) end
+                local okW, errW = pcall(K.swapTick, rec, held)
+                if not okW then K.swapSay('tick failed: ' .. tostring(errW)) end
             end
-            local ex = K.PICTURE_MEASURE
-            if rec.dims then
-                local lx, ly, lz = qrot(-rot.i, -rot.j, -rot.k, rot.r, gx / gap, gy / gap, gz / gap)
-                ex = math.abs(lx) * rec.dims[1] + math.abs(ly) * rec.dims[2] + math.abs(lz) * rec.dims[3]
-            end
-            -- the body will have gone on by the time this is used
-            local run = hasV and math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z) * step * K.PICTURE_STEPS or 0.0
-            ex = ex + run
-            local k = (gap + ex + K.PICTURE_MARGIN) / gap
-            local d = rayDistance(sys, Vector4.new(pos.x, pos.y, pos.z, 1.0), Vector4.new(pos.x + gx * k, pos.y + gy * k, pos.z + gz * k, 1.0), pos.x, pos.y, pos.z, false)
-            if d then reach = math.max(0.0, d - ex - K.PICTURE_MARGIN) end
+            rec.blocked = held.x > K.BLOCK_FREE_MISS and K.BLOCK_SPEED or nil
+            -- the hand goes to the thing when the world or its weight holds the thing back, and always where the mesh cannot be drawn on the hand (a corpse): then the hand is what closes the gap
+            -- with a copy on the hand the native pass stops the hand with the thing; the script must not move it as well
+            rec.pictured = held.y > 0.5 and (rec.carrier ~= nil or held.x <= K.HAND_SLACK)
+            if type(VRCarryHands) == 'function' then pcall(VRCarryHands, rec.proxy, rec.index, n == 2 and hands[2] or -1, rec.carrier ~= nil) end
         end
-        local ok, on = pcall(VRHeldPicture, rec.proxy, rec.index, HAND[hands[1]].index, Vector4.new(pgx, pgy, pgz, reach), Vector4.new(pti, ptj, ptk, ptr), rec.blocked ~= nil)
-        -- held short of the wall, the hand stays on it too
-        rec.pictured = ok and on and not rec.blocked and (reach < 0.0 or reach > gap * 0.5) or false
-        if ok and not on then sayOnce('a carried thing whose picture stays on its body: kind ' .. tostring(rec.kind)) end
     end
-
-    -- the pull, as far as these hands can give it
+    if rec.kind == 12 and rec.nativeMode > 0 then K.corpseTick(rec, pos, dt) end
+    -- the pull and the turn below are only for a body the native step does not have
+    if rec.nativeMode == 0 then
+    rec.pictured = false
+    end
     local accel = rec.kind == 12 and K.CARRY_ACCEL or carryAccel(rec.mass, n)
+    if rec.nativeMode == 0 then
+    -- the pull, as far as these hands can give it
     local follow = K.CARRY_FOLLOW / step
     local ex, ey, ez = (tx - pos.x) * follow, (ty - pos.y) * follow, (tz - pos.z) * follow
     if rec.blocked then
@@ -3457,7 +3755,8 @@ local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
     end
     -- what it was told, less the fall a step of gravity takes off it again
     rec.toldx, rec.toldy, rec.toldz = wantx, wanty, wantz - 9.81 * dt
-    do
+    end
+    if rec.nativeMode == 0 then
         local spin = K.CARRY_SPIN * math.min(1.0, accel / 60.0) * (rec.blocked and 0.3 or 1.0)
         local ei, ej, ek, er = qmul(ti, tj, tk, tr, -rot.i, -rot.j, -rot.k, rot.r)
         local sign = er < 0.0 and -1.0 or 1.0
@@ -3503,7 +3802,9 @@ local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
                     d and d[1] or 0.0, d and d[2] or 0.0, d and d[3] or 0.0, rec.blocked and 'blocked' or 'free', n)) end)
             end
         end
-        H.lost = dev > K.HAND_LOST_AT and H.lost + dt or 0.0
+        -- LOST, on the native step, only when the world holds it away from the hand. Measured from the body, walking counted as losing it, and the thing was dropped from a closed hand (2026-11-08).
+        local lostBy = rec.nativeMode > 0 and rec.nativeHeld or dev
+        H.lost = lostBy > K.HAND_LOST_AT and H.lost + dt or 0.0
         -- TWO HANDS, ONE TAKEN FROM A LITTLE WAY OFF: drawn on the place it took, on the picture, since neither hand's real place moves the thing away from it. Nothing to feed back: the target goes by the real hands.
         local onPicture = rec.pictured and n == 2
         if onPicture then
@@ -3521,7 +3822,10 @@ local function carryDrive(rec, dt, bx, by, bz, ii, ij, ik, ir)
     end
     for a = 1, n do
         local H = HOLD[hands[a]]
-        if H and H.lost > (rec.kind == 12 and K.CORPSE_LOST or K.HAND_LOST_FOR) then carryRelease(hands[a], false) end
+        if H and H.lost > (rec.kind == 12 and K.CORPSE_LOST or K.HAND_LOST_FOR) then
+            pcall(function() spdlog.info(string.format('[HandColl] the hand lost it: native %.0f, held off %.3f m', rec.nativeMode, rec.nativeHeld or -1.0)) end)
+            carryRelease(hands[a], false)
+        end
     end
 end
 
@@ -4223,7 +4527,9 @@ local function carry(allowed, holder, dt, bx, by, bz, ii, ij, ik, ir)
         if allowed and holder ~= side and not SKIP[side] and not K.NPC_GRIP[side] then pcall(K.npcTick, side, edge, bx, by, bz, ii, ij, ik, ir) end
         K.pf('people')
         if HOLD[side] then
-            if not allowed or holder == side or SKIP[side] then carryRelease(side, false)
+            if not allowed or holder == side or SKIP[side] then
+                pcall(function() spdlog.info(string.format('[HandColl] made to let go: allowed %s, holder %s, skip %s', tostring(allowed), tostring(holder), tostring(SKIP[side]))) end)
+                carryRelease(side, false)
             elseif not grip then carryRelease(side, true) end
         elseif edge and allowed and holder ~= side and not SKIP[side] and not K.reachBusy(side) then
             pcall(carryFind, side, bx, by, bz, ii, ij, ik, ir)
@@ -4280,6 +4586,7 @@ registerForEvent('onInit', function()
 end)
 
 registerForEvent('onUpdate', function(dt)
+    pcall(HC.K.swapFrame)
     dbgAcc = dbgAcc + (dt or 0.016)
     if dbgAcc >= 1.0 then
         dbgAcc = 0.0

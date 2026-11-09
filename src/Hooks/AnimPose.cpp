@@ -1,4 +1,5 @@
 #include "Utils/DebugGate.hpp"
+#include "Natives/HeldPicture.hpp"
 #include "Anim/HandGestures.hpp"
 // AnimPose -- THE HOOK. The engine's animation pose-apply, detoured.
 //
@@ -430,6 +431,8 @@ if (g_VRRecordFK) {
                     const float len=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]+n[3]*n[3]);
                     if(len>1e-6f)for(int c=0;c<4;++c)q[c]=n[c]/len;
                 }
+                // THE SLOT A COPY OF A HELD THING RIDES: what the game's animation does to it must not turn the copy (Natives/HeldPicture.cpp).
+                cvr::heldpicture::SlotPass(boneBuf,g_VRSmokeCigIdx,g_VRSmokeLighterIdx);
                 // GLOVES LAST: with finger-tracking gloves every finger is the player's own, whatever any layer
                 // above wrote (xr_finger_bones, Anim/HandGestures.cpp).
                 cvr::gestures::ApplyGloves(boneBuf);

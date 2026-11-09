@@ -1,5 +1,8 @@
 // HeldPicture -- a carried thing is drawn on the drawn hand, in the same frame, and its body stays in PhysX.
 //
+// RETIRED AND BROUGHT BACK 2026-11-08: with the body driven natively the mesh still trailed on a wrist turn, since a physics step always rests on a guess of where the wrist will be. The body now lands within millimetres,
+// so this is a small correction. Only kind 10 props have these records. Called from Natives/PhysicsRuntime.cpp; the solver's answer comes through Correct.
+//
 // WHY. A body can only follow the hand from one physics step to the next, so it is a frame behind at best: 7 to 10 cm at 3 m/s (measured 2026-11-04). The body has to stay a
 // body, for walls and for the throw. Only its picture has to be on the hand, and the picture is a separate thing.
 //
@@ -14,6 +17,7 @@
 //
 // NOT PROVEN until it has run: that the message sent at the submit reaches this frame, and what motion vectors and ray tracing do. The [picture] lines in the log are for that.
 #include "Natives/HeldPicture.hpp"
+#include "Natives/PhysicsRuntime.hpp"
 #include "Natives/NativeFunctions.hpp"
 #include "Natives/DebugView.hpp"
 #include "Anim/VrikState.hpp"
@@ -24,6 +28,9 @@
 #include <RED4ext/Scripting/Utils.hpp>
 #include <RED4ext/Scripting/Natives/Vector4.hpp>
 #include <windows.h>
+#include <atomic>
+#include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -40,10 +47,10 @@ namespace {
 constexpr uintptr_t kUpdateRva=0x5C3454,kListenerEntryRva=0x5C3010,kSystemRva=0x3BFCDD0,kListeners=0x222018,kRecords=0x1A2018,kProxyId=0x160,kListenerAt=0x100;
 constexpr uint32_t kRecordSize=64,kMostInstances=256;      // the instance's alive mask has 4 words
 constexpr double kFixed=131072.0;
+constexpr double kHideBelow=4.0;   // m: where the real mesh goes while a copy rides the hand. Was 1000: near, so the renderer has no reason to treat it as far away (not proved that it did, 2026-11-09)
 constexpr float kBlendIn=.08f,kBlendOut=.1f;              // s
 constexpr float kFarFromBody=3.f;                         // m: a picture further than this means this file has misread something, or the player has been moved
-constexpr uint64_t kUnaskedMs=150;
-constexpr float kMostSpin=50.f;                           // rad/s: a wrist flick is above PhysX's 7, measured held to exactly that
+constexpr uint64_t kUnaskedMs=750;
 
 struct Pose {float p[3];float q[4];};
 struct Slot {
@@ -53,6 +60,13 @@ struct Slot {
     float offset[3],turn[4];
     bool blocked;
     float reach;
+    float fixP[3],fixQ[4];
+    int side;
+    bool hidden;
+    float handFix[4];
+    double offBoneSum,offBoneMost,heldTurnSum,heldTurnMost;
+    uint32_t heldTurnCount;
+    uint32_t offBoneCount;
     uint64_t askedAt;
     float weight;     // 0 the body, 1 the hand
     bool posed;
@@ -141,7 +155,7 @@ bool Picture(Slot& s,uint8_t* record) {
     return true;
 }
 // Where the hand has the thing now. The player as the engine has it this frame, the bone as animated for it.
-bool HandPose(const Slot& s,Pose& out) {
+bool HandPose(Slot& s,Pose& out) {
     if(!CyberpunkVR_PlayerEntityValid || s.bone<0 || s.bone>=g_VRFKSnapCount)return false;
     float bone[3],rot[4],q[4],at[3],world[4],off[3];
     for(int k=0;k<3;++k)bone[k]=g_VRFKSnapPos[s.bone][k];
@@ -150,9 +164,39 @@ bool HandPose(const Slot& s,Pose& out) {
     if(!UnitLike(rot) || !UnitLike(q))return false;
     Rotate(q,bone,at);
     Mul(q,rot,world);
+    // THE TURN THE ARM IS SOLVED WITH, not the skeleton snapshot's: position followed the hand and the wrist's turn did not (2026-11-08). The log says how far apart the two are.
+    if(s.side>=0) {
+        float wrist[4],now[4];
+        if(cvr::physicsruntime::HandTurn(s.side,wrist) && UnitLike(wrist)) {
+            Mul(wrist,s.handFix,now);
+            const float d=std::fabs(now[0]*world[0]+now[1]*world[1]+now[2]*world[2]+now[3]*world[3]);
+            const double degrees=2.0*std::acos(d>1.f?1.f:d)*57.29578;
+            s.offBoneSum+=degrees;
+            if(degrees>s.offBoneMost)s.offBoneMost=degrees;
+            ++s.offBoneCount;
+            // the overlay's "lead": ahead of the hand by that long, if what is sent here reaches the screen a frame after the hand does (not proved either way)
+            const float lead=g_liveControls.xrCarryLead;
+            float spin[3];
+            if(lead>0.f && lead<=.06f && cvr::physicsruntime::HandSpin(s.side,spin)) {
+                const float half=lead*.5f;
+                const float a[4]={spin[0]*half,spin[1]*half,spin[2]*half,1.f};
+                const float n=std::sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]+1.f);
+                const float d[4]={a[0]/n,a[1]/n,a[2]/n,1.f/n};
+                float ahead[4];
+                Mul(d,now,ahead);
+                std::copy_n(ahead,4,now);
+            }
+            std::copy_n(now,4,world);
+        }
+    }
     Rotate(world,s.offset,off);
-    for(int k=0;k<3;++k)out.p[k]=CyberpunkVR_PlayerEntityPos[k]+at[k]+off[k];
+    for(int k=0;k<3;++k)out.p[k]=CyberpunkVR_PlayerEntityPos[k]+at[k]+off[k]+s.fixP[k];
     Mul(world,s.turn,out.q);
+    {
+        float turned[4];
+        Mul(s.fixQ,out.q,turned);
+        std::copy_n(turned,4,out.q);
+    }
     const float n=std::sqrt(out.q[0]*out.q[0]+out.q[1]*out.q[1]+out.q[2]*out.q[2]+out.q[3]*out.q[3]);
     if(!std::isfinite(n) || n<1e-4f)return false;
     for(int k=0;k<4;++k)out.q[k]/=n;
@@ -179,7 +223,10 @@ void Update(uint8_t* instance,void* spanArg,uint32_t count) {
     for(auto& s:slots) {
         if(!s.used || s.proxy!=proxy || s.body>=count)continue;
         if(!changed)std::memcpy(copy,static_cast<Span*>(spanArg)->begin,size_t(count)*kRecordSize);
-        if(Picture(s,copy+size_t(s.body)*kRecordSize))changed=true;
+        if(Picture(s,copy+size_t(s.body)*kRecordSize)) {
+            changed=true;
+            if(s.hidden)reinterpret_cast<int32_t*>(copy+size_t(s.body)*kRecordSize)[2]-=int32_t(kHideBelow*kFixed);
+        }
         ++s.detours;
         s.detourThread=GetCurrentThreadId();
         LARGE_INTEGER now;QueryPerformanceCounter(&now);
@@ -192,13 +239,13 @@ void Update(uint8_t* instance,void* spanArg,uint32_t count) {
 }
 void Report(const Slot& s) {
     const uint64_t took=s.firstTick?GetTickCount64()-s.firstTick:0;
-    Log("[picture] proxy %u body %u of %u let go: %.0f frames a second; %u frames, %u sent at the submit, the engine's own %u (thread %lu), body behind the hand mean %.3f most %.3f m, blocked %u frames, too far %u, submit after engine's own %.1f ms\n",
-        s.proxy,s.body,s.instances,took?s.frames*1000.0/took:0.,s.frames,s.sends,s.detours,s.detourThread,s.frames?s.behindSum/s.frames:0.,s.behindMost,s.blockedFrames,s.tooFar,s.detourGaps?s.detourGapSum/s.detourGaps:0.);
+    Log("[picture] proxy %u body %u of %u let go: %.0f frames a second; %u frames, %u sent at the submit, the engine's own %u (thread %lu), body behind the hand mean %.3f most %.3f m, blocked %u frames, too far %u, submit after engine's own %.1f ms; arm's turn off the snapshot's mean %.1f most %.1f deg; turn the solver held back mean %.1f most %.1f deg\n",
+        s.proxy,s.body,s.instances,took?s.frames*1000.0/took:0.,s.frames,s.sends,s.detours,s.detourThread,s.frames?s.behindSum/s.frames:0.,s.behindMost,s.blockedFrames,s.tooFar,s.detourGaps?s.detourGapSum/s.detourGaps:0.,s.offBoneCount?s.offBoneSum/s.offBoneCount:0.,s.offBoneMost,s.heldTurnCount?s.heldTurnSum/s.heldTurnCount:0.,s.heldTurnMost);
 }
 }  // namespace
 
 bool Hold(uint32_t proxy,uint32_t body,int bone,const float offset[3],const float turn[4],bool blocked,float reach) {
-    if(!installed || !g_liveControls.xrCarryPicture || body>=kMostInstances)return false;
+    if(!installed || !g_liveControls.xrNativePhysics || body>=kMostInstances)return false;
     if(!InstanceOf(proxy))return false;
     const auto now=GetTickCount64();
     AcquireSRWLockExclusive(&lock);
@@ -207,7 +254,7 @@ bool Hold(uint32_t proxy,uint32_t body,int bone,const float offset[3],const floa
     if(!slot)for(auto& s:slots)if(!s.used) {
         slot=&s;
         std::memset(&s,0,sizeof(s));
-        s.used=true;s.proxy=proxy;s.body=body;
+        s.used=true;s.proxy=proxy;s.body=body;s.fixQ[3]=1.f;s.side=-1;s.handFix[3]=1.f;
         InterlockedExchange(&anyUsed,1);
         break;
     }
@@ -221,9 +268,34 @@ bool Hold(uint32_t proxy,uint32_t body,int bone,const float offset[3],const floa
     return slot!=nullptr;
 }
 
+void Correct(uint32_t proxy,uint32_t body,const float dp[3],const float dq[4],int side,const float handFix[4]) {
+    AcquireSRWLockExclusive(&lock);
+    for(auto& s:slots)if(s.used && s.proxy==proxy && s.body==body) {
+        std::copy_n(dp,3,s.fixP);
+        std::copy_n(dq,4,s.fixQ);
+        {
+            const float w=std::fabs(dq[3]);
+            const double degrees=2.0*std::acos(w>1.f?1.f:w)*57.29578;
+            s.heldTurnSum+=degrees;
+            if(degrees>s.heldTurnMost)s.heldTurnMost=degrees;
+            ++s.heldTurnCount;
+        }
+        s.side=side;
+        std::copy_n(handFix,4,s.handFix);
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+uint8_t* Instance(uint32_t proxy) {return installed?InstanceOf(proxy):nullptr;}
+void Hide(uint32_t proxy,uint32_t body,bool hide) {
+    AcquireSRWLockExclusive(&lock);
+    for(auto& s:slots)if(s.used && s.proxy==proxy && s.body==body)s.hidden=hide;
+    ReleaseSRWLockExclusive(&lock);
+}
 void LetGo(uint32_t proxy,uint32_t body) {
     AcquireSRWLockExclusive(&lock);
     for(auto& s:slots)if(s.used && s.proxy==proxy && s.body==body) {
+        s.hidden=false;
         s.letGo=true;
         s.asked=false;
         s.relSet=false;
@@ -245,12 +317,6 @@ void AtFrameSubmit() {
     for(auto& s:slots) {
         if(!s.used)continue;
         s.asked=!s.letGo && tick-s.askedAt<=kUnaskedMs;
-        if(!s.spun) {
-            s.spun=true;
-            float was=0;
-            const bool raised=cvr::debugview::RaiseSpin(s.proxy,s.body,kMostSpin,&was);
-            Log("[picture] proxy %u body %u: most spin %s, was %.1f rad/s\n",s.proxy,s.body,raised?"raised":"left alone",was);
-        }
         if(s.blocked && s.asked)++s.blockedFrames;
         // After the last ask the picture stays where the hand last had it, and goes to the body: the hand is off elsewhere by then.
         if(s.asked) {
@@ -293,6 +359,7 @@ void AtFrameSubmit() {
             s.lastSubmit=s.lastDetour;
         }
         if(!Picture(s,record))continue;
+        if(s.hidden)reinterpret_cast<int32_t*>(record)[2]-=int32_t(kHideBelow*kFixed);
         ++s.sends;
         // Two things on one instance are rare, and each is put right by the other's next frame.
         ReleaseSRWLockExclusive(&lock);
@@ -323,114 +390,48 @@ CVR_HOOK("HeldPicture",::cvr::hooks::Stage::Boot,84,Install);
 }  // namespace
 }  // namespace cvr::heldpicture
 
-void VRHeldPictureLetGo(RED4ext::IScriptable*,RED4ext::CStackFrame* stack,bool* out,int64_t) {
-    int32_t proxy=0,body=0;
-    RED4ext::GetParameter(stack,&proxy);
-    RED4ext::GetParameter(stack,&body);
-    stack->code++;
-    if(proxy>0 && body>=0)cvr::heldpicture::LetGo(uint32_t(proxy),uint32_t(body));
-    if(out)*out=true;
-}
-
-// THE GAME'S OWN OUTLINE ON A THING WITHOUT AN ENTITY. entRenderHighlightEvent ends in sub_14079FE8C(render object, params) and that in a command of the render scene: slot 0x2D8 (sub_1407A0190), arguments &object+8, &object+0x10,
-// on, mask, opacity, 0. Read in the exe, all callers (sub_14079FE8C, sub_140402428, sub_1403DA0F4) alike. Mask: 1 an outline, 2 a fill, the index <<2, 0x40 through walls. The render side (sub_14067AAB4) calls slot 0xD0 of what +0x10 holds
-// and goes on only for what that answers with a type (+0x7D >>3) of 1, 5 or 7. A prop's object is at instance+0xC8 and is of the same make: sub_14020A038 reads it the same way, +8 a thing with a vtable, +0x10 the handle. The first try passed
-// +0x10 first and null second, read as fill and outline: a crash on the render thread at sub_14067AAFF. The whole object lights up: a node's instances together.
+// THE HAND SLOT HELD STILL UNDER A COPY (docs/native-hand-physics-build-20261108.md). The slot bones are parent-local and the game's animation owns them; VRIK places only the wrist.
+namespace cvr::heldpicture {
 namespace {
-bool Readable(uintptr_t at,size_t size) {
-    if(at<0x10000)return false;
-    MEMORY_BASIC_INFORMATION m{};
-    if(!VirtualQuery(reinterpret_cast<void*>(at),&m,sizeof(m)) || m.State!=MEM_COMMIT || (m.Protect&(PAGE_NOACCESS|PAGE_GUARD)))return false;
-    return at+size<=reinterpret_cast<uintptr_t>(m.BaseAddress)+m.RegionSize;
+std::atomic<uint64_t> slotAsked[2];
+struct SlotHold {bool on=false;alignas(16) uint8_t saved[48];int frames=0,turned=0;float mostTurn=0,mostMove=0;};
+SlotHold slotHold[2];
+constexpr float kSlotCountFromDeg=15.f;
 }
-// In the image, in .text: a slot of a vtable that has it.
-bool CodeOfImage(uintptr_t at) {
-    static uintptr_t lo=0,hi=0;
-    if(!lo) {
-        const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(cvr::heldpicture::base);
-        const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(cvr::heldpicture::base+dos->e_lfanew);
-        const auto* section=IMAGE_FIRST_SECTION(nt);
-        for(int i=0;i<nt->FileHeader.NumberOfSections;++i,++section)if(!std::memcmp(section->Name,".text",5)) {
-            lo=cvr::heldpicture::base+section->VirtualAddress;
-            hi=lo+section->Misc.VirtualSize;
+void SlotAsk(int side) {if(side==0||side==1)slotAsked[side]=GetTickCount64();}
+void SlotPass(uint8_t* bones,int rightSlot,int leftSlot) {
+    const uint64_t now=GetTickCount64();
+    for(int side=0;side<2;++side) {
+        SlotHold& s=slotHold[side];
+        const int bone=side==1?rightSlot:leftSlot;
+        const uint64_t asked=slotAsked[side].load();
+        const bool want=asked!=0 && now-asked<250 && bone>=0 && bone<VRIK_MAX_BONES;
+        if(!want) {
+            if(s.on) {
+                s.on=false;
+                Log("[carrier] hand %d: slot held %d frames; the animation turned it more than 15 deg in %d of them, most %.1f deg, moved it most %.1f mm\n",side,s.frames,s.turned,s.mostTurn,s.mostMove*1000.f);
+            }
+            continue;
         }
-    }
-    return at>=lo && at<hi;
-}
-void* AnswerOf(uintptr_t held) {
-    __try {
-        using Get=void*(*)(void*);
-        return reinterpret_cast<Get>((*reinterpret_cast<void***>(held))[0xD0/8])(reinterpret_cast<void*>(held));
-    } __except(EXCEPTION_EXECUTE_HANDLER) {return nullptr;}
-}
-}  // namespace
-void VRThingHighlight(RED4ext::IScriptable*,RED4ext::CStackFrame* stack,bool* out,int64_t) {
-    int32_t proxy=0,fill=0,outline=0;
-    bool through=false;
-    RED4ext::GetParameter(stack,&proxy);
-    RED4ext::GetParameter(stack,&fill);
-    RED4ext::GetParameter(stack,&outline);
-    RED4ext::GetParameter(stack,&through);
-    stack->code++;
-    if(out)*out=false;
-    using namespace cvr::heldpicture;
-    if(!base || proxy<=0)return;
-    uint8_t* instance=InstanceOf(uint32_t(proxy));
-    if(!instance)return;
-    const uintptr_t object=*reinterpret_cast<uintptr_t*>(instance+0xC8);
-    if(!Readable(object,0x18))return;
-    const uintptr_t owner=*reinterpret_cast<uintptr_t*>(object+8),held=*reinterpret_cast<uintptr_t*>(object+0x10);
-    if(!Readable(owner,16) || !Readable(held,16))return;
-    const uintptr_t table=*reinterpret_cast<uintptr_t*>(held);
-    if(!Readable(table,0xD8) || !CodeOfImage(*reinterpret_cast<uintptr_t*>(table+0xD0)))return;
-    void* answer=AnswerOf(held);
-    const int type=answer && Readable(reinterpret_cast<uintptr_t>(answer)+0x7D,1)?*(reinterpret_cast<uint8_t*>(answer)+0x7D)>>3:-1;
-    {
-        static int saidType[64]={};
-        if(type>=0 && type<64 && saidType[type]<1) {
-            ++saidType[type];
-            Log("[picture] outline on proxy %d: render object type %d, %s\n",proxy,type,type==1 || type==5 || type==7?"it takes one":"it does not take one: its lines instead");
-        } else if(type<0) {
-            static bool said=false;
-            if(!said) {said=true;Log("[picture] outline on proxy %d: no render object answers\n",proxy);}
+        uint8_t* b=bones+bone*48;
+        if(!s.on) {
+            s=SlotHold{};
+            s.on=true;
+            std::memcpy(s.saved,b,48);
+            continue;
         }
+        const float* q=reinterpret_cast<const float*>(b+VRIK_ROT_OFF);
+        const float* k=reinterpret_cast<const float*>(s.saved+VRIK_ROT_OFF);
+        const float* t=reinterpret_cast<const float*>(b);
+        const float* u=reinterpret_cast<const float*>(s.saved);
+        const float dot=std::fabs(q[0]*k[0]+q[1]*k[1]+q[2]*k[2]+q[3]*k[3]);
+        const float deg=2.f*std::acos(dot<1.f?dot:1.f)*57.29578f;
+        const float dx=t[0]-u[0],dy=t[1]-u[1],dz=t[2]-u[2],move=std::sqrt(dx*dx+dy*dy+dz*dz);
+        ++s.frames;
+        if(deg>kSlotCountFromDeg)++s.turned;
+        if(deg>s.mostTurn)s.mostTurn=deg;
+        if(move>s.mostMove)s.mostMove=move;
+        std::memcpy(b,s.saved,48);
     }
-    if(type!=1 && type!=5 && type!=7)return;
-    void* renderer=*reinterpret_cast<void**>(base+0x3BBCAE8);
-    if(!renderer)return;
-    using GetScene=void*(*)(void*);
-    void* scene=reinterpret_cast<GetScene>((*reinterpret_cast<void***>(renderer))[0x4D0/8])(renderer);
-    if(!scene)return;
-    void* entry=(*reinterpret_cast<void***>(scene))[0x2D8/8];
-    if(reinterpret_cast<uintptr_t>(entry)!=base+0x7A0190) {
-        static bool said=false;
-        if(!said) {said=true;Log("[picture] the scene's highlight is not where it was read: no highlight\n");}
-        return;
-    }
-    const bool on=fill>0 || outline>0;
-    uint8_t mask=through?0x40:0;
-    if(fill>0)mask|=uint8_t(fill<<2)|2;
-    else if(outline>0)mask|=uint8_t(outline<<2);
-    if(outline>0)mask|=1;
-    using Command=void(*)(void*,void*,void*,uint8_t,uint8_t,float,uint8_t);
-    reinterpret_cast<Command>(entry)(scene,reinterpret_cast<void*>(object+8),reinterpret_cast<void*>(object+0x10),on?1:0,mask,1.f,0);
-    if(out)*out=true;
 }
-
-// VRHeldPicture(proxy, body, bone, offset with the reach as its w, turn as x y z w, blocked)
-void VRHeldPicture(RED4ext::IScriptable*,RED4ext::CStackFrame* stack,bool* out,int64_t) {
-    int32_t proxy=0,body=0,bone=-1;
-    RED4ext::Vector4 offset{},turn{};
-    bool blocked=false;
-    RED4ext::GetParameter(stack,&proxy);
-    RED4ext::GetParameter(stack,&body);
-    RED4ext::GetParameter(stack,&bone);
-    RED4ext::GetParameter(stack,&offset);
-    RED4ext::GetParameter(stack,&turn);
-    RED4ext::GetParameter(stack,&blocked);
-    stack->code++;
-    const float o[3]={offset.X,offset.Y,offset.Z},t[4]={turn.X,turn.Y,turn.Z,turn.W};
-    const bool on=proxy>0 && body>=0 && std::isfinite(o[0]+o[1]+o[2]+t[0]+t[1]+t[2]+t[3]) &&
-        cvr::heldpicture::Hold(uint32_t(proxy),uint32_t(body),bone,o,t,blocked,std::isfinite(offset.W) && offset.W>=0?offset.W:1000.f);
-    if(out)*out=on;
 }

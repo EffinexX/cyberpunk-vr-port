@@ -10,6 +10,8 @@
 // script registers for the environment resources as they load and hands them over; the settings themselves are
 // native classes no script declares without Codeware.
 
+#include "Natives/HeldPicture.hpp"
+#include <atomic>
 #include "Natives/NativeFunctions.hpp"
 
 #include <RED4ext/JobQueue.hpp>
@@ -169,7 +171,9 @@ void RefreshAppearance(RED4ext::ent::IComponent* component) {
 
 // The component's resource loaded anew and its appearance rebuilt once it is in; with `wait`, the call returns once
 // that is done (5 s at most), so the caller's next frame already shows it.
-bool Reload(const Handle<RED4ext::ent::IComponent>& component, bool wait) {
+// A carrier's load: numbered, so a load that finishes late cannot speak for a newer one.
+std::atomic<uint64_t> carrierLoad[2], carrierLoaded[2], carrierAskedAt[2];
+bool Reload(const Handle<RED4ext::ent::IComponent>& component, bool wait, int carrierSide = -1, uint64_t load = 0) {
     if (!component || !component->owner) return false;
     auto** table = *reinterpret_cast<void***>(component.instance);
     using LoadResourceFn = uint64_t (*)(RED4ext::ent::IComponent*, RED4ext::JobQueue&);
@@ -179,6 +183,13 @@ bool Reload(const Handle<RED4ext::ent::IComponent>& component, bool wait) {
     queue.Dispatch([weak] {
         if (auto held = weak.Lock(); held && held->owner) RefreshAppearance(held.instance);
     });
+    if (carrierSide >= 0) {
+        queue.Dispatch([carrierSide, load] {
+            if (carrierLoad[carrierSide].load() != load) return;
+            carrierLoaded[carrierSide] = load;
+            Log("[carrier] hand %d: the copy's mesh was in after %llu ms\n", carrierSide, static_cast<unsigned long long>(GetTickCount64() - carrierAskedAt[carrierSide].load()));
+        });
+    }
     if (wait) {
         struct Done {
             std::mutex lock;
@@ -225,6 +236,109 @@ void VRComponentChangeAppearance(RED4ext::IScriptable*, RED4ext::CStackFrame* fr
         done = Reload(component, wait);
     }
     if (out) *out = done;
+}
+
+// A HELD PROP'S MESH ON A HAND CARRIER (docs/native-hand-physics-build-20261108.md). The instance keeps a pointer to its world node somewhere in its first 0x100 bytes; which, is found by the node class's vtable, taken
+// from an instance of the class, so no unknown object is ever called. The node is a worldMeshNode: RaRef<CMesh> at +0x38, appearance at +0x40.
+namespace {
+std::atomic<bool> carrierUsed[2];
+std::atomic<uint64_t> carrierHash[2];
+// The fields also hold floats (the height at +0x38 crashed the grab, 2026-11-08, through a __try), so a candidate is never dereferenced: ReadProcessMemory answers with an error where a read would fault.
+bool ReadSafely(uintptr_t at,void* into,size_t size) {
+    SIZE_T got=0;
+    return ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(at),into,size,&got) && got==size;
+}
+bool NodeOf(const uint8_t* instance,uintptr_t table,int* at,const uint8_t** node) {
+    uintptr_t fields[(0x100-0x30)/8];
+    if(!ReadSafely(reinterpret_cast<uintptr_t>(instance)+0x30,fields,sizeof fields))return false;
+    for(int i=0;i<int(std::size(fields));i++) {
+        const uintptr_t p=fields[i];
+        if(p<0x100000000ull || (p>>47) || (p&7))continue;
+        uintptr_t first=0;
+        if(ReadSafely(p,&first,sizeof first) && first==table) {*at=0x30+i*8;*node=reinterpret_cast<const uint8_t*>(p);return true;}
+    }
+    return false;
+}
+}  // namespace
+void VRHeldMeshOnto(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, bool* out, int64_t) {
+    auto component = Param<Handle<RED4ext::ent::IComponent>>(frame);
+    auto proxy = Param<int32_t>(frame);
+    auto side = Param<int32_t>(frame);
+    frame->code++;
+    if (out) *out = false;
+    const MeshFields fields = FieldsOf(component.instance);
+    if (!fields.path || proxy <= 0) {Log("[carrier] no mesh fields on the component, or no proxy\n");return;}
+    const uint8_t* instance = cvr::heldpicture::Instance(uint32_t(proxy));
+    if (!instance) {Log("[carrier] proxy %d: no prop instance behind it\n", proxy);return;}
+    static uintptr_t table = 0;
+    if (!table) {
+        auto* type = RED4ext::CRTTISystem::Get()->GetClass("worldInstancedDestructibleMeshNode");
+        void* sample = type ? type->CreateInstance(true) : nullptr;
+        table = sample ? *static_cast<uintptr_t*>(sample) : 0;
+    }
+    int at = -1;
+    const uint8_t* node = nullptr;
+    if (!table || !NodeOf(instance, table, &at, &node)) {
+        Log("[carrier] proxy %d: its world node was not found among the instance's first fields (class table %p)\n", proxy, reinterpret_cast<void*>(table));
+        return;
+    }
+    const uint64_t path = *reinterpret_cast<const uint64_t*>(node + 0x38);
+    const CName appearance = *reinterpret_cast<const CName*>(node + 0x40);
+    static std::atomic<int> calls{0};
+    Log("[carrier] call %d, proxy %d, hand %d: node at instance+0x%x, mesh hash %016llx, appearance %s\n", ++calls, proxy, side, at, static_cast<unsigned long long>(path), appearance.ToString() ? appearance.ToString() : "?");
+    if (!path) return;
+    *fields.path = RED4ext::ResourcePath(path);
+    if (fields.appearance) *fields.appearance = appearance;
+    if (side >= 0 && side <= 1) carrierHash[side] = path;
+    Log("[carrier] proxy %d: mesh set on the carrier, reloading\n", proxy);
+    const bool validSide = side >= 0 && side <= 1;
+    uint64_t load = 0;
+    if (validSide) {
+        carrierAskedAt[side] = GetTickCount64();
+        load = ++carrierLoad[side];
+    }
+    const bool done = Reload(component, false, validSide ? side : -1, load);
+    Log("[carrier] proxy %d: reload asked, returned %d\n", proxy, done ? 1 : 0);
+    if (side >= 0 && side <= 1) carrierUsed[side] = true;
+    if (out) *out = done;
+}
+// VRCarrierDirty(hand) -> true once after the carry has put its own mesh on that carrier: the reload's record of what it holds is out of date.
+void VRCarrierDirty(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, bool* out, int64_t) {
+    auto side = Param<int32_t>(frame);
+    frame->code++;
+    const bool was = side >= 0 && side <= 1 && carrierUsed[side].exchange(false);
+    if (out) *out = was;
+}
+// VRCarrierMeshHash(hand) -> the hash of the mesh last put on that carrier, 16 hex digits: the name of its replacement's template.
+void VRCarrierMeshHash(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
+    auto side = Param<int32_t>(frame);
+    frame->code++;
+    char text[32] = {};
+    if (side >= 0 && side <= 1) sprintf_s(text, "%016llx", static_cast<unsigned long long>(carrierHash[side].load()));
+    if (out) *out = RED4ext::CString(text);
+}
+// VRCarrierReady(hand) -> true once the mesh last asked for on that carrier has loaded.
+void VRCarrierReady(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, bool* out, int64_t) {
+    auto side = Param<int32_t>(frame);
+    frame->code++;
+    const bool ready = side >= 0 && side <= 1 && carrierLoad[side].load() != 0 && carrierLoaded[side].load() == carrierLoad[side].load();
+    if (out) *out = ready;
+}
+// VRCarrierSlotHold(hand): every tick a copy is on that hand; see SlotAsk.
+void VRCarrierSlotHold(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, bool* out, int64_t) {
+    auto side = Param<int32_t>(frame);
+    frame->code++;
+    cvr::heldpicture::SlotAsk(side);
+    if (out) *out = true;
+}
+void VRCarryHide(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, bool* out, int64_t) {
+    auto proxy = Param<int32_t>(frame);
+    auto body = Param<int32_t>(frame);
+    auto hide = Param<bool>(frame);
+    frame->code++;
+    if (proxy > 0 && body >= 0) cvr::heldpicture::Hide(uint32_t(proxy), uint32_t(body), hide);
+    Log("[carrier] proxy %d body %d: real mesh %s\n", proxy, body, hide ? "hidden" : "shown again");
+    if (out) *out = true;
 }
 
 // A VISUAL COMPONENT DISSOLVED OUT OR IN: the engine's dithered fade (Rendering/DissolveTime, 0.5 s), the one an

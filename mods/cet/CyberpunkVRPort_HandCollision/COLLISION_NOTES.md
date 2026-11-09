@@ -193,7 +193,7 @@ Learned from the "small things no longer move" fault (2026-11-08, fixed in `c5bd
 - Magazines have no box of their own (inside the grip they are covered; in the hand the hand capsule covers them).
 - Limits: 12 parts per body (`kGunMostBoxes`), 1024 tests per call (`kGunMostTests`), 14 ray targets (`GUN_SIDES`).
 - The world lists cost 0.6-1.2 ms/frame even with no gun out. A grid index of the statics would cut the rebuilds.
-- Carried-body lag, the gun from the side (its turn is not swept) and what could leave Lua: analysed 2026-11-08 in `docs/hand-physics-lag-weaponstop-threading-20261108.md`, nothing of it built yet.
+- Carried-body lag, the gun from the side (its turn is not swept) and what could leave Lua: analysed 2026-11-08 in `docs/hand-physics-lag-weaponstop-threading-20261108.md`. Built on branch `native-hand-physics` and played 2026-11-08 (not committed): state, what was tried and rejected, proved slots and how to read the logs are in `docs/native-hand-physics-build-20261108.md`. Read it before changing the carry. Open there: the game releasing a held actor while walking.
 
 ## How the user works
 

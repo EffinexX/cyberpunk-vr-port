@@ -273,14 +273,14 @@ void DrawVRHandsControls() {
             UI::SetTooltip("Off: each hand is stopped by the world with its own shape, like the gun's boxes.\n"
                               "On: the rays from the chest as before, to compare. Off after a restart.");
         }
-        bool carryPicture = st.xrCarryPicture != 0;
-        if (UI::Checkbox("Carried objects stick to the hand", &carryPicture)) {
-            st.xrCarryPicture = carryPicture ? 1 : 0;
+        bool nativePhysics = st.xrNativePhysics != 0;
+        if (UI::Checkbox("Native hand and gun physics", &nativePhysics)) {
+            st.xrNativePhysics = nativePhysics ? 1 : 0;
             SetLiveControlsUiState(&st, 1);
         }
         if (UI::IsItemHovered()) {
-            UI::SetTooltip("Draws a carried thing on the hand in the same frame, while its body follows in the physics.\n"
-                              "Against a wall the picture goes back to the body. Off: the picture is on the body, and trails a swing.");
+            UI::SetTooltip("On: the hands, the gun and carried things are solved in C++ in the same frame, turning included.\n"
+                              "Off: the script's way, as before.");
         }
         float leadMs = st.xrCarryLead * 1000.0f;
         if (UI::SliderFloat("Carried objects lead the hand (ms)", &leadMs, 0.0f, 100.0f, "%.0f")) {

@@ -1330,6 +1330,11 @@ end
 local function holdShow(side, meshPath, appearance)
     local c = holdComp(side)
     if not (c and meshPath) then return false end
+    -- the carry borrows these carriers for what is held in the hand: then what this file remembers of them is out of date
+    do
+        local okD, d = pcall(function() return Game.VRCarrierDirty(side) end)
+        if okD and d then holdS.mesh[side], holdS.skin[side] = nil, nil end
+    end
     if holdS.mesh[side] ~= meshPath then
         local ok = pcall(function() Game.VRComponentChangeResource(c, meshPath, true) end)
         if not ok then return false end

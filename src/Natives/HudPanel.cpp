@@ -1,7 +1,7 @@
 // Verified against CP2077 SHA256 a7de82945c03e041... with IDA headless.
 // Only native separate-window slots are moved; direct/projected HUD widgets stay native.
-#include "Natives/NativeFunctions.hpp"
 #include "Natives/HeldPicture.hpp"
+#include "Natives/NativeFunctions.hpp"
 #include "Camera/SurveillanceFollow.hpp"
 #include "Render/HudPanel.hpp"
 #include "Render/OpticsProbe.hpp"
