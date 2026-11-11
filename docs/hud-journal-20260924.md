@@ -43,6 +43,24 @@ or modify journal progression. The preceding scene's UI_Map values were
 Check that JournalNotificationQueue now has an inkVirtualWindow parent and retains
 the authored1300x550 bounds; inspect the visible text and XR output after replay.
 
+## XP, money and item notifications (2026-11-09)
+
+The XP (`progression`), money (`notification_currency`) and item (`Item_Received_SMALL`)
+popups are one HUD entry, `items_notification_queue` (controller `ItemsNotificationQueue`,
+resource `base/gameplay/gui/widgets/notifications/items_update.inkwidget`, authored root
+550x400). `prototype_hud.inkhud` has it in slot `LeftCenter` with `useSeparateWindow=0`, so
+they cannot be moved separately from each other, and the layout editor could not offer them.
+Level-up is a different entry, `level up notifications`, and was left alone.
+
+The entry now uses the same separate-window route as the journal and is appended to the
+layout catalogue as **XP / money / item notifications** (`hud_element_items_notifications`).
+Not yet confirmed in game: whether a stack of popups fits the 550x400 capture rectangle.
+
+WolvenKit 9.1 `unbundle -w` needs a glob: `*prototype_hud*` matches, the bare file name finds 0.
+`tools/hud_tests` did not link on 2026-11-09: `HudQuad.cpp` needs `CyberpunkVR_HudClearance*`
+and `CyberpunkVR_InteractionAnchor`, which the test project does not define. The new entry
+was checked with a small separate program instead (catalogue index, settings round trip).
+
 ## Live result
 
 PID15864 loaded the matching installed DLL. The startup log confirms the separate

@@ -410,6 +410,12 @@ int main(int argc,char** argv) try {
         const int journal=ElementIndex(EntryHash("Notifications_Journal"));
         Check(journal>=0 && std::string(Elements[journal].key)=="journal_notifications",
               "journal notification layout setting missing");
+        Check(NeedsSeparateWindow(EntryHash("items_notification_queue")) &&
+              EntryChannel(EntryHash("items_notification_queue"))==Channel::Main,
+              "XP / money notifications bypass the main texture HUD");
+        const int itemsQueue=ElementIndex(EntryHash("items_notification_queue"));
+        Check(itemsQueue==int(ElementCount)-1 && std::string(Elements[itemsQueue].key)=="items_notifications",
+              "XP / money layout missing or old indices changed");
         Check(NeedsSeparateWindow(EntryHash("hud tank")) && EntryChannel(EntryHash("hud tank"))==Channel::Basilisk,
               "Basilisk HUD bypasses texture HUD");
         const int tank=ElementIndex(EntryHash("hud tank"));
