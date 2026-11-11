@@ -229,6 +229,9 @@ constexpr int kDualWieldYTap      = 57;
 // 1 = HANDS ONLY (xr_body_hands_only): the player's body is drawn as its hands alone. openxr -> the CET HandsOnly
 // mod (which hides the body, the garments and the arms above the wrists) and NeckCap (the neck cap stays off).
 constexpr int kBodyHandsOnly      = 173;
+// Counts flashlight gestures (left hand at the left ear + left trigger), plugin -> the CET mod
+// CyberpunkVRPort_Flashlight, which toggles once per change.
+constexpr int kFlashlightToggleCount = 174;
 constexpr int kWheelArmedRightBit = 1;
 constexpr int kWheelArmedLeftBit  = 2;
 } // namespace vrshared

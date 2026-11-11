@@ -10,6 +10,10 @@ Agents start without memory of earlier sessions; these files are the memory. Wit
 - **How:** facts with absolute dates and commit hashes. Say what is measured and what is only inferred, and correct an entry that turned out wrong rather than adding a second one. Do not repeat what the code already says.
 - Notes follow the same rules as code: no commit or push without the user's go-ahead.
 
+## Simple Flashlight integration
+
+Runs in the real CET, not the port's Lua host: see `docs/flashlight-head-gesture-20261109.md`.
+
 ## Hand and gun collision
 
 Before you change, test or measure how the hands or the gun meet the world -- in

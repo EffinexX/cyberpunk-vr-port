@@ -48,4 +48,30 @@ struct ScannerEarZone {
         return dx*dx+dy*dy+dz*dz<=r*r;
     }
 };
+// The flashlight: the trigger of the hand at the ear, the scanner's zone. Only a squeeze begun with the hand already
+// there counts, so a trigger held for aiming survives the hand passing the head. The return value says the squeeze
+// belongs to this gesture and the game must not see it: from first travel, since the game aims long before .60.
+class EarTriggerGesture {
+    uint64_t inSince{},outSince{};
+    bool armed{},active{},carried{},down{};
+public:
+    bool Armed() const {return armed;}
+    bool Update(float trigger,bool inZone,bool eligible,uint64_t now,uint64_t enterMs,uint64_t exitMs,bool& fired) {
+        fired=false;
+        if(inZone) {
+            outSince=0;
+            if(!inSince)inSince=now;
+            if(now-inSince>=enterMs)armed=true;
+        } else {
+            inSince=0;
+            if(!outSince)outSince=now;
+            if(now-outSince>=exitMs)armed=false;
+        }
+        if(!active && trigger>.10f){active=true;carried=!armed || !eligible;}
+        if(active && !eligible)carried=true;
+        if(trigger<=.05f)active=carried=down=false;
+        if(active && !carried && !down && trigger>.60f){down=true;fired=true;}
+        return active && !carried;
+    }
+};
 }

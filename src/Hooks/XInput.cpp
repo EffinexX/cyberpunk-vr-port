@@ -166,6 +166,9 @@ extern "C" __declspec(dllexport) int32_t CyberpunkVR_ScannerExitMs  = 250;
 // latch and the port keeps LB asserted itself: squeeze at the ear to open, squeeze at the ear again
 // to close, hand free in between. 0 restores the original hold.
 extern "C" __declspec(dllexport) int32_t CyberpunkVR_ScannerToggle = 1;
+// FLASHLIGHT GESTURE -- the scanner's ear zone, but the trigger: toggles the Simple Flashlight mod through
+// mods/cet-standalone/CyberpunkVRPort_Flashlight. xr_flashlight_gesture in vrport.ini.
+extern "C" __declspec(dllexport) int32_t CyberpunkVR_FlashlightGesture = 1;
 // THE HACK LIST ON THE LEFT STICK, up and down, at the threshold every other gesture in this file
 // fires at. It REPLACES the face buttons for paging -- X and Y sat under the thumb of the hand that is
 // already squeezing a grip at the ear, which is the reach the one-handed scanner exists to avoid, so X
@@ -731,6 +734,34 @@ DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState) {
         } else {
             s_latch = false;
             scannerHold = s_gesture;
+        }
+    }
+
+    // ---- FLASHLIGHT: left hand at the left ear + left trigger -------------------------------------
+    //
+    // Not while the scanner is up, where the left trigger is the zoom modifier, and not in a vehicle, where it brakes.
+    {
+        static cvr::input::EarTriggerGesture s_flashlight;
+        static float s_flashlightCount = 0.0f;
+        const bool eligible = CyberpunkVR_FlashlightGesture != 0 && gameplayScreen && !uiPopupOpen &&
+            g_menuModeValue == 0 && !scannerActive && !g_isInVehicle && !cvr::lobby::WorldShown();
+        bool inZone = false;
+        OpenXRHeadPose head{},hands[2]{};uint64_t sequence{},stamp{};
+        if(eligible && OpenXRManager::Get().GetGestureHandFrame(&head,hands,&sequence,&stamp,true) &&
+           head.valid && hands[supportHand].valid) {
+            const auto& hand=hands[supportHand];
+            const cvr::input::ScannerEarZone zone{CyberpunkVR_ScannerEarX,CyberpunkVR_ScannerEarY,
+                CyberpunkVR_ScannerEarZ,CyberpunkVR_ScannerEarRadius,CyberpunkVR_ScannerEarMargin};
+            inZone=zone.Contains(supportHand==0 ? hand.posX : -hand.posX,hand.posY,hand.posZ,s_flashlight.Armed());
+        }
+        const uint64_t enterMs=CyberpunkVR_ScannerEnterMs>0 ? CyberpunkVR_ScannerEnterMs : 80;
+        const uint64_t exitMs=CyberpunkVR_ScannerExitMs>0 ? CyberpunkVR_ScannerExitMs : 250;
+        bool fired=false;
+        if(s_flashlight.Update(vr.leftTrigger,inZone,eligible,GetTickCount64(),enterMs,exitMs,fired))
+            pState->Gamepad.bLeftTrigger=0;
+        if(fired) {
+            s_flashlightCount+=1.0f;
+            OpenXRManager::Get().SetSharedSlot(vrshared::kFlashlightToggleCount,s_flashlightCount);
         }
     }
 

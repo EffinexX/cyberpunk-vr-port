@@ -207,6 +207,7 @@ extern "C" __declspec(dllexport) extern int32_t CyberpunkVR_LensHeadWrite;
 extern "C" __declspec(dllexport) extern int32_t CyberpunkVR_InputDefaultInUi;
 extern "C" __declspec(dllexport) extern int32_t CyberpunkVR_PopupMagBlockMs;
 extern "C" __declspec(dllexport) extern int32_t CyberpunkVR_DevCamAnyName;
+extern "C" __declspec(dllexport) extern int32_t CyberpunkVR_FlashlightGesture;   // src/Hooks/XInput.cpp
 // The node whose square dispatch draws the scanner outline, and the switch for replacing its shader.
 // Live in the ini because the candidates come from a measurement ([viscs] names them) and trying one
 // must not cost a rebuild: the node is read at every dispatch, so a change takes effect at once.
@@ -1744,6 +1745,11 @@ void PollLiveControls() {
             xrWheelPredictionMs = value;
             continue;
         }
+        if (sscanf_s(line, "xr_flashlight_gesture=%d", &intValue) == 1 ||
+            sscanf_s(line, "xr_flashlight_gesture = %d", &intValue) == 1) {
+            CyberpunkVR_FlashlightGesture = intValue != 0 ? 1 : 0;
+            continue;
+        }
         if (sscanf_s(line, "xr_wheel_horn=%d", &intValue) == 1 ||
             sscanf_s(line, "xr_wheel_horn = %d", &intValue) == 1) {
             xrWheelHorn = intValue;
@@ -2679,6 +2685,7 @@ void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_wheel_steer_dead_deg=%.1f\n", state.xrWheelSteerDeadDeg >= 0.0f ? state.xrWheelSteerDeadDeg : 1.5f);
     fprintf(file, "xr_wheel_prediction=%d\n", state.xrWheelPrediction != 0 ? 1 : 0);
     fprintf(file, "xr_wheel_prediction_ms=%.1f\n", std::isfinite(state.xrWheelPredictionMs) ? std::clamp(state.xrWheelPredictionMs,0.0f,8.0f):0.0f);
+    fprintf(file, "xr_flashlight_gesture=%d\n", CyberpunkVR_FlashlightGesture != 0 ? 1 : 0);
     fprintf(file, "xr_wheel_horn=%d\n", state.xrWheelHorn != 0 ? 1 : 0);
     fprintf(file, "xr_wheel_horn_radius=%.3f\n", state.xrWheelHornRadius > 0.0f ? state.xrWheelHornRadius : 0.12f);
     fprintf(file, "xr_vehicle_gun_trigger=%d\n", state.xrVehicleGunTrigger != 0 ? 1 : 0);
