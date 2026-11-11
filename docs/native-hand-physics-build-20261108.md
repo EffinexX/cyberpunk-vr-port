@@ -20,6 +20,7 @@ Installed and played with `xr_native_physics=1`, `xr_carry_lead=0.000`. Nothing 
 | Against a wall | Hand stops with the collider (`ApplyHandStop`). User: behaves better |
 | Walking drop | **Open, cause narrowed.** The prop instance is streamed out at a distance from its placement that goes with the mesh. See "The drop distance goes with the mesh" |
 | Crash on closing the game | `exe+0x1C2F8F`, every exit, older than this work. Set aside by the user |
+| Skippy: gun and hand jump at the body | 2026-11-11: something moving that follows the weapon stopped the gun 35 times in 2 min. `FollowsHeld` (`DebugView.cpp`) installed 16:57: did not help (never fired). 17:02: the 0.20 m sphere (query word2 `00400000`) seen at each Skippy draw is no obstacle, with a probe; DLL only. **Solved** (user, 17:14): the probe showed the sphere (r 0.10 m) centred on the gun's grip. Details in `COLLISION_NOTES.md` |
 
 Ideas tried and rejected in this build: kinematic carry (not drawn); putting off the release of held actors (did not stop the crash); re-sending velocity through the game (did not stop it); taking held shapes out of contacts (did not stop the release, and the user requires held things to collide); wrist lead on the picture (no gain felt).
 

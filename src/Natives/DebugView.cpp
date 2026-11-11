@@ -1311,6 +1311,107 @@ bool GunKinematicIsLoose(void* actor,uint32_t proxy,uint32_t body,const Bounds& 
     }
     return loose;
 }
+// WHAT MOVES WITH A HELD THING IS PART OF IT (2026-11-11): with Skippy drawn the gun was stopped 35 times in 2 minutes by something
+// moving, at 10-34 m/s, and gun and hand jumped (other guns: 0-8 in a whole session). Very likely a body of the weapon's own that follows
+// it: the gun was pushed out, the body followed, again. Inferred, not proved. So a small moving actor near the gun or a hand that moves as
+// that one does, seen from the chest (walking, a lift, a car move all of them alike and do not count), is no obstacle and is not shoved.
+// The decision is kept per actor; the first of each is logged with its shapes, to learn what it is.
+constexpr float kFollowNear=.5f,kFollowLongest=1.f,kFollowMinMove=.02f,kFollowSlack=.35f;
+constexpr int kFollowHits=4;
+struct FollowSeen {uint32_t proxy=0,body=0;Vec3 lastP{},lastHeld[3]{},lastChest{};bool heldOn[3]{};int hits=0,misses=0;bool follows=false;uint64_t seenAt=0;};
+std::unordered_map<void*,FollowSeen> followSeen;
+std::mutex followLock;
+uint64_t gunFollowSkipped=0;
+uint32_t gunFollowSaid=0;
+bool FollowsHeld(void* actor,uint32_t proxy,uint32_t body,const Vec3& p,const Bounds& whole) {
+    const float longest=std::fmax(std::fmax(whole.hi.x-whole.lo.x,whole.hi.y-whole.lo.y),whole.hi.z-whole.lo.z);
+    if(!(longest<kFollowLongest) || !collectAvoidOn)return false;
+    const uint64_t now=GetTickCount64();
+    const Vec3 chest=collectAvoid;
+    Vec3 held[3]{};bool on[3]{};bool anyNear=false;
+    for(int k=0;k<3;++k) {
+        const Mover& m=movers[k];
+        if(m.count<=0 || !m.prevOn || now-m.lastCall>300)continue;
+        held[k]=m.prev;on[k]=true;
+        const float dx=p.x-held[k].x,dy=p.y-held[k].y,dz=p.z-held[k].z;
+        if(dx*dx+dy*dy+dz*dz<kFollowNear*kFollowNear)anyNear=true;
+    }
+    std::lock_guard<std::mutex> hold(followLock);
+    auto it=followSeen.find(actor);
+    if(it!=followSeen.end() && (it->second.proxy!=proxy || it->second.body!=body || now-it->second.seenAt>2000))it->second=FollowSeen{};
+    if(it==followSeen.end()) {
+        if(!anyNear)return false;
+        if(followSeen.size()>=512)followSeen.clear();
+        it=followSeen.emplace(actor,FollowSeen{}).first;
+        it->second.proxy=proxy;it->second.body=body;
+        it->second.lastP=p;it->second.lastChest=chest;
+        for(int k=0;k<3;++k) {it->second.lastHeld[k]=held[k];it->second.heldOn[k]=on[k];}
+        it->second.seenAt=now;
+        return false;
+    }
+    FollowSeen& f=it->second;
+    if(f.follows) {f.seenAt=now;return true;}
+    if(f.seenAt!=0 && anyNear) {
+        const Vec3 dc{chest.x-f.lastChest.x,chest.y-f.lastChest.y,chest.z-f.lastChest.z};
+        const Vec3 da{p.x-f.lastP.x-dc.x,p.y-f.lastP.y-dc.y,p.z-f.lastP.z-dc.z};
+        bool moved=false,hit=false;
+        for(int k=0;k<3;++k) {
+            if(!on[k] || !f.heldOn[k])continue;
+            const float hx=p.x-held[k].x,hy=p.y-held[k].y,hz=p.z-held[k].z;
+            if(hx*hx+hy*hy+hz*hz>=kFollowNear*kFollowNear)continue;
+            const Vec3 dh{held[k].x-f.lastHeld[k].x-dc.x,held[k].y-f.lastHeld[k].y-dc.y,held[k].z-f.lastHeld[k].z-dc.z};
+            const float lh=std::sqrt(dh.x*dh.x+dh.y*dh.y+dh.z*dh.z);
+            if(!(lh>kFollowMinMove))continue;
+            moved=true;
+            const float ex=da.x-dh.x,ey=da.y-dh.y,ez=da.z-dh.z;
+            if(std::sqrt(ex*ex+ey*ey+ez*ez)<kFollowSlack*lh)hit=true;
+        }
+        if(hit)++f.hits;else if(moved)++f.misses;
+        if(f.hits>=kFollowHits && f.hits>=3*f.misses)f.follows=true;
+    }
+    f.lastP=p;f.lastChest=chest;
+    for(int k=0;k<3;++k) {f.lastHeld[k]=held[k];f.heldOn[k]=on[k];}
+    f.seenAt=now;
+    if(f.follows && gunFollowSaid<40) {
+        ++gunFollowSaid;
+        Log("[gunshape] a moving thing follows a held one, no obstacle from now: proxy %u/%u, longest side %.2f m, %d with it, %d not\n",proxy,body,longest,f.hits,f.misses);
+        return true;
+    }
+    return f.follows;
+}
+// THE PROBE FOR THAT SPHERE (2026-11-11): where it lies against the gun (in the gun's frame) and each hand, and what FollowsHeld made
+// of its actor, every 2 s while it is near, 60 lines a session. To learn whether it rides on the weapon, the hand, or the body.
+uint64_t heldSphereSaidAt=0;
+uint32_t heldSphereSaid=0;
+void HeldSphereProbe(void* actor,uint32_t proxy,uint32_t body,const NearShape& s) {
+    const uint64_t now=GetTickCount64();
+    if(heldSphereSaid>=60 || now-heldSphereSaidAt<2000)return;
+    heldSphereSaidAt=now;
+    ++heldSphereSaid;
+    const Vec3 c{s.pose.p.x+s.origin.x,s.pose.p.y+s.origin.y,s.pose.p.z+s.origin.z};
+    const float radius=reinterpret_cast<const SphereGeometry*>(s.geometry)->radius;
+    char held[3][96]{};
+    for(int k=0;k<3;++k) {
+        const Mover& m=movers[k];
+        if(m.count<=0 || !m.prevOn) {std::snprintf(held[k],sizeof held[k],"off");continue;}
+        const Vec3 d{c.x-m.prev.x,c.y-m.prev.y,c.z-m.prev.z};
+        const float dist=std::sqrt(d.x*d.x+d.y*d.y+d.z*d.z);
+        if(k==2) {
+            const Vec3 l=Rotate(Quat{-m.solvedTurn.x,-m.solvedTurn.y,-m.solvedTurn.z,m.solvedTurn.w},d);
+            std::snprintf(held[k],sizeof held[k],"%.3f m, in its frame %.3f %.3f %.3f, %llu ms ago",dist,l.x,l.y,l.z,(unsigned long long)(now-m.lastCall));
+        } else std::snprintf(held[k],sizeof held[k],"%.3f m, %llu ms ago",dist,(unsigned long long)(now-m.lastCall));
+    }
+    int hits=-1,misses=-1;bool follows=false;
+    {
+        std::lock_guard<std::mutex> hold(followLock);
+        const auto it=followSeen.find(actor);
+        if(it!=followSeen.end()) {hits=it->second.hits;misses=it->second.misses;follows=it->second.follows;}
+    }
+    const Vec3 chest=collectAvoid;
+    const Vec3 dc{c.x-chest.x,c.y-chest.y,c.z-chest.z};
+    Log("[gunshape] Skippy's sphere? proxy %u/%u, radius %.3f m, from the chest %.3f %.3f %.3f; gun %s; left hand %s; right hand %s; follows %d (%d with, %d not)\n",
+        proxy,body,radius,dc.x,dc.y,dc.z,held[2],held[0],held[1],follows?1:0,hits,misses);
+}
 void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
     ++gunWalkActors;
     if(Slot<int(*)(void*)>(actor,kActorGetType)(actor)!=1)return;
@@ -1344,6 +1445,24 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
     if(stop && kinematic && GunKinematicIsLoose(actor,proxy,body,whole))stop=false;
     void* shapes[kGunActorShapes]{};
     const uint32_t n=Slot<uint32_t(*)(void*,void**,uint32_t,uint32_t)>(actor,kActorGetShapes)(actor,shapes,kGunActorShapes,0);
+    // only for what would stop them: a loose thing shoved ahead of the gun moves with it too, and must go on being shoved
+    if(stop) {
+        const uint32_t saidBefore=gunFollowSaid;
+        if(FollowsHeld(actor,proxy,body,Vec3{place.p.x+origin.x,place.p.y+origin.y,place.p.z+origin.z},whole)) {
+            ++gunFollowSkipped;
+            if(gunFollowSaid!=saidBefore) {
+                // what it is made of, once
+                for(uint32_t i=0;i<n && i<4;++i) {
+                    NearShape s{};
+                    if(!GunCopyShape(shapes[i],place,origin,s,true))continue;
+                    Log("[gunshape]   its shape %u of %u: geometry %d, flags %u, bounds %.2f x %.2f x %.2f m, query %08x %08x %08x %08x, sim %08x %08x %08x %08x\n",
+                        i+1,n,s.type,unsigned(s.flags),s.bounds.hi.x-s.bounds.lo.x,s.bounds.hi.y-s.bounds.lo.y,s.bounds.hi.z-s.bounds.lo.z,
+                        s.query[0],s.query[1],s.query[2],s.query[3],s.sim[0],s.sim[1],s.sim[2],s.sim[3]);
+                }
+            }
+            return;
+        }
+    }
     for(uint32_t i=0;i<n && i<kGunActorShapes;++i) {
         if(stop) {
             // ONLY WHAT TAKES PART IN THE SIMULATION: a person carries a big query-only shape round it (bullets, sight), flags 10 (2026-11-08),
@@ -1360,7 +1479,12 @@ void GunTouchActor(void* actor,const Transform& gun,const Vec3& origin) {
                 const bool standingWords=got.type==GeomCapsule && got.query[2]==0x48000002u && got.sim[0]==2u;
                 const bool characterWords=standingWords || (got.type==GeomCapsule && got.query[2]==0x00002000u && got.sim[0]==1u && got.sim[2]==0x000041ceu);
                 const bool character=characterWords || (got.type==GeomCapsule && tall>1.f && wide<.6f && deep<.6f);
-                if(!character && (got.query[0]|got.query[1]|got.query[2]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]))++gunMovingBackCount;
+                // NOR THE 20 CM SPHERE THAT COMES WITH SKIPPY (2026-11-11): flags 11, query word2 00400000, every other word zero. It appeared
+                // at the draw in both sessions with Skippy and pushed the gun out of it frame after frame; gun and hand jumped. FollowsHeld did not
+                // catch it (the gun it is compared with is the one being pushed). That it belongs to Skippy is inferred from the timing.
+                const bool heldSphere=got.type==GeomSphere && got.query[2]==0x00400000u && !(got.query[0]|got.query[1]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]);
+                if(heldSphere)HeldSphereProbe(actor,proxy,body,got);
+                if(!character && !heldSphere &&(got.query[0]|got.query[1]|got.query[2]|got.query[3]|got.sim[0]|got.sim[1]|got.sim[2]|got.sim[3]))++gunMovingBackCount;
                 else ++gunMovingOwnSkipped;
             }
         } else if(gunLooseBackCount<kGunMostMoving && GunCopyShape(shapes[i],place,origin,gunLooseBack[gunLooseBackCount].s,true)) {
@@ -2437,9 +2561,10 @@ void VRWorldCenter(RED4ext::IScriptable*, RED4ext::CStackFrame* stack, bool* out
     worldMs += MsSince(t0);
     ++worldCalls;
     if (now - worldSaid > 10000) {
-        Log("[world] round the chest: %d near shapes, %d moving that stop, %d loose, %.1f own capsules skipped a frame; %.3f ms a frame for both lists; hands %u calls, %.3f ms mean\n",
-            gunNearCount, gunMovingCount, gunLooseCount, double(gunMovingOwnSkipped) / worldCalls, worldMs / worldCalls, handCalls, handCalls ? handMs / handCalls : 0.0);
+        Log("[world] round the chest: %d near shapes, %d moving that stop, %d loose, %.1f own capsules skipped a frame, %.1f following a held thing; %.3f ms a frame for both lists; hands %u calls, %.3f ms mean\n",
+            gunNearCount, gunMovingCount, gunLooseCount, double(gunMovingOwnSkipped) / worldCalls, double(gunFollowSkipped) / worldCalls, worldMs / worldCalls, handCalls, handCalls ? handMs / handCalls : 0.0);
         gunMovingOwnSkipped = 0;
+        gunFollowSkipped = 0;
         worldSaid = now;
         worldMs = 0;
         worldCalls = 0;

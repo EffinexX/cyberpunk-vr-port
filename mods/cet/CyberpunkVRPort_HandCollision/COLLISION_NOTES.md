@@ -54,6 +54,30 @@ reads 0.15-0.2 ms. The **debug view costs 1.3-3.7 ms** by itself: never judge pe
 
 - **Small things stopped moving under the gun** since `4aadac60` (reported 2026-11-08): kinematic actors became obstacles and never reached `bodyPush`/`bodyWake`, which is what made them dynamic; a thing that was woken also goes back to kinematic once it lies still. PhysX `getMass` is 0 for kinematic, so `GunKinematicIsLoose` asks the game's mass (`BodyGameMass`, decision kept per actor). Confirmed in game 2026-11-08 (user: small things move again). Of the 60 logged kinematic bodies near, 52 were kind 10 at 0.09-19.75 kg and 0.10-0.90 m, all shoved, so light kinematic props are common; the rest were kinds 1, 2, 3 without a game mass and stayed obstacles. No kind 10 body over the 30 kg or 1.2 m limits was among those 60, so the log does not show those limits at work. The per-shape `bounds` in the "stopped a hand or the gun" lines say nothing about the size of the actor.
 
+- **Skippy made gun and hand jump** (reported 2026-11-11, `w_handgun__arasaka_yukimura`, drawn 16:48). Counted over the HandCollision log per drawn weapon:
+  35 `[contact] gun, moving` in under 2 minutes, at 10-34 m/s, always `metal.physmat (guess, ray nil)`; every other weapon logged since 2026-11-09 had 0-8 in a
+  whole session. So something moving stopped the gun again and again. **Very likely a body of Skippy's own that follows the weapon** (pushed out, it
+  followed, again); inferred from the counts, not proved. The native log names two first-seen moving shapes of that session that may be it (once per kind, no
+  time): a sphere 0.20 m, flags 11, query word2 `00400000`, all else zero ("pushed out"), and a box 0.75 x 0.75 x 0.61 m, query word2 `08104040`, sim
+  `00004040 0 000002fd 80000000` ("stopped").
+  **Second session (16:59, with `FollowsHeld` in): the jumping went on** (user). `FollowsHeld` never fired (no `follows a held one` line, 0 in `[world]`); very
+  likely because it compares with the solved gun, which is the one being pushed, and the hands are not solved natively in this build (`hands 0 calls`). Only 2
+  `[contact]` lines this time, but the 0.20 m sphere above was "pushed out" right at the draw again (it did so at the draw in the first session too). So the
+  jumping is most likely the gun pushed out of that sphere each frame (a push-out makes no `[contact]`). Since 17:02 (installed, **not yet tested**) moving
+  spheres with exactly those words (query word2 `00400000`, all other words zero) are no obstacle, and `[gunshape] Skippy's sphere?` logs every 2 s where it
+  lies against the gun (in the gun's frame) and the hands, with `FollowsHeld`'s count for it.
+  **Confirmed 2026-11-11 17:04-17:14** (user: seems to work now; 0 `[contact] gun, moving` with Skippy out). The probe measured the sphere, radius 0.100 m,
+  **centred on the gun's grip origin**: 0-4 cm from the solved gun (mostly under 2 cm, up to 18 cm while the gun was being stopped), 4-11 cm from the right
+  hand, in all 60 lines. So the gun's boxes always lay inside it: proved, not inferred any more. A new actor (proxy 66828, then 71646) comes with each draw.
+  `FollowsHeld` did catch it once, late (63 with it, 21 not); on the second actor it counted 23 with, 191 not, because the gun it is compared with jumps while
+  it is pushed. So the word rule is what fixed it. `FollowsHeld` also fired on hand-sized capsules with all words zero (the player's own, already left out
+  by the zero-word rule): harmless. Not known: whether other weapons carry the same sphere (the logs of 2026-11-09 had few moving contacts with other guns).
+  First fix, still in: `FollowsHeld` in `DebugView.cpp` -- a moving actor
+  that would stop them, under 1 m, within 0.5 m of the gun or a hand, that moves as that one does relative to the chest (4 matches, at least 3 per miss, a match
+  within 35 % of the held thing's move of over 2 cm) is no obstacle from then on (kept per actor until unseen for 2 s). Loose things are left out of the rule, so
+  what the gun shoves goes on being shoved. Read `[gunshape] a moving thing follows a held one` and its `its shape` lines to learn what Skippy carries, and
+  `following a held thing` in the `[world]` line.
+
 ## PhysX facts (PhysX 3.4.2, `PhysX3_x64.dll` of the game)
 
 - Scene vtable at RVA `0x20CAF0`: slot 94 raycast, 95 sweep, 96 overlap.
