@@ -165,7 +165,9 @@ Repository: <https://github.com/dariulone/cyberpunk-vr-port>
   bullet blocks and deflections, the tactical belt and the grenade pin
   (*Controls → Controller vibration / Vibration strength*).
 - **Hand-to-holster** equip/unequip on a grip squeeze — *immersive* (by visual
-  holster) or *simple* (fixed weapon slots).
+  holster) or *simple* (fixed weapon slots). The holsters themselves are built in:
+  a leg holster at the drawing hip, a shoulder harness with the holster under the
+  off arm and a knife sheath on the chest, no extra mod needed.
 - **VR smoking** — cigarette and lighter as real props, with a captured
   finger grip, a hands-free mouth anchor and the game's own FX and audio.
 - **VR controller mapping** merged into XInput: one movement speed whatever the
@@ -230,11 +232,6 @@ Not needed any more, though earlier releases listed them: Visual Holsters (the p
 itself), Equipment-EX (the tactical belt has its own slot), Nova Optics (the port has its own optics) and More
 Occluders. More Occluders' scripted v0.3 has been reported not to compile on 2.5, and one script that fails to
 compile turns every redscript mod off, the port's too.
-
-Optional: [Valentino Holsters](https://www.nexusmods.com/cyberpunk2077/mods/18100) (with its ArchiveXL and
-TweakXL) puts real holsters round the weapons the immersive holsters hang on the body -- its leg holster at the
-drawing hip, its shoulder harness with the holster under the off arm, its chest knife sheath. The port ships none of
-its files; it shows them only when that mod is installed.
 
 Optional, for the AFW switch's PureDark reconstruction only: `PDAFWPlugin.dll` from PureDark's UEVR AFW release
 (https://github.com/PureDark/UEVR/releases), copied into `red4ext/plugins/cyberpunkvrport/`. The port does not ship

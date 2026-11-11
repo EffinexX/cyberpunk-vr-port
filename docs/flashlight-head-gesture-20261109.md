@@ -5,7 +5,7 @@ Status: built and installed 2026-11-09, **unverified in game**. Not committed.
 ## What exists
 
 - `src/Hooks/XInput.cpp` + `EarTriggerGesture` in `include/Hooks/ScannerGesture.hpp`: support hand in the scanner's ear
-  zone + its trigger counts up shared slot [174] (`kFlashlightToggleCount`). Switch: `xr_flashlight_gesture` in `vrport.ini` (default 1).
+  zone + its trigger counts up shared slot [175] (174 until the merge of upstream 0.2.3, which took 174 for `kReloadGlowOff`) (`kFlashlightToggleCount`). Switch: `xr_flashlight_gesture` in `vrport.ini` (default 1).
 - `mods/cet-standalone/CyberpunkVRPort_Flashlight`: replaces the flashlight mod's `logic.updatePosition` at run time with
   the headset pose (`VRViewWorldPos/Rot`), and calls its `logic.toggle` when the slot changes.
 

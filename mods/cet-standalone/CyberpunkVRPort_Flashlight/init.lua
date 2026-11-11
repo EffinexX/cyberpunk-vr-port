@@ -6,7 +6,7 @@
 --
 -- Nothing of the flashlight mod is copied or edited: its table is reached through GetMod at run time.
 
-local TOGGLE_SLOT = 174 -- vrshared::kFlashlightToggleCount
+local TOGGLE_SLOT = 175 -- vrshared::kFlashlightToggleCount
 
 local flashlight = nil
 local lastCount = nil
