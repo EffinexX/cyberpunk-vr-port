@@ -10,6 +10,11 @@ Agents start without memory of earlier sessions; these files are the memory. Wit
 - **How:** facts with absolute dates and commit hashes. Say what is measured and what is only inferred, and correct an entry that turned out wrong rather than adding a second one. Do not repeat what the code already says.
 - Notes follow the same rules as code: no commit or push without the user's go-ahead.
 
+## Merging upstream
+
+Before merging a new upstream release, read `docs/merge-upstream-023-20261111.md` (squashed force-pushed releases,
+colliding shared slots, the untracked archive and how it was rebuilt, the broken `deploy_full.ps1`).
+
 ## Simple Flashlight integration
 
 Runs in the real CET, not the port's Lua host: see `docs/flashlight-head-gesture-20261109.md`.

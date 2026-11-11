@@ -22,6 +22,10 @@ Status: built and installed 2026-11-09, **unverified in game**. Not committed.
 Toggle, not hold. The squeeze must start with the hand already armed at the ear. While it is owned, LT does not reach
 the game. Off while the scanner is confirmed open (LT = zoom modifier), in vehicles (LT = brake), in menus and the lobby.
 
+The mod's own controller toggle (hold D-pad left = the left trackpad held) switched the light on by accident; turned off
+2026-11-11 at the user's request: `"controllerMode":false` in the installed `mods\flashlight\config.json` (its
+"Controller Support" switch). The ear gesture calls `logic.toggle` directly and does not depend on it.
+
 ## Known limits
 
 - The LT mask at the ear applies even if the flashlight mod is absent; only the toggle does nothing then.
