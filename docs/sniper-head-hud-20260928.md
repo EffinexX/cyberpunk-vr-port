@@ -65,3 +65,37 @@ Installed Lua SHA-256:
 `FEFE9C97E3843BB162FD6C2FC6F2FE4119D881087AB604C2E895EEB293EB7AE0`.
 Backup and verified deployment receipt:
 `build/sniper-head-hud-20260928/deploy-185012/manifest.json`.
+
+## Input in the nest: LT zoom, RT fire and the LB scanner (2026-11-12)
+
+Reported in q303 "You Know My Name": inside the SniperNest neither the zoom (LT), the shot (RT) nor the scanner
+(LB) reached the game. A device takeover runs the gameplay branch of `Hooks/XInput.cpp`, not the menu/braindance
+pad branch (`g_bdActive` is raised only by the braindance/scene camera natives, not by `g_remoteCamOn`), and V
+holds no weapon of her own in the nest, so every "empty hands" rule applied:
+
+- **LT:** the smoking lighter's gate (`ltClaimedByLighter`) zeroed LT with no weapon on foot. Its old comment
+  named an `xr_lt_needs_weapon` ini key that does not exist; the only switch is the export
+  `CyberpunkVR_LtLighterGate`.
+- **RT:** "empty-hand RT is a finger gesture" (`g_VRBind==4 && !g_hasWeaponEquipped`) zeroed RT; a selected arm
+  cyberware (`physicalCyberware`) and the launcher's LT->RT swap would have done the same.
+- Fix (both): these rules are skipped while `DeviceCamActive()` (`deviceTakeover`). User confirmed LT and LB
+  arrive after the first build (21:51); RT fix built second.
+- **LB:** no port-side block. The user's SteamVR binding (Index, workshop 3838606856, made 2026-11-12) puts the
+  left trackpad centre, sub_mode click, on `frame_bumper`, which `OpenXRFrameLoop.cpp` emits as LB.
+
+### Scanner toggle on LB
+
+The user: "since 0.2.3 the scanner is no longer a toggle". Checked against git: the 0.2.3 merge (`206dfc87`)
+only tightened the ear gesture's squeeze (`ScannerSqueeze`); its latch (`CyberpunkVR_ScannerToggle`) is unchanged.
+The difference is the input: the previous binding (workshop 3836115085) had nothing on the left trackpad, so the
+scanner was the ear gesture (a toggle); the new LB button went through raw, and the game's LB is
+Vision_Hold_Button, a hold. Per the user's request, LB now toggles too (`CyberpunkVR_ScannerButtonToggle`, default
+1): the raw LB is masked out of the merge on gameplay screens (not in a vehicle, menu, popup or the lobby) and
+asserted from its own latch. On foot `ScannerRequest` releases a press the game did not take within 750 ms; in a
+takeover that check is skipped, because it is not verified that PlayerStateMachine.Vision reports the device's
+scanner, and the latch is cleared when the takeover starts or ends. While the scanner is open RT tags instead of
+firing (`CyberpunkVR_ScannerTriggerTag`), in the nest as on foot.
+
+Installed 2026-11-12 22:03, DLL SHA-256 `CA67C7246DAAD026963BF90A185013817372819F12DFDE5A64B4BD765A868D34`,
+backup `E:\cyberpunk_vr_portackupst-scanner-toggle-20261112-220359` (the LT-only build of 21:51,
+`9C863E76...`, backup `lt-takeover-20261112-215138`). In-game confirmation of RT and the toggle pending.
